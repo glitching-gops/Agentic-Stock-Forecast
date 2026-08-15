@@ -16,8 +16,17 @@ echo "Port: $PORT"
 mkdir -p models/joblib
 
 echo "Initialising database..."
-# Use a timeout for DB init to prevent hanging
-timeout 30s python3 -c "from data.db import init_db; init_db(); print('DB init OK')" || echo "DB init timed out or failed (ignoring to allow startup)"
+# Use a timeout for DB init to prevent hanging. Also creates the
+# index_membership table (data.universe.init_universe_tables) — without this,
+# a fresh production DB has no universe table until the first pipeline run,
+# and /api/stocks 500s on every request until then instead of degrading.
+timeout 30s python3 -c "
+from data.db import init_db
+from data.universe import init_universe_tables
+init_db()
+init_universe_tables()
+print('DB init OK')
+" || echo "DB init timed out or failed (ignoring to allow startup)"
 
 echo "Starting FastAPI server on port $PORT..."
 # exec ensures uvicorn receives signals directly from Render

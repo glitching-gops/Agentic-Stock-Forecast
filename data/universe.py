@@ -289,18 +289,30 @@ def _record_snapshot(index_name: str, snap_date: str, tickers: list[str], source
 
 # ── The universe rule ─────────────────────────────────────────────────────────
 def get_index_members(as_of: str, index_name: str = INDEX_NAME) -> list[str]:
-    """Returns index membership as of a date, from recorded intervals only."""
+    """
+    Returns index membership as of a date, from recorded intervals only.
+
+    Fails soft to an empty list if the table doesn't exist yet — a fresh
+    production database has no index_membership table until the first
+    sync_current_membership() call, and this is read from public endpoints
+    (/api/stocks) that should degrade rather than 500.
+    """
     engine = get_engine()
-    df = pd.read_sql(
-        text("""
-            SELECT DISTINCT ticker FROM index_membership
-            WHERE index_name = :idx
-              AND effective_from <= :d
-              AND effective_to   >  :d
-            ORDER BY ticker
-        """),
-        engine, params={"idx": index_name, "d": as_of},
-    )
+    try:
+        df = pd.read_sql(
+            text("""
+                SELECT DISTINCT ticker FROM index_membership
+                WHERE index_name = :idx
+                  AND effective_from <= :d
+                  AND effective_to   >  :d
+                ORDER BY ticker
+            """),
+            engine, params={"idx": index_name, "d": as_of},
+        )
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"[Universe] index_membership unavailable ({exc}). "
+              f"Run sync_current_membership() to populate it.")
+        return []
     return df["ticker"].tolist() if not df.empty else []
 
 
