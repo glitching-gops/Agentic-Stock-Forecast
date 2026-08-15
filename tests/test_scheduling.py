@@ -50,14 +50,15 @@ def test_daily_batch_driver_calls_the_daily_function_not_the_weekly_one():
 
 def test_daily_write_never_touches_weekly_owned_columns():
     """
-    train_and_forecast()'s DB write must only ever set last_trained (+
-    model_version). If it also wrote eval_rank_ic/conformal_*/evaluated_at,
-    a daily run could silently clobber the weekly evaluation's staleness
-    signal with values that were never actually recomputed.
+    _record_daily_fit()'s DB write (called from forecast_ticker_daily) must
+    only ever set last_trained (+ model_version). If it also wrote
+    eval_rank_ic/conformal_*/evaluated_at, a daily run could silently clobber
+    the weekly evaluation's staleness signal with values that were never
+    actually recomputed.
     """
     from pipeline import model
 
-    source = inspect.getsource(model.train_and_forecast)
+    source = inspect.getsource(model._record_daily_fit)
     insert_start = source.index("INSERT INTO model_metadata")
     insert_block = source[insert_start:insert_start + 400]
 
@@ -67,6 +68,40 @@ def test_daily_write_never_touches_weekly_owned_columns():
             f"daily write touches '{forbidden}', a weekly-owned column"
         )
     assert "last_trained" in insert_block
+
+
+def test_forecast_ticker_daily_records_its_own_fit():
+    """_record_daily_fit must be owned by the unit of work, not a batch
+    wrapper — so it fires no matter which caller reaches this function."""
+    from pipeline import model
+
+    source = inspect.getsource(model.forecast_ticker_daily)
+    assert "_record_daily_fit(ticker)" in source
+
+
+def test_scheduler_populates_forecasts_and_leaderboard_not_just_model_metadata():
+    """
+    The bug this guards against: scheduler.run_pipeline_job() used to call
+    pipeline.model.train_and_forecast() directly, which only ever writes
+    model_metadata. Only agents.graph.run_graph() (via its critic node)
+    populates the forecasts/leaderboard tables the dashboard actually reads.
+    That gap was latent since Phase 0 -- nothing scheduled ever called
+    run_graph, so the dashboard sat on a months-old row even while the daily
+    job ran successfully every day. This asserts the daily job calls
+    run_graph per ticker, not the lower-level batch driver.
+    """
+    import scheduler
+
+    source = inspect.getsource(scheduler.run_pipeline_job)
+    assert "run_graph(ticker)" in source
+    assert "train_and_forecast(tickers=universe)" not in source
+
+
+def test_main_bootstrap_also_populates_forecasts_not_just_model_metadata():
+    """main.py's local first-run bootstrap had the identical gap."""
+    source = (REPO / "main.py").read_text(encoding="utf-8")
+    assert "run_graph(ticker)" in source
+    assert "train_and_forecast(tickers=universe)" not in source
 
 
 def test_weekly_function_does_the_expensive_work():

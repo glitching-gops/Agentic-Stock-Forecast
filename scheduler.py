@@ -46,12 +46,21 @@ def run_pipeline_job():
     """
     Daily pipeline: universe sync, fresh data, cheap per-ticker forecast.
 
-    Calls pipeline.model.train_and_forecast(), which internally uses
-    forecast_ticker_daily() — cached hyperparameters, one XGBoost fit per
-    ticker, no Optuna search. The evidence grade attached to each forecast
-    comes from whatever run_weekly_evaluation_job() last persisted, which may
-    be up to a week old; that staleness is surfaced via `evaluated_at`, not
-    hidden.
+    The final step runs agents.graph.run_graph() per ticker rather than
+    calling pipeline.model.train_and_forecast() directly. This matters:
+    train_and_forecast() only ever wrote to model_metadata — it never touched
+    the forecasts/leaderboard tables the dashboard actually reads. Only
+    run_graph() (via its critic node, which computes the composite score and
+    calls save_forecast_to_db) does that. That gap was latent since Phase 0 —
+    nothing scheduled ever called run_graph, only the manual /run-all admin
+    route did — which is why the dashboard sat on a months-old row even while
+    this job ran successfully every day. run_graph()'s forecasting_node still
+    calls forecast_ticker_daily() internally, so this remains cached
+    hyperparameters, no Optuna search, per audit finding for this rewrite.
+
+    The evidence grade attached to each forecast comes from whatever
+    run_weekly_evaluation_job() last persisted, which may be up to a week
+    old; that staleness is surfaced via `evaluated_at`, not hidden.
     """
     logger.info("Starting daily pipeline run...")
     try:
@@ -63,7 +72,7 @@ def run_pipeline_job():
         from pipeline.signals import compute_and_store, count_labelled_rows
         from pipeline.sentiment import fetch_and_score
         from pipeline.macro import fetch_and_store as fetch_macro
-        from pipeline.model import train_and_forecast
+        from agents.graph import run_graph
 
         logger.info("[0/5] Syncing point-in-time universe...")
         sync_current_membership()
@@ -108,8 +117,21 @@ def run_pipeline_job():
         logger.info("[4/5] Fetching macro data...")
         fetch_macro()
 
-        logger.info("[5/5] Forecasting (cached hyperparameters, no search)...")
-        train_and_forecast(tickers=universe)
+        logger.info(f"[5/5] Forecasting {len(universe)} tickers "
+                   f"(cached hyperparameters, no search)...")
+        succeeded, failed = 0, 0
+        for ticker in universe:
+            try:
+                state = run_graph(ticker)
+                if state.get("forecast_available"):
+                    succeeded += 1
+                else:
+                    failed += 1
+                    logger.warning(f"[5/5] {ticker}: {state.get('forecast_error')}")
+            except Exception as exc:                                # noqa: BLE001
+                failed += 1
+                logger.error(f"[5/5] {ticker}: run_graph failed — {exc}")
+        logger.info(f"[5/5] Forecasting complete: {succeeded} succeeded, {failed} failed")
 
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:

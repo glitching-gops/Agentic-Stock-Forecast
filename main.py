@@ -58,7 +58,7 @@ if __name__ == "__main__":
         from pipeline.macro import fetch_and_store as fetch_macro
         from pipeline.sentiment import fetch_and_score
         from pipeline.signals import compute_and_store
-        from pipeline.model import train_and_forecast
+        from agents.graph import run_graph
 
         # Fetch over raw membership, then screen — the liquidity filter reads
         # the table this step populates.
@@ -70,7 +70,12 @@ if __name__ == "__main__":
 
         compute_and_store(tickers=universe)
         fetch_and_score(tickers=universe)
-        train_and_forecast(tickers=universe)
+
+        # run_graph(), not pipeline.model.train_and_forecast(): only run_graph
+        # (via its critic node) populates forecasts/leaderboard. See
+        # scheduler.run_pipeline_job's docstring for why this matters.
+        for ticker in universe:
+            run_graph(ticker)
     else:
         print("[3/5] Database already contains data. Skipping initial fetch.")
         universe = get_universe()

@@ -479,6 +479,13 @@ def forecast_ticker_daily(ticker: str) -> TickerForecast | None:
     bench_ticker = str(latest.get("benchmark_ticker", pd.Series([""])).iloc[0] or "")
     bench_specific = bool(latest.get("benchmark_sector_specific", pd.Series([0])).iloc[0])
 
+    # Owned here, not by the batch driver: this write must happen exactly
+    # once per ticker per day regardless of which caller reaches this
+    # function (scheduler.run_pipeline_job via agents.graph.run_graph, the
+    # admin /run/{ticker} route, or a direct call) — a duplicate elsewhere
+    # was what let a whole class of caller silently skip it.
+    _record_daily_fit(ticker)
+
     return TickerForecast(
         ticker=ticker,
         forecast_date=forecast_date,
@@ -489,6 +496,29 @@ def forecast_ticker_daily(ticker: str) -> TickerForecast | None:
         benchmark_sector_specific=bench_specific,
         n_train_rows=n_train,
     )
+
+
+def _record_daily_fit(ticker: str) -> None:
+    """
+    Updates only last_trained (+ model_version) in model_metadata.
+
+    Never touches eval_*/conformal_*/evaluated_at — those are weekly-owned
+    (see _persist_evaluation). tests/test_scheduling.py asserts this.
+    """
+    engine = get_engine()
+    with engine.connect() as conn:
+        conn.execute(text("""
+            INSERT INTO model_metadata (ticker, model_version, last_trained, ensemble_in_use)
+            VALUES (:ticker, :version, :trained, 0)
+            ON CONFLICT (ticker) DO UPDATE SET
+                model_version = EXCLUDED.model_version,
+                last_trained  = EXCLUDED.last_trained
+        """), {
+            "ticker": ticker,
+            "version": MODEL_VERSION,
+            "trained": datetime.now(timezone.utc),
+        })
+        conn.commit()
 
 
 def forecast_ticker_full(ticker: str) -> TickerForecast | None:
@@ -515,11 +545,19 @@ def forecast_ticker_full(ticker: str) -> TickerForecast | None:
 def train_and_forecast(single_ticker: str | None = None,
                        tickers: list[str] | None = None) -> dict[str, TickerForecast]:
     """
-    The DAILY batch driver: forecasts every ticker using cached hyperparameters.
+    Lower-level batch driver: fits and forecasts every ticker using cached
+    hyperparameters, no Optuna search. model_metadata.last_trained is updated
+    by forecast_ticker_daily() itself (_record_daily_fit), not here.
 
-    Runs no Optuna search. Updates only ``last_trained`` in model_metadata —
-    the eval_*/conformal_*/evaluated_at columns are weekly-owned and must not
-    be touched here, or the staleness signal they provide becomes meaningless.
+    IMPORTANT: this does NOT populate the forecasts/leaderboard tables — only
+    agents.graph.run_graph() does that (it runs the critic evidence gate and
+    computes the composite score, which this function has no part of). This
+    was a real, previously-latent gap: scheduler.run_pipeline_job() used to
+    call this function directly and nothing scheduled ever touched
+    forecasts/leaderboard, which is why the dashboard sat on a months-old row
+    even while this function ran successfully every day. The daily job now
+    calls run_graph() per ticker instead (see scheduler.py); this function
+    remains for programmatic/tool use where only model_metadata matters.
     """
     if single_ticker:
         to_process = [single_ticker]
@@ -529,7 +567,6 @@ def train_and_forecast(single_ticker: str | None = None,
         from data.universe import get_universe
         to_process = get_universe()
 
-    engine = get_engine()
     results: dict[str, TickerForecast] = {}
 
     for ticker in to_process:
@@ -546,25 +583,10 @@ def train_and_forecast(single_ticker: str | None = None,
         ev = forecast.evaluation
         ic = ev.get("rank_ic")
         hit = ev.get("hit_rate")
-        base = ev.get("majority_hit_rate")
         print(f"[Model] {ticker}: excess={forecast.price_view['pred_excess_return']:+.4f} "
               f"IC={'n/a' if ic is None else f'{ic:+.3f}'} "
               f"hit={'n/a' if hit is None else f'{hit:.1f}%'} "
               f"(evaluated_at={ev.get('evaluated_at') or 'never'})")
-
-        with engine.connect() as conn:
-            conn.execute(text("""
-                INSERT INTO model_metadata (ticker, model_version, last_trained, ensemble_in_use)
-                VALUES (:ticker, :version, :trained, 0)
-                ON CONFLICT (ticker) DO UPDATE SET
-                    model_version = EXCLUDED.model_version,
-                    last_trained  = EXCLUDED.last_trained
-            """), {
-                "ticker": ticker,
-                "version": forecast.model_version,
-                "trained": datetime.now(timezone.utc),
-            })
-            conn.commit()
 
     return results
 
