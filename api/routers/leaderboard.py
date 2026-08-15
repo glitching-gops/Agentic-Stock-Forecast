@@ -69,6 +69,13 @@ def get_leaderboard(
     if key in df.columns:
         df = df.sort_values(key, ascending=SORTABLE[key], na_position="last")
 
+    # Count matches BEFORE the limit. Reporting len(entries) instead made
+    # `total` a restatement of the page size, so a leaderboard holding only 5
+    # rows and one holding 500 both reported whatever `limit` happened to be —
+    # exactly the signal needed to tell "the pipeline wrote nothing" apart
+    # from "the page is capped".
+    total_matching = len(df)
+
     df = df.head(limit).reset_index(drop=True)
     df["rank"] = range(1, len(df) + 1)
 
@@ -89,7 +96,7 @@ def get_leaderboard(
 
     return LeaderboardResponse(
         entries=entries,
-        total=len(entries),
+        total=total_matching,
         last_updated=str(last_updated),
         filters_applied=filters,
     )

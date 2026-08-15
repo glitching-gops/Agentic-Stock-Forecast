@@ -605,3 +605,17 @@ def test_daily_job_prunes_the_leaderboard_after_forecasting():
 
     source = inspect.getsource(scheduler.run_pipeline_job)
     assert "prune_leaderboard(universe)" in source
+
+
+def test_leaderboard_total_counts_matches_not_page_size():
+    """
+    `total` must report how many rows matched, not how many were returned.
+    Returning len(entries) made it a restatement of `limit`, hiding the
+    difference between a leaderboard holding 5 rows and one holding 500.
+    """
+    source = (REPO / "api" / "routers" / "leaderboard.py").read_text(encoding="utf-8")
+
+    assert "total=len(entries)" not in source
+    assert "total_matching = len(df)" in source
+    # The count must be taken before the page is sliced.
+    assert source.index("total_matching = len(df)") < source.index("df.head(limit)")
