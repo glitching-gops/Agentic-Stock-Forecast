@@ -3,50 +3,17 @@ set -e
 
 echo "=== ZeRO Stock Forecast — Render Startup ==="
 echo "Port: $PORT"
-echo "Checking model files..."
 
-# Ensure models directory exists
-mkdir -p models/joblib models/lstm models/meta
-
-# Only download if models directory is empty
-if [ ! -f "models/joblib/RELIANCE.NS.joblib" ]; then
-    echo "Models not found — downloading from model-store branch..."
-
-    if [ -z "$GITHUB_TOKEN" ]; then
-        echo "ERROR: GITHUB_TOKEN is not set. Cannot download models."
-        exit 1
-    fi
-
-    # Download zip (forcing HTTP/1.1 to avoid protocol errors)
-    curl -L --http1.1 \
-        -H "Authorization: token ${GITHUB_TOKEN}" \
-        -H "Accept: application/vnd.github.v3.raw" \
-        "https://api.github.com/repos/glitching-gops/Agentic-Stock-Forecast/contents/models_store.zip?ref=model-store" \
-        -o models_store.zip
-
-    echo "Download complete. Size: $(du -h models_store.zip | cut -f1). Extracting..."
-    # Validate every member path before writing. extractall() honours absolute
-    # paths and '..' segments in the archive, so a tampered zip could write
-    # outside the working directory (audit finding F15).
-    python3 -c "
-import os
-import zipfile
-
-DEST = os.path.abspath('.')
-print('Starting extraction...')
-with zipfile.ZipFile('models_store.zip', 'r') as zf:
-    for member in zf.infolist():
-        target = os.path.abspath(os.path.join(DEST, member.filename))
-        if not target.startswith(DEST + os.sep) and target != DEST:
-            raise SystemExit(f'Refusing unsafe archive path: {member.filename}')
-    zf.extractall(DEST)
-print('Extraction complete.')
-"
-    rm models_store.zip
-    echo "Models ready."
-else
-    echo "Models already present — skipping download."
-fi
+# The pre-trained-model download step that used to live here is gone.
+# Under Phase 0, pipeline.model.fit_production_model() always retrains fresh
+# and only ever WRITES to models/joblib/*.joblib — nothing reads an existing
+# file to skip training (that warm-path was removed because it caused bug
+# F10: a stale/missing joblib silently produced a flat forecast). Downloading
+# a 21MB archive from GitHub's Contents API added 45-90s to every cold start
+# and, on a slow or interrupted transfer, would crash the whole deploy — that
+# is exactly what took the site down: curl exited 18 (partial transfer) and
+# `set -e` killed the script before uvicorn ever started.
+mkdir -p models/joblib
 
 echo "Initialising database..."
 # Use a timeout for DB init to prevent hanging
