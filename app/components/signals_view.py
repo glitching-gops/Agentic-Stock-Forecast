@@ -70,8 +70,13 @@ def render_signals_view(df: pd.DataFrame, latest_signals: dict) -> None:
         if "date" in heatmap_df.columns:
             heatmap_df.set_index("date", inplace=True)
             
-        # Get all signal columns (excluding date, ticker, target)
-        exclude_cols = ["date", "ticker", "target"]
+        # Signal columns only — exclude identifiers, targets and benchmark
+        # bookkeeping so the heatmap never plots a forward-looking label.
+        exclude_cols = [
+            "date", "ticker",
+            "target", "target_return", "target_excess_return", "benchmark_return",
+            "benchmark_ticker", "benchmark_sector_specific",
+        ]
         cols_to_plot = [c for c in heatmap_df.columns if c not in exclude_cols]
         
         if cols_to_plot:

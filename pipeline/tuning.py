@@ -1,62 +1,59 @@
 """
-pipeline/tuning.py
+pipeline/tuning.py — Hyperparameter search, nested inside the training fold.
 
-Optuna-based hyperparameter tuning for the per-stock XGBoost regressor.
-Runs 50 trials per stock using expanding window cross-validation.
-Saves best parameters to a JSON file per ticker so they can be reused
-during daily fast retrains without re-running Optuna.
+The previous version was called with the full labelled set, including the slice
+later reported as held out (audit finding F2), and used contiguous CV folds with
+no purge (F3). Fifty trials over nine hyperparameters, selected using the test
+fold, on a series whose effective independent sample size is roughly
+n_rows / horizon — about 13 per stock on a 2-year window.
 
-Tuned parameters:
-  - n_estimators:    [100, 800]
-  - learning_rate:   [0.01, 0.3]  (log scale)
-  - max_depth:       [3, 8]
-  - subsample:       [0.6, 1.0]
-  - colsample_bytree:[0.6, 1.0]
-  - min_child_weight:[1, 10]
-  - gamma:           [0, 5]
-  - reg_alpha:       [0, 2]       (L1 regularisation)
-  - reg_lambda:      [0, 2]       (L2 regularisation)
+Three changes:
+
+  1. ``tune`` accepts ONLY a training slice. It is passed to the walk-forward
+     harness as the ``tuner`` callback, which is structurally incapable of
+     handing it test rows.
+  2. Inner CV uses ``PurgedWalkForward``, so the search itself is not scored on
+     leaked labels.
+  3. Studies are seeded, so a tuning run is reproducible. The trial count is
+     recorded and returned for the deflated-Sharpe adjustment — searching more
+     configurations raises the bar a result must clear.
 """
 
-import os
+from __future__ import annotations
+
 import json
+import os
+
 import numpy as np
 import optuna
 import pandas as pd
-import torch
+from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_percentage_error
+
+from pipeline.evaluation import PurgedWalkForward
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 PARAMS_DIR = os.path.join(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-    "tuned_params"
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "tuned_params"
 )
 os.makedirs(PARAMS_DIR, exist_ok=True)
 
-_DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-N_TRIALS = 50
-N_FOLDS  = 5
+SEED = 42
+N_TRIALS = 40
+INNER_FOLDS = 3
 
 
 def get_params_path(ticker: str) -> str:
-    """Returns the path to the saved tuned parameters JSON for a ticker."""
-    safe = ticker.replace(".", "_")
-    return os.path.join(PARAMS_DIR, f"{safe}_params.json")
+    return os.path.join(PARAMS_DIR, f"{ticker.replace('.', '_')}_params.json")
 
 
 def save_params(ticker: str, params: dict) -> None:
-    """Saves the best Optuna parameters for a ticker to disk."""
     with open(get_params_path(ticker), "w") as f:
         json.dump(params, f, indent=2)
 
 
 def load_params(ticker: str) -> dict | None:
-    """
-    Loads saved tuned parameters for a ticker if they exist.
-    Returns None if no saved params are found.
-    """
     path = get_params_path(ticker)
     if os.path.exists(path):
         with open(path) as f:
@@ -64,113 +61,134 @@ def load_params(ticker: str) -> dict | None:
     return None
 
 
-def expanding_window_cv(
+def purged_cv_score(
     X: pd.DataFrame,
     y: pd.Series,
     params: dict,
-    n_folds: int = N_FOLDS
+    horizon: int = 30,
+    n_folds: int = INNER_FOLDS,
 ) -> float:
     """
-    Expanding window cross-validation for time series data.
-    Trains on the first k/n_folds of data, tests on the next fold.
-    Returns the mean MAPE across all folds.
+    Mean absolute error across purged inner folds.
 
-    Example with 5 folds on 300 rows:
-      Fold 1: train rows 0-60,   test rows 60-120
-      Fold 2: train rows 0-120,  test rows 120-180
-      Fold 3: train rows 0-180,  test rows 180-240
-      Fold 4: train rows 0-240,  test rows 240-300
+    MAE on excess returns, not MAPE on prices. MAPE is undefined near zero and
+    was flattering on price levels; on a return target it is meaningless.
     """
-    n = len(X)
-    fold_size = n // (n_folds + 1)
+    splitter = PurgedWalkForward(
+        n_folds=n_folds, horizon=horizon, embargo=horizon,
+        min_train=max(120, len(X) // 3),
+    )
 
-    if fold_size < 20:
-        # Not enough data for this many folds — fall back to single split
-        split = int(n * 0.7)
-        model = XGBRegressor(**params, random_state=42, verbosity=0)
-        model.fit(X.iloc[:split], y.iloc[:split])
-        preds = model.predict(X.iloc[split:])
-        return mean_absolute_percentage_error(y.iloc[split:], preds)
+    scores: list[float] = []
+    for train_idx, test_idx in splitter.split(len(X)):
+        X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
+        X_te, y_te = X.iloc[test_idx], y.iloc[test_idx]
 
-    mapes = []
-    for fold in range(1, n_folds + 1):
-        train_end = fold * fold_size
-        test_end  = min(train_end + fold_size, n)
-
-        if test_end <= train_end:
+        mask_tr, mask_te = y_tr.notna(), y_te.notna()
+        if mask_tr.sum() < 50 or mask_te.sum() < 10:
             continue
 
-        X_train = X.iloc[:train_end]
-        y_train = y.iloc[:train_end]
-        X_test  = X.iloc[train_end:test_end]
-        y_test  = y.iloc[train_end:test_end]
+        model = XGBRegressor(**params, random_state=SEED, verbosity=0)
+        model.fit(X_tr[mask_tr], y_tr[mask_tr])
+        preds = model.predict(X_te[mask_te])
+        scores.append(float(mean_absolute_error(y_te[mask_te], preds)))
 
-        model = XGBRegressor(**params, random_state=42, verbosity=0)
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        mapes.append(mean_absolute_percentage_error(y_test, preds))
-
-    return float(np.mean(mapes)) if mapes else 1.0
+    return float(np.mean(scores)) if scores else float("inf")
 
 
-def tune_hyperparameters(
-    ticker: str,
+def tune(
     X: pd.DataFrame,
     y: pd.Series,
+    horizon: int = 30,
     n_trials: int = N_TRIALS,
-    force: bool = False
+    seed: int = SEED,
 ) -> dict:
     """
-    Runs Optuna hyperparameter tuning for a single stock's XGBoost model.
+    Searches hyperparameters using only the rows it is given.
 
-    If saved params exist and force=False, returns saved params immediately
-    without running Optuna. This allows daily fast retrains to reuse
-    Tuesday's tuned params without re-running 50 trials.
-
-    Set force=True to re-tune from scratch (e.g. weekly Sunday retuning).
-
-    Args:
-        ticker:   NSE ticker string e.g. 'RELIANCE.NS'
-        X:        Feature matrix (signals + sentiment + macro)
-        y:        Target series (30-day forward close price)
-        n_trials: Number of Optuna trials (default 50)
-        force:    If True, ignores saved params and re-tunes
-
-    Returns:
-        dict of best XGBoost hyperparameters
+    Designed to be passed as the ``tuner`` callback to
+    ``pipeline.evaluation.walk_forward``, which calls it with the training slice
+    of each outer fold. It has no access to the outer test rows by construction.
     """
-    if not force:
-        saved = load_params(ticker)
-        if saved:
-            print(f"[Tuning] {ticker}: Using saved params (run with force=True to retune)")
-            return saved
-
-    print(f"[Tuning] {ticker}: Running {n_trials} Optuna trials...")
+    if len(X) < 150:
+        return _default_params()
 
     def objective(trial: optuna.Trial) -> float:
         params = {
-            "n_estimators":     trial.suggest_int("n_estimators", 100, 800),
-            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
-            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 600),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "max_depth":        trial.suggest_int("max_depth", 2, 6),
             "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 5, 40),
             "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
-            "reg_alpha":        trial.suggest_float("reg_alpha", 0.0, 2.0),
-            "reg_lambda":       trial.suggest_float("reg_lambda", 0.0, 2.0),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 0.0, 5.0),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1.0, 20.0),
             "tree_method":      "hist",
-            "device":           _DEVICE,
         }
-        return expanding_window_cv(X, y, params)
+        return purged_cv_score(X, y, params, horizon=horizon)
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=seed),   # seeded: reproducible
+    )
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
-    best_params = study.best_params
-    best_params["tree_method"] = "hist"
-    best_params["device"]      = _DEVICE
+    best = dict(study.best_params)
+    best["tree_method"] = "hist"
+    return best
 
-    save_params(ticker, best_params)
-    print(f"[Tuning] {ticker}: Best MAPE {study.best_value:.4f} | Params saved")
 
-    return best_params
+def _default_params() -> dict:
+    """
+    Conservative defaults for short series.
+
+    Deliberately heavily regularised: with ~30-session overlapping labels the
+    effective sample is an order of magnitude smaller than the row count, and
+    the previous search space (depth up to 8, min_child_weight from 1) invited
+    memorisation.
+    """
+    return {
+        "n_estimators": 300,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "min_child_weight": 20,
+        "gamma": 1.0,
+        "reg_alpha": 1.0,
+        "reg_lambda": 10.0,
+        "tree_method": "hist",
+    }
+
+
+def tune_and_cache(
+    ticker: str,
+    X: pd.DataFrame,
+    y: pd.Series,
+    horizon: int = 30,
+    force: bool = False,
+) -> dict:
+    """
+    Tunes for the FINAL production fit and caches the result.
+
+    This is separate from the evaluation path on purpose. Parameters cached here
+    are used to fit the model that generates tomorrow's forecast; they are never
+    used to produce a reported metric, because ``walk_forward`` re-tunes inside
+    each fold. Conflating the two is what F2 was.
+    """
+    if not force:
+        cached = load_params(ticker)
+        if cached:
+            return cached
+
+    params = tune(X, y, horizon=horizon)
+    save_params(ticker, params)
+    return params
+
+
+# Backwards-compatible aliases for callers not yet migrated.
+def tune_hyperparameters(ticker: str, X: pd.DataFrame, y: pd.Series,
+                         n_trials: int = N_TRIALS, force: bool = False) -> dict:
+    """Deprecated. Use ``tune`` (evaluation) or ``tune_and_cache`` (production)."""
+    return tune_and_cache(ticker, X, y, force=force)

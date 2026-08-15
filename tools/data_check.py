@@ -1,5 +1,5 @@
 import yfinance as yf
-from data.tickers import TICKERS
+from data.universe import get_universe
 
 existing_20 = [
     "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "KOTAKBANK.NS",
@@ -8,7 +8,7 @@ existing_20 = [
     "ONGC.NS", "BPCL.NS", "POWERGRID.NS", "MARUTI.NS", "TATAMOTORS.NS", "LT.NS"
 ]
 
-new_tickers = [t for t in TICKERS.keys() if t not in existing_20]
+new_tickers = [t for t in get_universe() if t not in existing_20]
 print(f"Checking {len(new_tickers)} new tickers...\n")
 
 sufficient = []

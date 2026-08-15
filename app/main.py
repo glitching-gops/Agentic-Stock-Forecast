@@ -36,7 +36,7 @@ stock_detail_page = st.Page(
 )
 portfolio_page = st.Page(
     "pages/portfolio.py",
-    title="Portfolio Optimizer",
+    title="Portfolio",
     icon="💼",
 )
 about_page = st.Page(

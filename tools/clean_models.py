@@ -4,9 +4,9 @@ import sys
 if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
     
-from data.tickers import TICKERS
+from data.universe import get_universe
 
-keep = set(TICKERS.keys())
+keep = set(get_universe())
 
 def ticker_to_safe(ticker: str) -> str:
     return ticker.replace(".", "_")

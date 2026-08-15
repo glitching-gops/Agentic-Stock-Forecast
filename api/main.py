@@ -3,6 +3,8 @@ FastAPI application entry point.
 Initialises the database, mounts routers, configures CORS,
 and starts the APScheduler daily pipeline job on startup.
 """
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -27,10 +29,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Restrict origins. The wildcard was paired with an admin route whose
+# /run-all variant kicks off a full pipeline run for the entire universe
+# (audit finding F15). Set ALLOWED_ORIGINS as a comma-separated list.
+_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://glitching-gops-zer0.streamlit.app,"
+    "https://agentic-stock-forecast.streamlit.app,"
+    "http://localhost:8501",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=[o.strip() for o in _origins.split(",") if o.strip()],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 

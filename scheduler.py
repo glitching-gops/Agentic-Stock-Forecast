@@ -25,75 +25,107 @@ logger = logging.getLogger(__name__)
 # concurrent run prevention natively via coalesce + max_instances.
 
 def run_pipeline_job():
+    """
+    Daily pipeline.
+
+    Step 0 is new: the universe is resynced from its point-in-time rule before
+    anything else runs, and the labelled-row count is asserted non-decreasing
+    afterwards. That assertion is the guard against F6 silently returning — the
+    old append-only writer froze the training labels without any visible symptom.
+    """
     logger.info("Starting scheduled pipeline run...")
     try:
+        from data.universe import (
+            get_ingest_universe, get_universe, sync_current_membership,
+        )
+        from data.tickers import refresh_metadata
         from pipeline.fetch import fetch_and_store
-        from pipeline.signals import compute_and_store
+        from pipeline.signals import compute_and_store, count_labelled_rows
         from pipeline.sentiment import fetch_and_score
         from pipeline.macro import fetch_and_store as fetch_macro
         from pipeline.model import train_and_forecast
 
-        # Step 1: Fetch OHLCV
+        logger.info("[0/5] Syncing point-in-time universe...")
+        sync_current_membership()
+        refresh_metadata()
+
+        # Ingest over raw index membership; the liquidity screen runs afterwards
+        # because it reads the very table this step populates.
+        ingest_list = get_ingest_universe()
+        logger.info(f"[0/5] Index members to ingest: {len(ingest_list)}")
+
+        if not ingest_list:
+            logger.error("Index membership is empty — aborting run.")
+            return
+
+        labelled_before = count_labelled_rows()
+
         logger.info("[1/5] Fetching OHLCV data...")
-        fetch_and_store()
-        
-        # Step 2: Compute signals
+        fetch_and_store(tickers=ingest_list)
+
+        universe = get_universe()
+        logger.info(f"[1/5] Tradable universe after screening: {len(universe)}")
+        if not universe:
+            logger.error("Universe is empty after screening — aborting run.")
+            return
+
         logger.info("[2/5] Computing signals...")
-        compute_and_store()
-        
-        # Step 3: Fetch sentiment
+        compute_and_store(tickers=universe)
+
+        labelled_after = count_labelled_rows()
+        if labelled_after < labelled_before:
+            logger.error(
+                f"Labelled rows fell from {labelled_before} to {labelled_after}. "
+                f"Target backfill is broken (regression of F6) — aborting before "
+                f"any forecast is written."
+            )
+            return
+        logger.info(f"[2/5] Labelled rows: {labelled_before} -> {labelled_after}")
+
         logger.info("[3/5] Fetching news sentiment...")
-        fetch_and_score()
-        
-        # Step 4: Fetch macro data
+        fetch_and_score(tickers=universe)
+
         logger.info("[4/5] Fetching macro data...")
         fetch_macro()
-        
-        # Step 5: Train models
-        logger.info("[5/5] Training models...")
-        train_and_forecast()
-        
+
+        logger.info("[5/5] Training and forecasting...")
+        train_and_forecast(tickers=universe)
+
         logger.info("Scheduled pipeline run completed successfully.")
     except Exception as e:
-        logger.error(f"Error during scheduled pipeline run: {e}")
+        logger.error(f"Error during scheduled pipeline run: {e}", exc_info=True)
 
 def weekly_retune_all():
     """
-    Runs full Optuna retuning (force=True) for all 100 stocks.
-    Scheduled weekly on Sunday at 02:00 IST.
-    Saves best params to tuned_params/ for use in daily fast retrains.
+    Re-tunes the PRODUCTION model's hyperparameters for every ticker.
+
+    These parameters are used only to fit the model that generates the next
+    forecast. Reported metrics never come from them: ``walk_forward`` re-tunes
+    inside each evaluation fold, so a configuration is never chosen with sight
+    of the rows it is later scored on (audit finding F2).
+
+    The LSTM retrain is gone — that module is archived because it never wrote a
+    checkpoint (F5). See pipeline/archived/README.md.
     """
-    from data.tickers import TICKERS
-    from data.db import get_engine
-    import pandas as pd
-    from pipeline.model import load_features_for_ticker
-    from pipeline.tuning import tune_hyperparameters
+    from data.universe import get_universe
+    from pipeline.model import load_features_for_ticker, FEATURES, TARGET
+    from pipeline.signals import HORIZON_SESSIONS
+    from pipeline.tuning import tune_and_cache
 
-    engine = get_engine()
-    logger.info(f"[Scheduler] Weekly retune started for {len(TICKERS)} stocks")
+    universe = get_universe()
+    logger.info(f"[Scheduler] Weekly retune started for {len(universe)} stocks")
 
-    for ticker in TICKERS.keys():
+    for ticker in universe:
         try:
-            # Load feature matrix for this ticker
-            X, y = load_features_for_ticker(ticker, engine)
-            if len(X) < 100:
-                logger.info(f"[Scheduler] {ticker}: insufficient data, skipping")
+            df = load_features_for_ticker(ticker)
+            labelled = df[df[TARGET].notna()] if not df.empty and TARGET in df else df
+            if labelled.empty or len(labelled) < 300:
+                logger.info(f"[Scheduler] {ticker}: insufficient labelled data, skipping")
                 continue
-            tune_hyperparameters(ticker, X, y, force=True)
-            
-            from pipeline.lstm_model import train_lstm
 
-            try:
-                df_full = X.copy()
-                df_full['target'] = y
-                signals_df = pd.read_sql(f"SELECT date, close FROM signals WHERE ticker = '{ticker}'", con=engine)
-                signals_df.set_index("date", inplace=True)
-                df_full['close'] = signals_df.loc[df_full.index, 'close']
-                train_lstm(ticker, df_full.copy(), force=True)
-                logger.info(f"[Scheduler] {ticker}: LSTM retrained")
-            except Exception as e:
-                logger.error(f"[Scheduler] {ticker}: LSTM retrain failed — {e}")
-
+            tune_and_cache(ticker, labelled[FEATURES], labelled[TARGET],
+                           horizon=HORIZON_SESSIONS, force=True)
+            logger.info(f"[Scheduler] {ticker}: retuned on {len(labelled)} rows")
         except Exception as e:
             logger.error(f"[Scheduler] {ticker}: retuning failed — {e}")
 

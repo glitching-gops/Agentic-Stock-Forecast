@@ -4,7 +4,7 @@ if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
 
 from data.db import get_engine
-from data.tickers import TICKERS
+from data.universe import get_universe
 import pandas as pd
 
 engine = get_engine()
@@ -17,7 +17,7 @@ lb = pd.read_sql("""
     ORDER BY composite_score DESC
 """, con=engine)
 
-print(f"=== Final {len(TICKERS)}-Stock Leaderboard ===\n")
+print(f"=== Final {len(get_universe())}-Stock Leaderboard ===\n")
 print(f"Total stocks:        {len(lb)}")
 print(f"Mean MAPE:           {lb['mape'].mean():.2f}%")
 print(f"Mean Dir Accuracy:   {lb['directional_accuracy'].mean():.2f}%")
@@ -37,7 +37,7 @@ sector_summary = lb.groupby("sector").agg(
 print(sector_summary.to_string())
 
 # Check for missing tickers
-all_tickers   = set(TICKERS.keys())
+all_tickers   = set(get_universe())
 lb_tickers    = set(lb["ticker"].tolist())
 missing       = all_tickers - lb_tickers
 print(f"\nMissing from leaderboard: {sorted(missing) if missing else 'None'}")

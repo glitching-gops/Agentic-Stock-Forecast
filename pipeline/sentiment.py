@@ -6,9 +6,10 @@ import pandas as pd
 import feedparser
 from datetime import datetime
 import urllib.parse
+from sqlalchemy import text
 
 from data.db import get_engine
-from data.tickers import TICKERS
+from data.tickers import get_company
 
 # FinBERT model lazy loading
 finbert = None
@@ -24,10 +25,16 @@ def get_finbert():
             print(f"Error loading FinBERT: {e}")
     return finbert
 
-def fetch_and_score(single_ticker=None):
+def fetch_and_score(single_ticker=None, tickers=None):
     engine = get_engine()
-    tickers_to_process = [single_ticker] if single_ticker else list(TICKERS.keys())
-    
+    if single_ticker:
+        tickers_to_process = [single_ticker]
+    elif tickers:
+        tickers_to_process = list(tickers)
+    else:
+        from data.universe import get_universe
+        tickers_to_process = get_universe()
+
     model = get_finbert()
     if model is None:
         print("FinBERT model not loaded. Skipping sentiment analysis.")
@@ -37,7 +44,7 @@ def fetch_and_score(single_ticker=None):
     today_str = datetime.today().strftime('%Y-%m-%d')
     
     for ticker in tickers_to_process:
-        company_name = TICKERS[ticker]["company"]
+        company_name = get_company(ticker)
         print(f"Fetching news for {company_name} ({ticker})...")
         
         query = urllib.parse.quote(f"{company_name} NSE")
@@ -79,8 +86,8 @@ def fetch_and_score(single_ticker=None):
             # Check existing to avoid duplicates
             # Read all headlines for this ticker and date
             existing = pd.read_sql(
-                f"SELECT headline FROM sentiment WHERE ticker = '{ticker}' AND date = '{today_str}'", 
-                con=engine
+                text("SELECT headline FROM sentiment WHERE ticker = :t AND date = :d"),
+                con=engine, params={"t": ticker, "d": today_str},
             )["headline"].tolist()
             
             new_rows = df[~df["headline"].isin(existing)]
@@ -105,19 +112,20 @@ def get_aggregate_sentiment(ticker, date=None):
     Positive = +score, Negative = -score, Neutral = 0
     """
     engine = get_engine()
-    
-    date_filter = f"AND date = '{date}'" if date else "ORDER BY date DESC LIMIT 5"
-    query = f"SELECT * FROM sentiment WHERE ticker = '{ticker}' {date_filter}"
-    
-    if not date:
-        # Get the most recent date's data
-        dates_df = pd.read_sql(f"SELECT MAX(date) as max_date FROM sentiment WHERE ticker = '{ticker}'", con=engine)
-        if dates_df.empty or pd.isna(dates_df.iloc[0]['max_date']):
+
+    if date is None:
+        dates_df = pd.read_sql(
+            text("SELECT MAX(date) AS max_date FROM sentiment WHERE ticker = :t"),
+            con=engine, params={"t": ticker},
+        )
+        if dates_df.empty or pd.isna(dates_df.iloc[0]["max_date"]):
             return 0.0
-        max_date = dates_df.iloc[0]['max_date']
-        query = f"SELECT * FROM sentiment WHERE ticker = '{ticker}' AND date = '{max_date}'"
-        
-    df = pd.read_sql(query, con=engine)
+        date = dates_df.iloc[0]["max_date"]
+
+    df = pd.read_sql(
+        text("SELECT * FROM sentiment WHERE ticker = :t AND date = :d"),
+        con=engine, params={"t": ticker, "d": date},
+    )
     
     if df.empty:
         return 0.0

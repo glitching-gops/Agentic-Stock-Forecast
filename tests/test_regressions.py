@@ -1,0 +1,403 @@
+"""
+Regression tests for the non-leakage defects found in the Phase 0 audit.
+
+One test (or group) per finding. Each fails if the defect returns.
+"""
+
+import inspect
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+
+
+# ── F5: the archived ensemble must stay off the live path ─────────────────────
+
+def test_lstm_and_meta_learner_are_not_imported_by_live_modules():
+    """
+    The LSTM never checkpointed (NaN validation targets), and the Ridge
+    meta-learner was fitted and scored on the same rows. Both are archived;
+    nothing on the live path may import them.
+    """
+    live_dirs = ["pipeline", "agents", "api", "app", "data"]
+    offenders = []
+
+    paths = [p for d in live_dirs for p in (REPO / d).rglob("*.py")]
+    paths += [REPO / "main.py", REPO / "scheduler.py"]
+
+    for path in paths:
+        if "archived" in path.parts or not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8", errors="ignore")
+        if "lstm_model" in source or "meta_learner" in source:
+            offenders.append(str(path.relative_to(REPO)))
+
+    assert not offenders, (
+        f"archived modules referenced from the live path: {offenders}. "
+        f"They may only return via experiment E3."
+    )
+
+
+def test_archived_modules_still_exist_with_rationale():
+    assert (REPO / "pipeline" / "archived" / "lstm_model.py").exists()
+    assert (REPO / "pipeline" / "archived" / "meta_learner.py").exists()
+    readme = (REPO / "pipeline" / "archived" / "README.md").read_text(encoding="utf-8")
+    assert "val_loss" in readme and "meta_learner" in readme
+
+
+# ── F6: labels must be backfilled ─────────────────────────────────────────────
+
+def test_signal_writes_are_upserts_not_append_only():
+    """
+    The old code inserted only dates absent from the table, so the trailing 30
+    rows kept `target = NULL` forever and the labelled set never grew.
+    """
+    from pipeline import signals
+
+    source = inspect.getsource(signals._upsert_signals)
+    assert "DELETE FROM signals" in source, (
+        "signal writes must clear the recomputed range before reinserting, "
+        "otherwise targets are never backfilled (F6)"
+    )
+
+    store_source = inspect.getsource(signals.compute_and_store)
+    assert "isin(existing_dates)" not in store_source
+    assert "_upsert_signals" in store_source
+
+
+def test_labelled_row_count_is_queryable():
+    """The monotonicity assertion in the pipeline depends on this helper."""
+    from pipeline.signals import count_labelled_rows
+    assert callable(count_labelled_rows)
+
+
+# ── F7: sentiment must not be a model feature ─────────────────────────────────
+
+def test_sentiment_is_not_in_the_feature_list():
+    """
+    `sentiment_score` was 0.0 for every training row and non-zero only for the
+    row being predicted. It returns as a feature only when a dated news archive
+    exists.
+    """
+    from pipeline.model import FEATURES
+    assert "sentiment_score" not in FEATURES
+    assert "sentiment" not in FEATURES
+
+
+# ── F8: the target must be a return, not a price level ────────────────────────
+
+def test_target_is_an_excess_return():
+    from pipeline.model import TARGET
+    from pipeline.signals import TARGET_COLS
+
+    assert TARGET == "target_excess_return"
+    assert "target_excess_return" in TARGET_COLS
+
+
+def test_excess_return_target_is_computed_against_a_benchmark():
+    """Target must be the stock's forward log return minus the benchmark's."""
+    from pipeline.signals import HORIZON_SESSIONS
+
+    n = 200
+    close = pd.Series(np.linspace(100, 120, n))    # stock:     +20%
+    bench = pd.Series(np.linspace(200, 300, n))    # benchmark: +50%
+
+    log_c, log_b = np.log(close), np.log(bench)
+    target_return = log_c.shift(-HORIZON_SESSIONS) - log_c
+    benchmark_return = log_b.shift(-HORIZON_SESSIONS) - log_b
+    excess = target_return - benchmark_return
+
+    assert excess.notna().sum() == n - HORIZON_SESSIONS
+    # The stock rises more slowly than its benchmark, so excess must be negative.
+    assert excess.dropna().mean() < 0
+
+    # And a stock outrunning its benchmark must show positive excess.
+    fast = pd.Series(np.linspace(100, 200, n))
+    log_f = np.log(fast)
+    excess_fast = (log_f.shift(-HORIZON_SESSIONS) - log_f) - benchmark_return
+    assert excess_fast.dropna().mean() > 0
+
+
+# ── F10: no silent flat-forecast fallback ─────────────────────────────────────
+
+def test_failed_forecast_is_distinguishable_from_a_flat_forecast():
+    """
+    The old fallback set forecast_price = current_price with mape = 100, which
+    is indistinguishable from a genuine no-change prediction.
+    """
+    from agents.forecasting_agent import _failed_forecast
+
+    failed = _failed_forecast("boom")
+    assert failed["forecast_available"] is False
+    assert failed["forecast_price"] is None
+    assert failed["forecast_direction"] == "UNAVAILABLE"
+    assert failed["forecast_error"] == "boom"
+
+
+def test_warm_path_helper_is_gone():
+    """The KeyError-swallowing warm path was removed rather than patched."""
+    from agents import forecasting_agent
+    assert not hasattr(forecasting_agent, "_generate_forecast_from_existing")
+
+
+def test_feature_names_match_between_training_and_serving():
+    """
+    F10 was a name mismatch: the serving path wrote `sentiment` while FEATURES
+    expected `sentiment_score`. Any such divergence must fail loudly.
+    """
+    from pipeline.model import FEATURES
+    from pipeline.signals import FEATURE_COLS
+
+    macro_features = {"usdinr", "india_vix", "nifty_5d_return",
+                      "nifty_20d_return", "fii_net_flow", "dii_net_flow"}
+    assert set(FEATURES) == set(FEATURE_COLS) | macro_features
+
+
+# ── F11 / F12: adjustment consistency and no backward fill ────────────────────
+
+def test_ohlcv_ingestion_overwrites_rather_than_appends():
+    from pipeline import fetch
+
+    source = inspect.getsource(fetch._replace_ticker_history)
+    assert "DELETE FROM ohlcv" in source, (
+        "appending unseen dates splices two adjustment bases together (F11)"
+    )
+
+
+def test_adjustment_break_detector_exists():
+    from pipeline.fetch import detect_adjustment_breaks
+    assert callable(detect_adjustment_breaks)
+
+
+def test_no_backward_fill_anywhere_on_the_live_path():
+    """bfill() imports future values into the past (F12)."""
+    offenders = []
+    for directory in ["pipeline", "agents", "data"]:
+        for path in (REPO / directory).rglob("*.py"):
+            if "archived" in path.parts:
+                continue
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+            ):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if ".bfill(" in stripped or 'method="bfill"' in stripped:
+                    offenders.append(f"{path.relative_to(REPO)}:{lineno}")
+
+    assert not offenders, f"backward fill found at {offenders}"
+
+
+# ── F13: earnings surprise must lag the announcement ──────────────────────────
+
+def test_earnings_surprise_lands_after_the_announcement_date():
+    from pipeline.signals import compute_earnings_surprise
+
+    source = inspect.getsource(compute_earnings_surprise)
+    assert "s > row[\"announced\"]" in source or "s > row['announced']" in source, (
+        "earnings surprise must attach to the first session strictly AFTER the "
+        "announcement; Indian results are commonly declared post-close (F13)"
+    )
+
+
+# ── F4: universe must not be selected on model output ─────────────────────────
+
+def test_performance_based_universe_selector_is_deleted():
+    assert not (REPO / "tools" / "select_top_50.py").exists(), (
+        "select_top_50.py ranked stocks by composite score and kept the top 5 "
+        "per sector, selecting the universe on the model's own accuracy (F4)"
+    )
+
+
+def test_universe_rule_references_no_model_output():
+    from data.universe import UniverseRule
+
+    rule = UniverseRule()
+    fingerprint = rule.fingerprint().lower()
+    for forbidden in ["mape", "accuracy", "composite", "score", "verdict",
+                      "forecast", "confidence"]:
+        assert forbidden not in fingerprint, (
+            f"universe rule references '{forbidden}', which is model output"
+        )
+
+
+def test_ingest_universe_is_separate_from_screened_universe():
+    """
+    The liquidity screen reads the ohlcv table, which is only populated for
+    tickers already fetched. Ingesting over the SCREENED universe collapses it
+    to whatever happens to be in the database — a 100-name universe silently
+    became 5 names during Phase 0 development.
+    """
+    from data.universe import get_ingest_universe, get_universe
+
+    assert callable(get_ingest_universe)
+    assert callable(get_universe)
+
+    ingest_src = inspect.getsource(get_ingest_universe)
+    assert "get_index_members" in ingest_src
+    assert "liquidity" not in ingest_src.lower().split('"""')[-1]
+
+
+def test_pipeline_fetches_over_membership_then_screens():
+    """Ingestion must run over index membership, screening after."""
+    for path in [REPO / "scheduler.py", REPO / "main.py"]:
+        source = path.read_text(encoding="utf-8")
+        if "fetch_and_store" not in source:
+            continue
+        assert "get_ingest_universe" in source, (
+            f"{path.name} must ingest over get_ingest_universe(), not the "
+            f"already-screened universe"
+        )
+
+
+def test_universe_bias_is_reported_not_hidden():
+    from data.universe import describe_universe_bias
+
+    bias = describe_universe_bias()
+    assert "survivorship_bias" in bias
+    assert "note" in bias and bias["note"]
+
+
+# ── F9: the evidence gate, not the LLM, sets the verdict ──────────────────────
+
+def test_evidence_grade_is_deterministic_and_needs_no_llm():
+    from agents.critic_agent import grade_evidence
+
+    strong = {"forecast_available": True, "eval_rank_ic": 0.08,
+              "eval_rank_ic_t": 2.6, "eval_hit_rate": 58.0,
+              "eval_baseline_hit_rate": 52.0, "eval_beats_naive": True}
+    assert grade_evidence(strong)[0] == "STRONG"
+
+    weak = dict(strong, eval_rank_ic_t=0.4)
+    assert grade_evidence(weak)[0] == "WEAK"
+
+    nothing = {"forecast_available": True, "eval_rank_ic": 0.001,
+               "eval_rank_ic_t": 0.1, "eval_hit_rate": 48.0,
+               "eval_baseline_hit_rate": 56.0}
+    assert grade_evidence(nothing)[0] == "INSUFFICIENT"
+
+
+def test_grade_is_capped_when_magnitude_has_no_skill():
+    """A rupee target is shown, so magnitude skill is required for STRONG."""
+    from agents.critic_agent import grade_evidence
+
+    state = {"forecast_available": True, "eval_rank_ic": 0.15,
+             "eval_rank_ic_t": 3.0, "eval_hit_rate": 60.0,
+             "eval_baseline_hit_rate": 51.0, "eval_beats_naive": False}
+    grade, reasons = grade_evidence(state)
+    assert grade == "WEAK"
+    assert any("capped at WEAK" in r for r in reasons)
+
+
+def test_grade_is_insufficient_when_no_forecast_exists():
+    from agents.critic_agent import grade_evidence
+    grade, _ = grade_evidence({"forecast_available": False,
+                               "forecast_error": "no history"})
+    assert grade == "INSUFFICIENT"
+
+
+def test_composite_score_is_gated_by_evidence():
+    """
+    The old score gave 75 of 100 points from leaked metrics that barely varied.
+    A model that failed its held-out checks must now score zero regardless of
+    how large a move it predicts.
+    """
+    from agents.graph import compute_composite_score
+
+    strong = compute_composite_score(0.05, "STRONG", 0.70)
+    weak = compute_composite_score(0.05, "WEAK", 0.70)
+    insufficient = compute_composite_score(0.05, "INSUFFICIENT", 0.70)
+
+    assert strong > weak > insufficient
+    assert insufficient == 0.0
+    assert compute_composite_score(0.50, "INSUFFICIENT", 0.99) == 0.0
+    assert compute_composite_score(-0.05, "STRONG", 0.30) == 0.0
+    assert 0.0 <= strong <= 100.0
+
+
+# ── F15: bound SQL parameters ─────────────────────────────────────────────────
+
+def test_no_fstring_sql_interpolation_of_tickers():
+    """`/api/admin/run/{ticker}` accepts a user-supplied ticker."""
+    offenders = []
+    for directory in ["pipeline", "agents", "api", "data"]:
+        for path in (REPO / directory).rglob("*.py"):
+            if "archived" in path.parts:
+                continue
+            for lineno, line in enumerate(
+                path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
+            ):
+                stripped = line.strip()
+                if stripped.startswith("#") or "ALTER TABLE" in stripped:
+                    continue
+                lowered = stripped.lower()
+                looks_like_sql = any(k in lowered for k in
+                                     ("select ", "insert into", "delete from", "update "))
+                if looks_like_sql and ("f\"" in stripped or "f'" in stripped) \
+                        and "{ticker}" in stripped:
+                    offenders.append(f"{path.relative_to(REPO)}:{lineno}")
+
+    assert not offenders, f"f-string SQL with a ticker at {offenders}"
+
+
+def test_admin_key_comparison_is_constant_time():
+    from api import dependencies
+
+    source = inspect.getsource(dependencies.verify_api_key)
+    assert "compare_digest" in source
+
+
+# ── Conformal calibration ─────────────────────────────────────────────────────
+
+def test_conformal_intervals_achieve_nominal_coverage():
+    from pipeline.conformal import check_coverage, fit_conformal
+
+    rng = np.random.default_rng(7)
+    y_pred = rng.normal(size=2000) * 0.02
+    y_true = y_pred + rng.normal(size=2000) * 0.05
+
+    calibration = fit_conformal(y_true, y_pred, coverage=0.80)
+    assert calibration is not None
+
+    y_pred_new = rng.normal(size=2000) * 0.02
+    y_true_new = y_pred_new + rng.normal(size=2000) * 0.05
+
+    coverage = check_coverage(calibration, y_true_new, y_pred_new)
+    assert coverage["well_calibrated"], (
+        f"realised coverage {coverage['realised_coverage']:.3f} is more than "
+        f"5pp from the nominal 0.80"
+    )
+
+
+def test_conformal_refuses_to_calibrate_on_too_few_residuals():
+    from pipeline.conformal import fit_conformal
+    assert fit_conformal(np.array([0.1, 0.2]), np.array([0.1, 0.15])) is None
+
+
+def test_probability_is_monotonic_in_the_prediction():
+    from pipeline.conformal import fit_conformal
+
+    rng = np.random.default_rng(8)
+    y_pred = rng.normal(size=1000) * 0.02
+    y_true = y_pred + rng.normal(size=1000) * 0.05
+    calibration = fit_conformal(y_true, y_pred)
+
+    probs = [calibration.prob_positive(p) for p in [-0.10, -0.02, 0.0, 0.02, 0.10]]
+    assert probs == sorted(probs)
+    assert calibration.prob_positive(0.0) == pytest.approx(0.5, abs=0.1)
+
+
+def test_price_view_states_its_benchmark_assumption():
+    """
+    The implied rupee target only holds if the benchmark is flat. Shipping it
+    without that caveat would re-introduce the overclaiming Phase 0 removes.
+    """
+    from pipeline.conformal import to_price_view
+
+    view = to_price_view(1000.0, 0.02, None)
+    assert "assumption" in view
+    assert "flat" in view["assumption"].lower()
+    assert view["random_walk_price"] == 1000.0

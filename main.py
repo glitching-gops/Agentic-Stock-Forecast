@@ -1,67 +1,88 @@
-# main.py — Entry point for the Stock Forecast v1 application
-# Runs: DB init → Initial full pipeline run (if empty) → Starts scheduler → Launches Streamlit
+"""
+main.py — Local entry point.
 
+Order matters: the universe is synced from its point-in-time rule before any
+data is fetched, because every downstream step now takes an explicit ticker
+list rather than reaching for a hard-coded one.
+"""
+
+import os
 import subprocess
 import sys
-import os
+
 import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-from data.db import init_db, get_engine
-from pipeline.fetch import fetch_and_store
-from pipeline.signals import compute_and_store
-from pipeline.sentiment import fetch_and_score
-from pipeline.macro import fetch_and_store as fetch_macro
-from pipeline.model import train_and_forecast
-from scheduler import start_scheduler
+from data.db import get_engine, init_db
+from data.tickers import refresh_metadata
+from data.universe import (
+    describe_universe_bias,
+    get_ingest_universe,
+    get_universe,
+    init_universe_tables,
+    sync_current_membership,
+)
 
-def is_db_empty():
+
+def is_db_empty() -> bool:
     engine = get_engine()
     try:
-        count = pd.read_sql("SELECT COUNT(*) as c FROM ohlcv", con=engine).iloc[0]["c"]
+        count = pd.read_sql("SELECT COUNT(*) AS c FROM ohlcv", con=engine).iloc[0]["c"]
         return count == 0
     except Exception:
         return True
 
+
 if __name__ == "__main__":
-    print("=== Stock Forecast v1 ===\n")
+    print("=== ZeRO Agentic Stock Forecast ===\n")
 
-    # Step 1: Initialise database
-    print("[1/4] Initialising database...")
+    print("[1/5] Initialising database...")
     init_db()
+    init_universe_tables()
 
-    # Step 2: Initial data fetch if empty
+    print("[2/5] Syncing point-in-time universe...")
+    sync_current_membership()
+    refresh_metadata()
+    ingest_list = get_ingest_universe()
+    print(f"      Index members: {len(ingest_list)}")
+
+    bias = describe_universe_bias()
+    print(f"      NOTE: {bias['note']}\n")
+
     if is_db_empty():
-        print("[2/4] Database is empty. Running initial full pipeline (this will take a while)...")
-        fetch_and_store()
-        compute_and_store()
-        fetch_and_score()
+        print("[3/5] Database is empty. Running the initial full pipeline "
+              "(this takes a while)...")
+        from pipeline.fetch import fetch_and_store
+        from pipeline.macro import fetch_and_store as fetch_macro
+        from pipeline.sentiment import fetch_and_score
+        from pipeline.signals import compute_and_store
+        from pipeline.model import train_and_forecast
+
+        # Fetch over raw membership, then screen — the liquidity filter reads
+        # the table this step populates.
+        fetch_and_store(tickers=ingest_list)
         fetch_macro()
-        train_and_forecast()
+
+        universe = get_universe()
+        print(f"      Tradable universe after screening: {len(universe)}")
+
+        compute_and_store(tickers=universe)
+        fetch_and_score(tickers=universe)
+        train_and_forecast(tickers=universe)
     else:
-        print("[2/4] Database already contains data. Skipping initial fetch.")
+        print("[3/5] Database already contains data. Skipping initial fetch.")
+        universe = get_universe()
+        print(f"      Tradable universe: {len(universe)}")
 
-    # Step 2.5: Initialise LangGraph State for all stocks
-    from agents.graph import run_graph
-
-    print("[2.5/4] Pre-warming LangGraph states...")
-    # We can pre-run the graph for RELIANCE.NS just to make sure it compiles
-    try:
-        run_graph("RELIANCE.NS")
-    except Exception as e:
-        print(f"Warning: Failed to pre-warm graph: {e}")
-
-    # Step 3: Start Scheduler
-    print("[3/4] Starting background scheduler...")
+    print("[4/5] Starting background scheduler...")
+    from scheduler import start_scheduler
     start_scheduler()
 
-    # Step 4: Launch Streamlit dashboard
-    print("[4/4] Launching dashboard...\n")
+    print("[5/5] Launching dashboard...\n")
     dashboard_path = os.path.join(os.path.dirname(__file__), "app", "main.py")
-    
-    # Run streamlit
+
     try:
         subprocess.run([sys.executable, "-m", "streamlit", "run", dashboard_path])
     except KeyboardInterrupt:

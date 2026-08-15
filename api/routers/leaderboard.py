@@ -1,59 +1,95 @@
 """
-GET /api/leaderboard — returns ranked stocks by composite score.
-Supports filtering by sector, verdict, confidence, and sorting.
+GET /api/leaderboard — stocks ranked by composite score.
+
+The composite is now predicted excess return and conviction, multiplied by an
+evidence grade from purged walk-forward evaluation. Previously ~75 of its 100
+points came from leaked in-sample metrics that barely varied across stocks
+(audit finding F9).
 """
-from fastapi import APIRouter, Query
-from api.schemas.leaderboard import LeaderboardResponse, LeaderboardEntry
-from data.db import get_engine
-import pandas as pd
 from datetime import datetime
 from typing import Optional
 
+import pandas as pd
+from fastapi import APIRouter, Query
+from sqlalchemy import text
+
+from api.schemas.leaderboard import LeaderboardEntry, LeaderboardResponse
+from data.db import get_engine
+
 router = APIRouter()
+
+SORTABLE = {
+    "composite_score": False,
+    "upside_pct": False,
+    "pred_excess_return": False,
+    "prob_outperform": False,
+    "eval_rank_ic": False,
+    "eval_hit_rate": False,
+}
+
 
 @router.get("", response_model=LeaderboardResponse)
 def get_leaderboard(
     sector:     Optional[str] = Query(None),
     verdict:    Optional[str] = Query(None),
-    confidence: Optional[str] = Query(None),
+    evidence:   Optional[str] = Query(None, description="STRONG / WEAK / INSUFFICIENT"),
     sort_by:    str = Query("composite_score"),
-    limit:      int = Query(20)
+    limit:      int = Query(20, ge=1, le=200),
 ):
     engine = get_engine()
-    df = pd.read_sql("SELECT * FROM leaderboard ORDER BY composite_score DESC", con=engine)
+    df = pd.read_sql(text("SELECT * FROM leaderboard"), con=engine)
 
-    filters_applied = {}
+    if df.empty:
+        return LeaderboardResponse(entries=[], total=0,
+                                   last_updated=datetime.now().isoformat(),
+                                   filters_applied={})
+
+    filters: dict = {}
 
     if sector:
         df = df[df["sector"] == sector]
-        filters_applied["sector"] = sector
+        filters["sector"] = sector
+
     if verdict:
-        verdict_upper = verdict.upper()
-        if verdict_upper == "APPROVED_OR_FLAGGED":
+        upper = verdict.upper()
+        if upper == "APPROVED_OR_FLAGGED":
             df = df[df["critic_verdict"].isin(["APPROVED", "FLAGGED"])]
-            filters_applied["verdict"] = "APPROVED_OR_FLAGGED"
-        elif verdict_upper in ["APPROVED", "FLAGGED", "REJECTED"]:
-            df = df[df["critic_verdict"] == verdict_upper]
-            filters_applied["verdict"] = verdict_upper
-        # Silently ignore invalid verdict values
-    if confidence:
-        df = df[df["forecast_confidence"] == confidence.capitalize()]
-        filters_applied["confidence"] = confidence
+            filters["verdict"] = upper
+        elif upper in {"APPROVED", "FLAGGED", "REJECTED"}:
+            df = df[df["critic_verdict"] == upper]
+            filters["verdict"] = upper
 
-    valid_sort = ["composite_score", "upside_pct", "mape", "directional_accuracy"]
-    if sort_by in valid_sort:
-        ascending = sort_by == "mape"
-        df = df.sort_values(sort_by, ascending=ascending)
+    if evidence:
+        upper = evidence.upper()
+        if upper in {"STRONG", "WEAK", "INSUFFICIENT"}:
+            df = df[df["forecast_confidence"] == upper]
+            filters["evidence"] = upper
 
-    df = df.head(limit)
+    key = sort_by if sort_by in SORTABLE else "composite_score"
+    if key in df.columns:
+        df = df.sort_values(key, ascending=SORTABLE[key], na_position="last")
+
+    df = df.head(limit).reset_index(drop=True)
     df["rank"] = range(1, len(df) + 1)
 
-    entries = [LeaderboardEntry(**row.to_dict()) for _, row in df.iterrows()]
-    last_updated = df["last_updated"].max() if "last_updated" in df.columns else datetime.now().isoformat()
+    def _bool(value):
+        return None if value is None or pd.isna(value) else bool(value)
+
+    entries = []
+    for _, row in df.iterrows():
+        record = row.where(row.notna(), None).to_dict()
+        record["benchmark_sector_specific"] = _bool(row.get("benchmark_sector_specific"))
+        record["eval_beats_random_walk"] = _bool(row.get("eval_beats_random_walk"))
+        entries.append(LeaderboardEntry(**{
+            k: v for k, v in record.items()
+            if k in LeaderboardEntry.model_fields
+        }))
+
+    last_updated = df["last_updated"].max() if "last_updated" in df.columns else datetime.now()
 
     return LeaderboardResponse(
         entries=entries,
         total=len(entries),
         last_updated=str(last_updated),
-        filters_applied=filters_applied
+        filters_applied=filters,
     )

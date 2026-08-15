@@ -81,9 +81,11 @@ def fetch_and_store():
     print("Fetching macroeconomic data...")
     
     try:
-        # Fetch data for the last 2 years to match OHLCV data
+        # Match the OHLCV window (pipeline.fetch.PERIOD). A shorter macro
+        # window silently truncates the training set at the join in
+        # load_features_for_ticker.
         tickers = ["USDINR=X", "^INDIAVIX", "^NSEI"]
-        data = yf.download(tickers, period="2y", interval="1d", auto_adjust=True)
+        data = yf.download(tickers, period="10y", interval="1d", auto_adjust=True)
         
         if data.empty:
             print("[Macro] No macro data returned from yfinance. Skipping update.")
@@ -96,10 +98,13 @@ def fetch_and_store():
         if isinstance(close_df.columns, pd.MultiIndex):
             close_df.columns = [str(col[0]) for col in close_df.columns]
             
-        # Forward fill any missing prices from yfinance
+        # Forward fill only. The previous code also called bfill(), which fills
+        # a missing value from a LATER observation — look-ahead bias (audit
+        # finding F12). Leading gaps, where USDINR and NSE calendars diverge at
+        # the start of the window, are dropped instead of being back-filled.
         close_df.ffill(inplace=True)
-        close_df.bfill(inplace=True)
-            
+        close_df = close_df.dropna(how="any")
+
         # Reset index to get Date as column
         df = close_df.reset_index()
         df.rename(columns={
@@ -133,19 +138,25 @@ def fetch_and_store():
             df["fii_net_flow"] = 0.0
             df["dii_net_flow"] = 0.0
         
-        # Check existing to avoid duplicates
-        existing_dates = pd.read_sql("SELECT date FROM macro", con=engine)["date"].tolist()
-        
-        new_rows = df[~df["date"].isin(existing_dates)]
-        
-        if not new_rows.empty:
-            new_rows.to_sql("macro", con=engine, if_exists="append", index=False)
-            print(f"Stored {len(new_rows)} new macro rows.")
-            return len(new_rows)
-        else:
-            print("No new macro rows to store.")
-            return 0
-            
+        # yfinance can return more than one row for the current session (a
+        # partial intraday bar alongside the daily one). Keep the last per date.
+        df = df.drop_duplicates(subset=["date"], keep="last")
+
+        # Overwrite the refreshed window rather than appending unseen dates.
+        # Appending leaves rows computed under an older Nifty adjustment basis
+        # in place, the same defect as F11 in the OHLCV path.
+        from sqlalchemy import text
+
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM macro WHERE date >= :start"),
+                         {"start": df["date"].min()})
+            df.to_sql("macro", con=conn, if_exists="append", index=False)
+            conn.commit()
+
+        print(f"Stored {len(df)} macro rows (window refreshed from {df['date'].min()}).")
+        return len(df)
+
+
     except Exception as e:
         print(f"Error fetching macro data: {e}")
         return 0

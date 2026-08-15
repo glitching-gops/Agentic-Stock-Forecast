@@ -51,7 +51,11 @@ def init_db():
     engine = get_engine()
     with engine.connect() as conn:
 
-        # Raw OHLCV table
+        # Raw OHLCV table.
+        # `close` is the unadjusted traded price; `adj_close` is the
+        # corporate-action-adjusted series. Storing both is what lets the
+        # pipeline detect adjustment breaks instead of silently splicing two
+        # adjustment bases together (audit finding F11).
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ohlcv (
                 date        TEXT,
@@ -60,10 +64,18 @@ def init_db():
                 high        REAL,
                 low         REAL,
                 close       REAL,
+                adj_close   REAL,
                 volume      REAL,
                 PRIMARY KEY (date, ticker)
             )
         """))
+
+        for col in ["adj_close"]:
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(f"ALTER TABLE ohlcv ADD COLUMN {col} REAL"))
+            except Exception:
+                pass  # Column already exists
 
         # Computed signals table
         conn.execute(text("""
@@ -100,12 +112,29 @@ def init_db():
         new_columns = [
             "ema_50", "bb_upper", "bb_lower", "hurst",
             "sector_rel_5d", "sector_rel_10d", "sector_rel_20d",
-            "earnings_surprise"  # new
+            "earnings_surprise",
+            # Phase 0: the target is now a forward EXCESS return rather than an
+            # absolute price level. Predicting a price level made MAPE look
+            # flattering (a random walk beats the model on it) and capped every
+            # forecast at the training maximum, because trees cannot
+            # extrapolate (audit findings F8, and the target half of F1).
+            "target_return",          # forward log return of the stock
+            "target_excess_return",   # forward log return minus benchmark
+            "benchmark_return",       # forward log return of the benchmark
         ]
         for col in new_columns:
             try:
                 with conn.begin_nested():
                     conn.execute(text(f"ALTER TABLE signals ADD COLUMN {col} REAL"))
+            except Exception:
+                pass  # Column already exists, skip
+
+        # Non-numeric signal columns recording which benchmark was used.
+        for col, coltype in [("benchmark_ticker", "TEXT"),
+                             ("benchmark_sector_specific", "INTEGER")]:
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(f"ALTER TABLE signals ADD COLUMN {col} {coltype}"))
             except Exception:
                 pass  # Column already exists, skip
 
@@ -193,6 +222,54 @@ def init_db():
             )
         """))
 
+        # Phase 0 forecast record. The model predicts an excess return; the
+        # displayed rupee target is derived from it, and is shown alongside a
+        # conformal interval, a calibrated probability, and the random-walk
+        # reference so a reader can see what the forecast is being compared to.
+        forecast_extra = [
+            ("pred_excess_return",   "REAL"),    # model output, log excess return
+            ("pred_return",          "REAL"),    # implied total return
+            ("interval_low",         "REAL"),    # conformal lower bound, price
+            ("interval_high",        "REAL"),    # conformal upper bound, price
+            ("interval_coverage",    "REAL"),    # nominal coverage, e.g. 0.80
+            ("prob_outperform",      "REAL"),    # calibrated P(excess return > 0)
+            ("random_walk_price",    "REAL"),    # baseline: today's price
+            ("benchmark_ticker",     "TEXT"),
+            ("benchmark_name",       "TEXT"),
+            ("benchmark_sector_specific", "INTEGER"),
+            ("eval_rank_ic",         "REAL"),    # honest walk-forward metrics
+            ("eval_hit_rate",        "REAL"),
+            ("eval_baseline_hit_rate", "REAL"),
+            ("eval_beats_random_walk", "INTEGER"),
+            ("model_version",        "TEXT"),
+            ("universe_rule",        "TEXT"),
+        ]
+        for table in ["forecasts", "leaderboard"]:
+            for col, coltype in forecast_extra:
+                try:
+                    with conn.begin_nested():
+                        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                except Exception:
+                    pass  # Column already exists, skip
+
+        # Realised outcomes, written back at T+30. This is what converts a
+        # claimed accuracy into an observed one.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS forecast_outcomes (
+                forecast_id          INTEGER,
+                ticker               TEXT NOT NULL,
+                forecast_date        TEXT NOT NULL,
+                resolution_date      TEXT,
+                pred_excess_return   REAL,
+                realised_excess_return REAL,
+                realised_return      REAL,
+                benchmark_return     REAL,
+                direction_correct    INTEGER,
+                inside_interval      INTEGER,
+                PRIMARY KEY (ticker, forecast_date)
+            )
+        """))
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS model_metadata (
                 ticker              TEXT PRIMARY KEY,
@@ -210,12 +287,28 @@ def init_db():
             )
         """))
 
-        # Add new model_metadata columns (safe migration)
-        meta_new_columns = ["ensemble_mape", "ensemble_dir_acc"]
+        # Add new model_metadata columns (safe migration).
+        # The eval_* columns replace xgb_mape / xgb_dir_acc / ensemble_*, which
+        # are retained only so old rows still read. Writing an excess-return MAE
+        # into a column named "mape" is exactly the sort of quiet mislabelling
+        # that made the previous metrics unreadable.
+        meta_new_columns = [
+            "ensemble_mape", "ensemble_dir_acc",
+            "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate",
+            "eval_baseline_hit_rate", "eval_mae", "eval_mae_naive",
+            "eval_n_oos", "eval_n_effective",
+        ]
         for col in meta_new_columns:
             try:
                 with conn.begin_nested():
                     conn.execute(text(f"ALTER TABLE model_metadata ADD COLUMN {col} REAL"))
+            except Exception:
+                pass  # Column already exists, skip
+
+        for col in ["model_version", "eval_protocol"]:
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(f"ALTER TABLE model_metadata ADD COLUMN {col} TEXT"))
             except Exception:
                 pass  # Column already exists, skip
 

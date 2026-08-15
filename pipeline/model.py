@@ -1,323 +1,396 @@
-# model.py — Trains an XGBoost regressor on the computed signals, sentiment, and macro data
-# Uses Optuna for hyperparameter tuning and expanding window cross-validation
+"""
+pipeline/model.py — Training, honest evaluation, and forecast generation.
 
+The rewrite removes the metric path that produced the project's headline
+numbers. Previously:
+
+  - a Ridge meta-learner was fitted on the validation set and scored on that
+    same validation set, and its output overwrote the XGBoost metrics (F1);
+  - Optuna saw the test slice before it was reported as held out (F2);
+  - folds were contiguous, so 30-session labels straddled the split (F3);
+  - the final production model was fitted on all data, then a *different*
+    model's accuracy was reported next to its forecast.
+
+Now there are two clearly separated paths:
+
+  EVALUATION   ``evaluate_ticker`` runs purged walk-forward with tuning nested
+               inside each training fold. Everything reported comes from here,
+               always beside a baseline.
+
+  PRODUCTION   ``fit_production_model`` fits on all labelled data to generate
+               tomorrow's forecast. It produces NO metrics. A forecast carries
+               the evaluation metrics measured on held-out folds, which is the
+               only honest thing to attach to it.
+"""
+
+from __future__ import annotations
+
+import json
 import os
-import pandas as pd
-import numpy as np
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
 import joblib
-from datetime import datetime
+import numpy as np
+import pandas as pd
 from sqlalchemy import text
 from xgboost import XGBRegressor
-from sklearn.metrics import mean_absolute_percentage_error
+
 from data.db import get_engine
-from data.tickers import TICKERS
-from pipeline.tuning import tune_hyperparameters, expanding_window_cv
-from pipeline.lstm_model import train_lstm, predict_lstm
-from pipeline.meta_learner import train_meta_learner, predict_ensemble
+from pipeline.conformal import fit_conformal, to_price_view
+from pipeline.evaluation import (
+    PurgedWalkForward,
+    WalkForwardResult,
+    format_report,
+    walk_forward,
+)
+from pipeline.signals import FEATURE_COLS, HORIZON_SESSIONS
+from pipeline.tuning import tune, tune_and_cache
 
-FEATURES = [
-    # Technical signals (20)
-    "rsi", "macd_hist", "bb_width", "obv", "sma_20",
-    "ema_9", "ema_21", "ema_50", "atr_14", "stoch_k",
-    "williams_r", "roc_10", "vroc_10", "prox_52w",
-    "lag1_ret", "lag5_ret", "dev_sma50", "bb_upper",
-    "bb_lower", "hurst",
-    # Sentiment
-    "sentiment_score",
-    # Macro signals
+MODEL_VERSION = "phase0-excess-return-v1"
+
+FEATURES = FEATURE_COLS + [
+    # Macro. `fii_net_flow` / `dii_net_flow` were scraped and stored by
+    # macro.py but never referenced by the old FEATURES list; they are wired in
+    # here rather than left as dead columns (audit finding F15).
     "usdinr", "india_vix", "nifty_5d_return", "nifty_20d_return",
-    # New signals — Track A
-    "sector_rel_5d", "sector_rel_10d", "sector_rel_20d",
-    "earnings_surprise",
+    "fii_net_flow", "dii_net_flow",
 ]
-TARGET   = "target"
 
-def classify_confidence(mape: float, dir_acc: float) -> str:
-    if mape < 8.0 and dir_acc > 65.0:
-        return "High"
-    if mape <= 12.0 or dir_acc >= 55.0:
-        return "Medium"
-    return "Low"
+TARGET = "target_excess_return"
 
-def load_features_for_ticker(ticker: str, engine):
+MODELS_DIR = os.path.join(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "models", "joblib"
+)
+
+
+@dataclass
+class TickerForecast:
+    """A forecast and the held-out evidence for trusting it."""
+
+    ticker: str
+    forecast_date: str
+    current_price: float
+    price_view: dict = field(default_factory=dict)
+    evaluation: dict = field(default_factory=dict)
+    benchmark_ticker: str = ""
+    benchmark_sector_specific: bool = False
+    model_version: str = MODEL_VERSION
+    n_train_rows: int = 0
+
+
+# ── Feature assembly ──────────────────────────────────────────────────────────
+
+
+def load_features_for_ticker(ticker: str, engine=None) -> pd.DataFrame:
     """
-    Reads signals, sentiment, and macro data from the database for a given ticker.
-    Returns (X, y) as a tuple of DataFrames.
+    Loads signals joined to macro data for one ticker, sorted by date.
+
+    ``sentiment_score`` is deliberately ABSENT. It only ever existed for the
+    current date, so every training row held 0.0 while the single row being
+    predicted held a real value (audit finding F7) — a train/serve mismatch at
+    exactly the row that matters. It returns once a dated news archive exists.
     """
-    # Load signals
-    signals_df = pd.read_sql(f"SELECT * FROM signals WHERE ticker = '{ticker}' ORDER BY date ASC", con=engine)
-    if signals_df.empty:
-        return pd.DataFrame(), pd.Series()
-        
-    signals_df.set_index("date", inplace=True)
-    
-    # Load macro data
-    macro_df = pd.read_sql("SELECT * FROM macro ORDER BY date ASC", con=engine)
-    macro_df.set_index("date", inplace=True)
-    
-    # Load sentiment data
-    sentiment_df = pd.read_sql(f"SELECT date, sentiment_label, sentiment_score FROM sentiment WHERE ticker = '{ticker}'", con=engine)
-    
-    # Aggregate sentiment by date
-    daily_sentiment = {}
-    for _, row in sentiment_df.iterrows():
-        d = row["date"]
-        # Score = score if positive, -score if negative, 0 if neutral
-        score = row["sentiment_score"] if row["sentiment_label"] == "positive" else (-row["sentiment_score"] if row["sentiment_label"] == "negative" else 0)
-        if d not in daily_sentiment:
-            daily_sentiment[d] = []
-        daily_sentiment[d].append(score)
-        
-    daily_sentiment_avg = {d: np.mean(scores) for d, scores in daily_sentiment.items()}
-    
-    # Merge signals and macro
-    df = signals_df.join(macro_df, how="inner")
-    
-    # Map sentiment (fallback to 0.0 for historical dates without sentiment data)
-    df["sentiment_score"] = df.index.map(lambda d: daily_sentiment_avg.get(d, 0.0))
-    
-    # Defensive feature filling
+    engine = engine or get_engine()
+
+    signals = pd.read_sql(
+        text("SELECT * FROM signals WHERE ticker = :t ORDER BY date ASC"),
+        engine, params={"t": ticker},
+    )
+    if signals.empty:
+        return pd.DataFrame()
+
+    macro = pd.read_sql(text("SELECT * FROM macro ORDER BY date ASC"), engine)
+
+    if macro.empty:
+        for col in ["usdinr", "india_vix", "nifty_5d_return",
+                    "nifty_20d_return", "fii_net_flow", "dii_net_flow"]:
+            signals[col] = 0.0
+        df = signals
+    else:
+        df = signals.merge(macro, on="date", how="left")
+        macro_cols = [c for c in macro.columns if c != "date"]
+        # Forward fill only — never bfill, which would import future values (F12).
+        df[macro_cols] = df[macro_cols].ffill()
+
     for col in FEATURES:
         if col not in df.columns:
-            print(f"[Model] {ticker}: feature '{col}' not found — filling with 0.0")
             df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    
-    if len(df) < 50:
-        return pd.DataFrame(), pd.Series()
-        
-    X = df[FEATURES]
-    y = df[TARGET]
-    
-    return X, y
 
-def train_and_forecast(single_ticker=None):
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def _model_factory(params: dict | None = None):
+    """Returns a factory producing fresh, identically configured estimators."""
+    def factory():
+        model = XGBRegressor(random_state=42, verbosity=0, tree_method="hist")
+        if params:
+            model.set_params(**params)
+        return model
+    return factory
+
+
+# ── Evaluation path ───────────────────────────────────────────────────────────
+
+
+def evaluate_ticker(
+    ticker: str,
+    df: pd.DataFrame | None = None,
+    n_folds: int = 6,
+    tune_inside_folds: bool = True,
+    tune_trials: int = 15,
+) -> WalkForwardResult:
+    """
+    Purged walk-forward evaluation. This is the ONLY source of reported metrics.
+
+    Hyperparameter search runs inside each training fold via the ``tuner``
+    callback, so no configuration is ever chosen with sight of the rows it is
+    later scored on.
+
+    ``tune_trials`` is the per-fold Optuna budget. Cost is
+    ``n_folds x tune_trials x inner_folds`` model fits per ticker, so a
+    universe-wide evaluation is expensive; lower it for breadth and record the
+    value alongside the result. What matters for validity is that tuning is
+    NESTED, not that it is exhaustive — and a smaller search is the conservative
+    direction, since fewer configurations tried means a lower bar for the result
+    to clear (see ``evaluation.deflated_sharpe_note``).
+    """
+    df = load_features_for_ticker(ticker) if df is None else df
+    if df.empty or len(df) < 350:
+        return WalkForwardResult(ticker, 0, 0,
+                                 pd.DataFrame(columns=["date", "y_true", "y_pred", "fold"]))
+
+    X = df[FEATURES]
+    y = df[TARGET] if TARGET in df.columns else pd.Series(np.nan, index=df.index)
+
+    tuner = None
+    if tune_inside_folds:
+        def tuner(X_train: pd.DataFrame, y_train: pd.Series) -> dict:   # noqa: E306
+            return tune(X_train, y_train, horizon=HORIZON_SESSIONS,
+                        n_trials=tune_trials)
+
+    return walk_forward(
+        X=X, y=y, dates=df["date"].tolist(),
+        model_factory=_model_factory(),
+        # min_train=500 (~2 years) so the first fold is not fitted on a
+        # window shorter than the feature lookbacks it depends on.
+        splitter=PurgedWalkForward(n_folds=n_folds, horizon=HORIZON_SESSIONS,
+                                   embargo=HORIZON_SESSIONS, min_train=500),
+        ticker=ticker,
+        tuner=tuner,
+    )
+
+
+# ── Production path ───────────────────────────────────────────────────────────
+
+
+def fit_production_model(ticker: str, df: pd.DataFrame, force_tune: bool = False):
+    """
+    Fits on all labelled rows to generate the next forecast.
+
+    Returns (model, n_train_rows). Produces NO metrics: a model fitted on
+    everything has no held-out data left to be scored on, and pretending
+    otherwise is precisely what F1 did.
+    """
+    labelled = df[df[TARGET].notna()]
+    if len(labelled) < 200:
+        return None, 0
+
+    X, y = labelled[FEATURES], labelled[TARGET]
+    params = tune_and_cache(ticker, X, y, horizon=HORIZON_SESSIONS, force=force_tune)
+
+    model = XGBRegressor(**params, random_state=42, verbosity=0)
+    model.fit(X, y)
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    joblib.dump(
+        {"model": model, "features": FEATURES, "version": MODEL_VERSION,
+         "trained_at": datetime.now(timezone.utc).isoformat(), "n_train": len(labelled)},
+        os.path.join(MODELS_DIR, f"{ticker}.joblib"),
+    )
+    return model, len(labelled)
+
+
+def forecast_ticker(ticker: str, force_tune: bool = False) -> TickerForecast | None:
+    """
+    Produces one forecast with its held-out evidence attached.
+
+    Sequence: evaluate on purged folds, calibrate conformal intervals on those
+    out-of-sample residuals, then fit the production model and predict the most
+    recent unlabelled row.
+    """
+    df = load_features_for_ticker(ticker)
+    if df.empty or len(df) < 350:
+        print(f"[Model] {ticker}: insufficient history ({len(df)} rows)")
+        return None
+
+    result = evaluate_ticker(ticker, df)
+    if result.n_predictions == 0:
+        print(f"[Model] {ticker}: no out-of-sample predictions")
+        return None
+
+    calibration = fit_conformal(
+        result.predictions["y_true"].to_numpy(),
+        result.predictions["y_pred"].to_numpy(),
+        coverage=0.80,
+    )
+
+    model, n_train = fit_production_model(ticker, df, force_tune=force_tune)
+    if model is None:
+        return None
+
+    # Predict the most recent row whose label is not yet knowable.
+    unlabelled = df[df[TARGET].isna()]
+    latest = unlabelled.iloc[[-1]] if not unlabelled.empty else df.iloc[[-1]]
+
+    pred_excess = float(model.predict(latest[FEATURES])[0])
+    current_price = float(latest["close"].iloc[0])
+    forecast_date = str(latest["date"].iloc[0])
+
+    price_view = to_price_view(current_price, pred_excess, calibration)
+
+    m = result.metrics
+    evaluation = {
+        "rank_ic": m.get("rank_ic"),
+        "rank_ic_t": m.get("rank_ic_t"),
+        "hit_rate": m.get("hit_rate"),
+        "majority_hit_rate": m.get("majority_hit_rate"),
+        "n_effective": m.get("n_effective"),
+        "mae": m.get("mae"),
+        "mae_naive_zero": result.baselines.get("zero", {}).get("mae"),
+        "beats_naive": m.get("beats_naive_mae", False),
+        "n_oos_predictions": result.n_predictions,
+        "n_folds": result.n_folds_run,
+        "protocol": result.protocol,
+    }
+
+    bench_ticker = str(latest.get("benchmark_ticker", pd.Series([""])).iloc[0] or "")
+    bench_specific = bool(latest.get("benchmark_sector_specific", pd.Series([0])).iloc[0])
+
+    return TickerForecast(
+        ticker=ticker,
+        forecast_date=forecast_date,
+        current_price=current_price,
+        price_view=price_view,
+        evaluation=evaluation,
+        benchmark_ticker=bench_ticker,
+        benchmark_sector_specific=bench_specific,
+        n_train_rows=n_train,
+    )
+
+
+# ── Batch driver ──────────────────────────────────────────────────────────────
+
+
+def train_and_forecast(single_ticker: str | None = None,
+                       tickers: list[str] | None = None,
+                       force_tune: bool = False) -> dict[str, TickerForecast]:
+    """Generates forecasts for a set of tickers and records model metadata."""
+    if single_ticker:
+        to_process = [single_ticker]
+    elif tickers:
+        to_process = list(tickers)
+    else:
+        from data.universe import get_universe
+        to_process = get_universe()
+
     engine = get_engine()
-    tickers_to_process = [single_ticker] if single_ticker else list(TICKERS.keys())
-    results = {}
-    
-    # Create models dir if not exists
-    os.makedirs(os.path.join(os.path.dirname(__file__), "..", "models", "joblib"), exist_ok=True)
-    
-    for ticker in tickers_to_process:
-        print(f"Training model for {ticker}...")
-        
-        X, y = load_features_for_ticker(ticker, engine)
-        
-        if X.empty or len(X) < 100:
-            print(f"Not enough complete data for {ticker}")
+    results: dict[str, TickerForecast] = {}
+
+    for ticker in to_process:
+        try:
+            forecast = forecast_ticker(ticker, force_tune=force_tune)
+        except Exception as exc:                                  # noqa: BLE001
+            print(f"[Model] {ticker}: failed — {exc}")
             continue
 
-        # Split into instances where target is known (for training) vs unknown (for prediction)
-        train_mask = y.notna()
-        X_train_full = X[train_mask]
-        y_train_full = y[train_mask]
-        
-        # Test evaluation split (last 15% for directional accuracy check)
-        n = len(X_train_full)
-        split_idx = int(n * 0.85)
-        X_train, y_train = X_train_full.iloc[:split_idx], y_train_full.iloc[:split_idx]
-        X_test, y_test   = X_train_full.iloc[split_idx:], y_train_full.iloc[split_idx:]
+        if forecast is None:
+            continue
 
-        # Get tuned parameters — uses saved params if available, runs Optuna if not
-        best_params = tune_hyperparameters(ticker, X_train_full, y_train_full)
+        results[ticker] = forecast
+        ev = forecast.evaluation
+        print(f"[Model] {ticker}: excess={forecast.price_view['pred_excess_return']:+.4f} "
+              f"IC={ev.get('rank_ic', float('nan')):+.3f} "
+              f"hit={ev.get('hit_rate', float('nan')):.1f}% "
+              f"(majority {ev.get('majority_hit_rate', float('nan')):.1f}%)")
 
-        # Train final model on full training set using tuned parameters
-        model = XGBRegressor(**best_params, random_state=42, verbosity=0)
-        model.fit(X_train_full, y_train_full)
-
-        # Evaluate using expanding window CV for a more realistic MAPE estimate
-        cv_mape = expanding_window_cv(X_train_full, y_train_full, best_params) * 100
-
-        # Also compute test set directional accuracy on the held-out 15%
-        # We need to retrain on the 85% part to avoid data leakage for the test set accuracy
-        test_model = XGBRegressor(**best_params, random_state=42, verbosity=0)
-        test_model.fit(X_train, y_train)
-        y_pred_test = test_model.predict(X_test)
-        
-        # Directional accuracy: compare actual direction vs predicted direction
-        # Get previous close for the test set period
-        # We need the original dataframe close prices
-        signals_df = pd.read_sql(f"SELECT date, close FROM signals WHERE ticker = '{ticker}'", con=engine)
-        signals_df.set_index("date", inplace=True)
-        test_prev_close = signals_df.loc[y_test.index, "close"].values
-        
-        actual_dir = np.where(y_test.values > test_prev_close, 1, 0)
-        pred_dir   = np.where(y_pred_test > test_prev_close, 1, 0)
-        directional_accuracy = float(np.mean(actual_dir == pred_dir) * 100)
-
-        mape = cv_mape  # use CV MAPE as the reported metric
-
-        print(f"{ticker} -> CV MAPE: {mape:.2f}%, Dir Acc: {directional_accuracy:.2f}%")
-        
-        # Save model
-        model_path = os.path.join(os.path.dirname(__file__), "..", "models", "joblib", f"{ticker}.joblib")
-        joblib.dump(model, model_path)
-
-        # Forecast: use the most recent row (where target is NaN)
-        pred_mask = y.isna()
-        if pred_mask.any():
-            latest_row = X[pred_mask].iloc[[-1]]
-            current_price = float(signals_df.loc[latest_row.index[0], "close"])
-        else:
-            # Fallback if no target is NaN (shouldn't happen with 30-day shift)
-            latest_row = X.iloc[[-1]]
-            current_price = float(signals_df.iloc[-1]["close"])
-            
-        forecast_price = float(model.predict(latest_row)[0])
-        forecast_date = latest_row.index[0]
-
-        # Determine confidence
-        if mape < 8.0 and directional_accuracy > 65.0:
-            confidence = "High"
-        elif mape <= 12.0 or directional_accuracy >= 55.0:
-            confidence = "Medium"
-        else:
-            confidence = "Low"
-
-        df_full = X.copy()
-        df_full['target'] = y
-        df_full['close'] = signals_df.loc[df_full.index, 'close']
-
-        # ── LSTM training ────────────────────────────────────────────────────────────
-        print(f"[Model] {ticker}: training LSTM...")
-        try:
-            lstm_result = train_lstm(ticker, df_full.copy(), force=False)
-            lstm_price = predict_lstm(ticker, df_full.copy())
-            lstm_device = lstm_result.get("device")
-        except Exception as e:
-            print(f"[Model] {ticker}: LSTM failed — {e}")
-            lstm_price = None
-            lstm_device = "cpu"
-            lstm_result = {}
-
-        # ── Meta-learner training ────────────────────────────────────────────────────
-        try:
-            val_df = df_full.iloc[split_idx:n].copy()
-            lstm_val_preds = []
-
-            for i in range(len(val_df)):
-                context_start = max(0, split_idx + i - 30)
-                context_df    = df_full.iloc[context_start:split_idx + i].copy()
-                pred = predict_lstm(ticker, context_df)
-                lstm_val_preds.append(pred if pred is not None else y_pred_test[i])
-
-            lstm_val_preds = np.array(lstm_val_preds)
-            hurst_val      = X_test["hurst"].values if "hurst" in X_test.columns \
-                             else np.full(len(y_test), 0.5)
-
-            meta = train_meta_learner(
-                ticker,
-                xgb_val_preds  = y_pred_test,
-                lstm_val_preds = lstm_val_preds,
-                hurst_val      = hurst_val,
-                y_val          = y_test.values,
-                force          = False
-            )
-        except Exception as e:
-            print(f"[Model] {ticker}: meta-learner training failed — {e}")
-            meta = None
-            ensemble_mape = mape
-            ensemble_dir_acc = directional_accuracy
-
-        if meta:
-            try:
-                # Calculate ensemble MAPE on validation set
-                # Re-align lengths as in train_meta_learner
-                min_len = min(len(y_pred_test), len(lstm_val_preds), len(hurst_val), len(y_test))
-                X_meta_test = np.column_stack([
-                    y_pred_test[-min_len:],
-                    lstm_val_preds[-min_len:],
-                    hurst_val[-min_len:]
-                ])
-                y_meta_test = y_test.values[-min_len:]
-                
-                ensemble_val_preds = meta.predict(X_meta_test)
-                ensemble_mape = float(mean_absolute_percentage_error(y_meta_test, ensemble_val_preds) * 100)
-                
-                # Calculate ensemble directional accuracy
-                # Need prev_close for y_meta_test
-                test_prev_close_meta = test_prev_close[-min_len:]
-                actual_dir_meta = np.where(y_meta_test > test_prev_close_meta, 1, 0)
-                pred_dir_meta   = np.where(ensemble_val_preds > test_prev_close_meta, 1, 0)
-                ensemble_dir_acc = float(np.mean(actual_dir_meta == pred_dir_meta) * 100)
-            except Exception as e:
-                print(f"[Model] {ticker}: ensemble evaluation failed — {e}")
-                ensemble_mape = mape
-                ensemble_dir_acc = directional_accuracy
-        else:
-            ensemble_mape = mape
-            ensemble_dir_acc = directional_accuracy
-
-        # ── Ensemble final forecast ──────────────────────────────────────────────────
-        current_hurst  = float(df_full["hurst"].iloc[-1]) \
-                         if "hurst" in df_full.columns else 0.5
-
-        ensemble_price = predict_ensemble(
-            ticker        = ticker,
-            xgb_price     = forecast_price,
-            lstm_price    = lstm_price,
-            current_hurst = current_hurst,
-            current_price = current_price,
-        )
-
-        results[ticker] = {
-            "current_price":  current_price,
-            "xgb_forecast_price": forecast_price,
-            "lstm_forecast_price": lstm_price,
-            "forecast_price": ensemble_price,
-            "xgb_mape":       round(mape, 2),
-            "xgb_dir_acc":    round(directional_accuracy, 2),
-            "mape":           round(ensemble_mape, 2),
-            "dir_acc":  round(ensemble_dir_acc, 2),
-            "forecast_date":  forecast_date,
-            "direction":      "UP" if ensemble_price > current_price else "DOWN",
-            "change_pct":     round(((ensemble_price - current_price) / current_price) * 100, 2),
-            "feature_importance": dict(zip(FEATURES, model.feature_importances_)),
-            "forecast_confidence": confidence,
-            "device": lstm_device
-        }
-
-        # Step 5 - write model metadata to database
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO model_metadata (
-                    ticker, xgb_mape, xgb_dir_acc, lstm_val_mape,
-                    ensemble_mape, ensemble_dir_acc,
-                    lstm_epochs_trained, meta_xgb_coef, meta_lstm_coef,
-                    meta_hurst_coef, ensemble_in_use, last_trained
+                    ticker, eval_rank_ic, eval_rank_ic_t, eval_hit_rate,
+                    eval_baseline_hit_rate, eval_mae, eval_mae_naive,
+                    eval_n_oos, model_version, eval_protocol,
+                    ensemble_in_use, last_trained
                 ) VALUES (
-                    :ticker, :xgb_mape, :xgb_dir_acc, :lstm_val_mape,
-                    :ensemble_mape, :ensemble_dir_acc,
-                    :lstm_epochs, :meta_xgb, :meta_lstm, :meta_hurst,
-                    :in_use, :trained
+                    :ticker, :ic, :ic_t, :hit, :baseline, :mae, :mae_naive,
+                    :n_oos, :version, :protocol, 0, :trained
                 )
                 ON CONFLICT (ticker) DO UPDATE SET
-                    xgb_mape            = EXCLUDED.xgb_mape,
-                    xgb_dir_acc         = EXCLUDED.xgb_dir_acc,
-                    lstm_val_mape       = EXCLUDED.lstm_val_mape,
-                    ensemble_mape       = EXCLUDED.ensemble_mape,
-                    ensemble_dir_acc    = EXCLUDED.ensemble_dir_acc,
-                    lstm_epochs_trained = EXCLUDED.lstm_epochs_trained,
-                    meta_xgb_coef       = EXCLUDED.meta_xgb_coef,
-                    meta_lstm_coef      = EXCLUDED.meta_lstm_coef,
-                    meta_hurst_coef     = EXCLUDED.meta_hurst_coef,
-                    ensemble_in_use     = EXCLUDED.ensemble_in_use,
-                    last_trained        = EXCLUDED.last_trained
+                    eval_rank_ic           = EXCLUDED.eval_rank_ic,
+                    eval_rank_ic_t         = EXCLUDED.eval_rank_ic_t,
+                    eval_hit_rate          = EXCLUDED.eval_hit_rate,
+                    eval_baseline_hit_rate = EXCLUDED.eval_baseline_hit_rate,
+                    eval_mae               = EXCLUDED.eval_mae,
+                    eval_mae_naive         = EXCLUDED.eval_mae_naive,
+                    eval_n_oos             = EXCLUDED.eval_n_oos,
+                    model_version          = EXCLUDED.model_version,
+                    eval_protocol          = EXCLUDED.eval_protocol,
+                    ensemble_in_use        = 0,
+                    last_trained           = EXCLUDED.last_trained
             """), {
-                "ticker":    ticker,
-                "xgb_mape":  mape,
-                "xgb_dir_acc": directional_accuracy,
-                "lstm_val_mape": lstm_result.get("val_mape"),
-                "ensemble_mape": ensemble_mape,
-                "ensemble_dir_acc": ensemble_dir_acc,
-                "lstm_epochs":   lstm_result.get("epochs_trained"),
-                "meta_xgb":  float(meta.coef_[0]) if meta is not None else 0.5,
-                "meta_lstm": float(meta.coef_[1]) if meta is not None else 0.5,
-                "meta_hurst":float(meta.coef_[2]) if meta is not None else 0.0,
-                "in_use":    1,
-                "trained":   datetime.utcnow(),
+                "ticker":   ticker,
+                "ic":       ev.get("rank_ic"),
+                "ic_t":     ev.get("rank_ic_t"),
+                "hit":      ev.get("hit_rate"),
+                "baseline": ev.get("majority_hit_rate"),
+                "mae":      ev.get("mae"),
+                "mae_naive": ev.get("mae_naive_zero"),
+                "n_oos":    ev.get("n_oos_predictions"),
+                "version":  forecast.model_version,
+                "protocol": json.dumps(ev.get("protocol", {})),
+                "trained":  datetime.now(timezone.utc),
             })
             conn.commit()
 
     return results
+
+
+def evaluate_universe(tickers: list[str] | None = None) -> pd.DataFrame:
+    """
+    Runs purged walk-forward across the universe and returns a per-ticker table
+    plus the pooled out-of-sample panel, for the cross-sectional report.
+    """
+    if tickers is None:
+        from data.universe import get_universe
+        tickers = get_universe()
+
+    rows, panels = [], []
+    for ticker in tickers:
+        result = evaluate_ticker(ticker, tune_inside_folds=False)
+        if result.n_predictions == 0:
+            continue
+        print(format_report(result))
+
+        m, zero = result.metrics, result.baselines.get("zero", {})
+        rows.append({
+            "ticker": ticker,
+            "n_oos": result.n_predictions,
+            "rank_ic": m.get("rank_ic"),
+            "rank_ic_t": m.get("rank_ic_t"),
+            "hit_rate": m.get("hit_rate"),
+            "majority_hit_rate": m.get("majority_hit_rate"),
+            "mae": m.get("mae"),
+            "mae_naive": zero.get("mae"),
+            "beats_naive": m.get("beats_naive_mae"),
+        })
+
+        panel = result.predictions.copy()
+        panel["ticker"] = ticker
+        panels.append(panel)
+
+    table = pd.DataFrame(rows)
+    if panels:
+        table.attrs["panel"] = pd.concat(panels, ignore_index=True)
+    return table

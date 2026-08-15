@@ -1,168 +1,224 @@
 """
-critic_agent.py
-LangGraph node that critically reviews the Forecasting Agent's output using Groq.
+agents/critic_agent.py — Evidence gate plus an LLM signal review.
+
+The previous critic asked an LLM for a verdict and then overwrote it with five
+deterministic branches keyed on ``mape`` and ``dir_acc`` (audit finding F9).
+Because those were the leaked in-sample values — typically ~3% and ~83% —
+Tier 1 (``mape < 6 and dir_acc > 75``) fired for effectively every stock, so the
+verdict was a near-constant ``APPROVED`` and the LLM's output never survived to
+the database. It contributed 30 of 100 composite points while carrying no
+information.
+
+Phase 0 splits the two jobs and makes both auditable:
+
+  ``grade_evidence``  Deterministic, tested, and driven by held-out walk-forward
+                      metrics. Answers "has this model demonstrated skill on
+                      data it did not see?" This is the gate, and an LLM cannot
+                      raise it.
+
+  ``critic_node``     The LLM reviews signal coherence and may add flags. Its
+                      flags are stored separately, and it can only downgrade.
+
+That asymmetry is deliberate: the LLM sees numbers it has no way to verify, so
+it is allowed to raise doubt but never to certify.
+
+Phase 3 replaces this with a critic that reads dated, attributed evidence and
+flags contradictions — verifiable work. Until that exists, this layer stays
+small and its limits are stated rather than disguised.
 """
-import os
+
+from __future__ import annotations
+
 import json
+import os
 import re
+
 from groq import Groq
 from dotenv import load_dotenv
+
 from agents.state import AgentState
 
 load_dotenv(override=True)
-_groq_api_key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
-groq_client = Groq(api_key=_groq_api_key) if _groq_api_key and _groq_api_key != "your_groq_key_here" else None
+
+# Thresholds for the deterministic gate. Deliberately modest: a rank IC of 0.03
+# with a t-statistic above 2 is a real but weak edge, which is an honest
+# description of what technical signals deliver at a 30-session horizon.
+MIN_RANK_IC = 0.02
+MIN_IC_TSTAT = 2.0
+MIN_HIT_RATE_EDGE_PP = 1.0     # percentage points above the majority baseline
+
+
+def _groq_client() -> Groq | None:
+    key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
+    if not key or key == "your_groq_key_here":
+        return None
+    return Groq(api_key=key)
+
+
+def grade_evidence(state: dict) -> tuple[str, list[str]]:
+    """
+    Grades a forecast on held-out evidence alone.
+
+    Returns ``(grade, reasons)`` where grade is STRONG, WEAK or INSUFFICIENT.
+    Pure function of the evaluation metrics — no LLM, no network, unit-testable.
+    """
+    if not state.get("forecast_available"):
+        return "INSUFFICIENT", [state.get("forecast_error") or "no forecast produced"]
+
+    ic = state.get("eval_rank_ic")
+    ic_t = state.get("eval_rank_ic_t")
+    hit = state.get("eval_hit_rate")
+    baseline = state.get("eval_baseline_hit_rate")
+
+    reasons: list[str] = []
+    passed = 0
+    checks = 0
+
+    if ic is not None:
+        checks += 1
+        if ic >= MIN_RANK_IC:
+            passed += 1
+            reasons.append(f"Out-of-sample rank IC {ic:+.3f} clears the {MIN_RANK_IC:+.2f} floor.")
+        else:
+            reasons.append(f"Out-of-sample rank IC {ic:+.3f} is below the {MIN_RANK_IC:+.2f} floor.")
+
+    if ic_t is not None:
+        checks += 1
+        if abs(ic_t) >= MIN_IC_TSTAT:
+            passed += 1
+            reasons.append(f"Rank IC t-statistic {ic_t:+.2f} is distinguishable from noise.")
+        else:
+            reasons.append(f"Rank IC t-statistic {ic_t:+.2f} is within noise.")
+
+    if hit is not None and baseline is not None:
+        checks += 1
+        edge = hit - baseline
+        if edge >= MIN_HIT_RATE_EDGE_PP:
+            passed += 1
+            reasons.append(
+                f"Hit rate {hit:.1f}% beats the majority-class baseline "
+                f"{baseline:.1f}% by {edge:.1f}pp."
+            )
+        else:
+            reasons.append(
+                f"Hit rate {hit:.1f}% does not beat the majority-class baseline "
+                f"{baseline:.1f}% ({edge:+.1f}pp)."
+            )
+
+    if checks == 0:
+        return "INSUFFICIENT", ["No held-out evaluation metrics available."]
+
+    grade = "STRONG" if passed == checks else "WEAK" if passed >= 1 else "INSUFFICIENT"
+
+    # The dashboard shows a rupee price target, which depends on the forecast's
+    # MAGNITUDE, while rank IC and hit rate only establish ORDERING and
+    # DIRECTION. If mean absolute error is worse than forecasting zero excess
+    # return, the magnitude carries no information and the grade is capped —
+    # otherwise a STRONG badge would sit next to a price the model cannot
+    # actually justify.
+    if state.get("eval_beats_naive") is False:
+        reasons.append(
+            "Mean absolute error is worse than forecasting zero excess return, so "
+            "the magnitude carries no information even where the ranking does. "
+            "Grade capped at WEAK: treat the ranking as the signal and the rupee "
+            "target as illustrative."
+        )
+        if grade == "STRONG":
+            grade = "WEAK"
+
+    return grade, reasons
+
+
+def _llm_review(state: dict, ticker: str) -> tuple[list[str], str]:
+    """
+    Asks the LLM to flag internal contradictions in the signal snapshot.
+
+    Returns ``(flags, reasoning)``. Failure returns no flags rather than a
+    default verdict, so an API outage cannot silently change a stock's grade.
+    """
+    client = _groq_client()
+    if client is None:
+        return [], "LLM review skipped (no API key configured)."
+
+    prompt = f"""You are reviewing the inputs to a 30-session relative-return forecast for an Indian (NSE) stock.
+
+Stock: {state.get('company_name', ticker)} ({ticker})
+Benchmark: {state.get('benchmark_ticker')}
+Predicted excess return: {state.get('pred_excess_return')}
+Probability of outperformance: {state.get('prob_outperform')}
+
+Signal snapshot:
+{state.get('latest_signals', {})}
+
+Narrative: {state.get('signal_narrative', '')}
+
+Raise a flag ONLY where a specific, checkable contradiction is present:
+1. SIGNAL CONFLICT — RSI above 75 AND MACD histogram strongly negative, simultaneously.
+2. DIRECTION CONFLICT — the narrative describes clear momentum in the opposite
+   direction to the predicted excess return.
+3. THIN TRADING — OBV essentially flat across the window AND volume ROC near zero.
+4. STALE OR DEGENERATE INPUT — signal values that are constant, zero, or implausible.
+
+You are reviewing inputs, not certifying the forecast. You cannot approve anything.
+Do not comment on whether the model is accurate; you have no way to verify that.
+
+Respond ONLY with JSON:
+{{"flags": ["..."], "reasoning": "2-3 sentences"}}"""
+
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+    try:
+        completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model_name,
+            temperature=0.2,
+        )
+        raw = completion.choices[0].message.content.strip()
+    except Exception as exc:                                   # noqa: BLE001
+        return [], f"LLM review unavailable: {exc}"
+
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        parsed = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return [], "LLM response was not valid JSON; no flags recorded."
+
+    flags = parsed.get("flags", [])
+    if not isinstance(flags, list):
+        flags = []
+    return [str(f) for f in flags], str(parsed.get("reasoning", ""))
+
 
 def critic_node(state: AgentState) -> dict:
-        
+    """
+    Grades held-out evidence, then lets the LLM add flags that can only downgrade.
+    """
     ticker = state["ticker"]
-    
-    # Default fallback state
-    updates = {
-        "critic_verdict": "FLAGGED",
-        "critic_reasoning": "Critic Agent failed to parse LLM response or API key missing.",
-        "critic_flags": [],
-        "critic_confidence_adjustment": "MAINTAINED"
+
+    grade, reasons = grade_evidence(dict(state))
+    flags, llm_reasoning = _llm_review(dict(state), ticker)
+
+    # Map evidence grade to a verdict, then apply LLM flags as a downgrade only.
+    verdict = {"STRONG": "APPROVED", "WEAK": "FLAGGED", "INSUFFICIENT": "REJECTED"}[grade]
+    source = "evidence_gate"
+
+    if flags and verdict == "APPROVED":
+        verdict = "FLAGGED"
+        source = "evidence_gate+llm_flags"
+    elif flags:
+        source = "evidence_gate+llm_flags"
+
+    reasoning = " ".join(reasons)
+    if llm_reasoning:
+        reasoning = f"{reasoning} LLM signal review: {llm_reasoning}"
+
+    return {
+        "evidence_grade": grade,
+        "evidence_reasons": reasons,
+        "critic_verdict": verdict,
+        "critic_reasoning": reasoning,
+        "critic_flags": flags,
+        "critic_source": source,
     }
-    
-    if not groq_client:
-        return updates
-        
-    try:
-        prompt = f"""You are a senior quantitative analyst reviewing a 30-day stock forecast.
-Only raise a flag if you observe a CLEAR and SIGNIFICANT issue. Do not
-raise flags for minor signal ambiguity or normal market noise.
-
-Stock: {state['company_name']} ({ticker})
-Current Price: ₹{state['current_price']}
-Forecast Price: ₹{state.get('forecast_price', 0)} ({state.get('forecast_direction', 'UNKNOWN')}, {state.get('forecast_change_pct', 0)}%)
-Model MAPE: {state.get('model_mape', 0)}%
-Directional Accuracy: {state.get('model_directional_accuracy', 0)}%
-Forecast Confidence: {state.get('forecast_confidence', 'Low')}
-
-Signal Snapshot:
-{state['latest_signals']}
-
-Sentiment Score: {state['sentiment_score']} (range: -1 to +1)
-Signal Narrative: {state.get('signal_narrative', '')}
-
-Raise a flag ONLY if one of these specific conditions is clearly present:
-1. SIGNAL CONFLICT: RSI above 75 AND MACD histogram is strongly negative
-   (both must be true simultaneously, not just one)
-2. SENTIMENT DIVERGENCE: sentiment score below -0.3 AND forecast direction
-   is UP, or sentiment above +0.3 AND forecast direction is DOWN
-3. EXTREME FORECAST: predicted price change exceeds 28% in 30 days
-4. DATA QUALITY: OBV has been flat (near zero change) for the entire
-   signal window AND volume ROC is also near zero — indicating very thin
-   trading volume
-
-Do NOT flag:
-- MAPE between 8-15% (this is acceptable for a 30-day horizon)
-- Mild sentiment disagreement (scores between -0.3 and +0.3 are neutral)
-- Normal volatility in any single indicator
-- Stocks that are simply in a downtrend
-
-Respond ONLY in this exact JSON format with no other text:
-{{
-  "verdict": "APPROVED" | "FLAGGED" | "REJECTED",
-  "reasoning": "2-3 sentence overall assessment",
-  "flags": ["flag 1"] or [],
-  "confidence_adjustment": "UPGRADED" | "MAINTAINED" | "DOWNGRADED"
-}}"""
-
-        # Use 8b model by default to stay within free tier rate limits
-        model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-
-        # Simple retry mechanism for 429 Rate Limits
-        response_text = ""
-        max_retries = 2
-        for attempt in range(max_retries):
-            try:
-                completion = groq_client.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model=model_name,
-                    temperature=0.2
-                )
-                response_text = completion.choices[0].message.content.strip()
-                break
-            except Exception as e:
-                if "429" in str(e) and attempt < max_retries - 1:
-                    import time
-                    time.sleep(2)
-                    continue
-                raise e
-
-        
-        # Clean markdown formatting if present robustly
-        response_text = re.sub(r"^```(?:json)?\s*", "", response_text, flags=re.IGNORECASE)
-        response_text = re.sub(r"\s*```$", "", response_text)
-            
-        try:
-            parsed = json.loads(response_text.strip())
-        except json.JSONDecodeError as e:
-            print(f"[{ticker}] Critic Agent JSON parse error: {e}")
-            parsed = {}
-            
-        verdict   = parsed.get("verdict", "FLAGGED")
-        reasoning = parsed.get("reasoning", "")
-        flags     = parsed.get("flags", [])
-
-        # ── Hard verdict override rules ───────────────────────────────────────
-        mape       = state.get("model_mape", 0.0)
-        change_pct = abs(state.get("forecast_change_pct", 0.0))
-        dir_acc    = state.get("model_directional_accuracy", 0.0)
-        num_flags  = len(flags)
-
-        # REJECTED — only for genuinely unreliable forecasts
-        if mape > 15.0:
-            verdict    = "REJECTED"
-            reasoning += f" Auto-rejected: MAPE of {mape:.1f}% exceeds the 15% threshold."
-        elif change_pct > 30.0:
-            verdict    = "REJECTED"
-            reasoning += (
-                f" Auto-rejected: forecast change of {change_pct:.1f}% "
-                f"exceeds the 30% plausibility cap."
-            )
-        elif num_flags >= 3:
-            verdict    = "REJECTED"
-            reasoning += f" Auto-rejected: {num_flags} simultaneous flags raised."
-
-        # APPROVED — model quality overrides LLM flags progressively
-        # Tier 1: exceptional model — overrides any number of flags
-        elif mape < 6.0 and dir_acc > 75.0:
-            verdict = "APPROVED"
-        # Tier 2: strong model — overrides up to 2 flags
-        elif mape < 8.0 and dir_acc > 70.0 and num_flags <= 2:
-            verdict = "APPROVED"
-        # Tier 3: good model — overrides 1 flag
-        elif mape < 10.0 and dir_acc > 65.0 and num_flags <= 1:
-            verdict = "APPROVED"
-        # Tier 4: no flags at all — even average models get approved
-        elif num_flags == 0 and mape < 12.0:
-            verdict = "APPROVED"
-
-        updates["critic_verdict"]               = verdict
-        updates["critic_reasoning"]             = reasoning
-        updates["critic_flags"]                 = flags
-        updates["critic_confidence_adjustment"] = parsed.get("confidence_adjustment", "MAINTAINED")
-
-        # PSU oil override — always at least FLAGGED
-        PSU_OIL_TICKERS = ["ONGC.NS", "BPCL.NS"]
-        if ticker in PSU_OIL_TICKERS:
-            if not any("PSU" in f or "crude" in f.lower() for f in updates["critic_flags"]):
-                updates["critic_flags"].append(
-                    "PSU oil stock: price driven by crude oil prices and "
-                    "government fuel pricing policy — risks outside current signal library."
-                )
-            if updates["critic_verdict"] == "APPROVED":
-                updates["critic_verdict"]   = "FLAGGED"
-                updates["critic_reasoning"] += (
-                    " PSU oil sector override applied: crude oil price risk "
-                    "not captured in current signal library."
-                )
-        
-    except Exception as e:
-        print(f"[{ticker}] Critic Agent error: {e}")
-        updates["critic_reasoning"] = f"Groq API Error: {e}"
-        
-    return updates

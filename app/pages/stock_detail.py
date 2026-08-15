@@ -62,7 +62,7 @@ def fetch_leaderboard(sector=None, verdict=None, confidence=None, sort_by="compo
         params = {"sort_by": sort_by, "limit": 100}
         if sector:     params["sector"]     = sector
         if verdict:    params["verdict"]    = verdict
-        if confidence: params["confidence"] = confidence
+        if confidence: params["evidence"] = confidence
         response = requests.get(f"{API_BASE_URL}/api/leaderboard", params=params, timeout=60)
         response.raise_for_status()
         return response.json()
@@ -173,14 +173,19 @@ if not state:
     st.warning(f"No forecast available for {selected_company}. Trigger the pipeline from the backend.")
     st.stop()
 
-mape = state.get('mape', 0)
-dir_acc = state.get('directional_accuracy', 0)
-if mape > 10 or dir_acc < 55:
+evidence_grade = state.get("forecast_confidence") or "INSUFFICIENT"
+evaluation = state.get("evaluation") or {}
+hit_rate = evaluation.get("hit_rate")
+baseline_hit = evaluation.get("baseline_hit_rate")
+
+if evidence_grade != "STRONG":
+    edge_text = ""
+    if hit_rate is not None and baseline_hit is not None:
+        edge_text = (f" Out-of-sample hit rate {hit_rate:.1f}% against a "
+                     f"{baseline_hit:.1f}% majority-class baseline.")
     st.sidebar.warning(
-        f"⚠️ Model quality for {selected_company} is below threshold "
-        f"(MAPE: {mape:.1f}%, Dir Acc: {dir_acc:.1f}%). "
-        f"Forecasts for this stock should be treated with caution. "
-        f"Review the Agent Analysis tab for Critic feedback."
+        f"⚠️ Held-out evidence for {selected_company} is **{evidence_grade}**."
+        f"{edge_text} See the Agent Analysis tab for the full evidence trail."
     )
 
 # df could be empty list of dicts, let's load it to DataFrame
@@ -227,54 +232,96 @@ tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Signals", "Sentiment", "Agent Ana
 with tab1:
     col1, col2, col3, col4 = st.columns(4)
     
-    current_price = state.get('current_price', 0)
-    forecast_price = state.get('forecast_price', 0)
-    forecast_change_pct = state.get('change_pct', 0)
-    direction = state.get("direction", "UNKNOWN")
-    mape = state.get('mape', 0)
-    
+    current_price   = state.get("current_price") or 0.0
+    forecast_price  = state.get("forecast_price")
+    excess_return   = state.get("pred_excess_return")
+    direction       = state.get("direction", "UNAVAILABLE")
+    interval_low    = state.get("interval_low")
+    interval_high   = state.get("interval_high")
+    coverage        = state.get("interval_coverage")
+    prob_outperform = state.get("prob_outperform")
+    random_walk     = state.get("random_walk_price")
+    benchmark_name  = state.get("benchmark_name") or state.get("benchmark_ticker") or "benchmark"
+    sector_specific = state.get("benchmark_sector_specific")
+
+    dir_color = ("#06D6A0" if direction == "OUTPERFORM"
+                 else "#EF476F" if direction == "UNDERPERFORM" else "#94A3B8")
+    dir_symbol = ("▲" if direction == "OUTPERFORM"
+                  else "▼" if direction == "UNDERPERFORM" else "–")
+
+    def _money(value) -> str:
+        return f"₹{value:,.2f}" if value is not None else "—"
+
     with col1:
         st.markdown(f"""
         <div class="stCard">
             <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">Current Price</div>
-            <div style="color: #FFB703; font-size: 2rem; font-weight: 700;">₹{current_price:,.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with col2:
-        dir_color = "#06D6A0" if direction == "UP" else "#EF476F" if direction == "DOWN" else "#94A3B8"
-        dir_symbol = "▲" if direction == "UP" else "▼" if direction == "DOWN" else "-"
-        v_class = f"badge-{verdict.lower()}"
-        v_icon = "✓" if verdict == "APPROVED" else "⚠" if verdict == "FLAGGED" else "✕"
-        
-        st.markdown(f"""
-        <div class="stCard">
-            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">30-Day Target</div>
-            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.5rem;">
-                <div style="color: #FFB703; font-size: 2rem; font-weight: 700;">₹{forecast_price:,.2f}</div>
-                <div style="background-color: rgba(0,0,0,0.2); padding: 4px 8px; border-radius: 6px; color: {dir_color}; font-weight: 600;">{dir_symbol} {forecast_change_pct}%</div>
+            <div style="color: #FFB703; font-size: 2rem; font-weight: 700;">{_money(current_price)}</div>
+            <div style="color: #64748B; font-size: 0.75rem; margin-top: 6px;">
+                Random-walk forecast: {_money(random_walk)}
             </div>
-            <div class="{v_class}" style="font-size: 0.8rem; padding: 2px 8px;">{v_icon} CRITIC {verdict}</div>
         </div>
         """, unsafe_allow_html=True)
-        
+
+    with col2:
+        excess_text = f"{excess_return * 100:+.1f}%" if excess_return is not None else "—"
+        interval_text = (f"{_money(interval_low)} – {_money(interval_high)}"
+                         if interval_low is not None and interval_high is not None else "—")
+        coverage_text = f"{coverage:.0%} interval" if coverage else "interval"
+
+        st.markdown(f"""
+        <div class="stCard">
+            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">Implied 30-Session Target</div>
+            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 0.5rem;">
+                <div style="color: #FFB703; font-size: 2rem; font-weight: 700;">{_money(forecast_price)}</div>
+                <div style="background-color: rgba(0,0,0,0.2); padding: 4px 8px; border-radius: 6px; color: {dir_color}; font-weight: 600;">{dir_symbol} {excess_text}</div>
+            </div>
+            <div style="color: #94A3B8; font-size: 0.8rem;">{coverage_text}: {interval_text}</div>
+            <div style="color: #64748B; font-size: 0.72rem; margin-top: 6px;">
+                Assumes {benchmark_name} is flat. The model forecasts relative performance only.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     with col3:
+        prob_text = f"{prob_outperform:.0%}" if prob_outperform is not None else "—"
+        prob_color = ("#06D6A0" if (prob_outperform or 0) > 0.55
+                      else "#EF476F" if (prob_outperform or 1) < 0.45 else "#94A3B8")
+        bench_note = ("" if sector_specific
+                      else " (no sector index available — measured against NIFTY 50)")
         st.markdown(f"""
         <div class="stCard">
-            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">Direction</div>
-            <div style="color: {dir_color}; font-size: 2rem; font-weight: 700;">{direction}</div>
+            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">P(outperform)</div>
+            <div style="color: {prob_color}; font-size: 2rem; font-weight: 700;">{prob_text}</div>
+            <div style="color: #64748B; font-size: 0.75rem; margin-top: 6px;">
+                vs {benchmark_name}{bench_note}. 50% = coin flip.
+            </div>
         </div>
         """, unsafe_allow_html=True)
-        
+
     with col4:
-        mape_color = "#EF476F" if mape > 8.0 else "#FFFFFF"
+        grade_color = {"STRONG": "#06D6A0", "WEAK": "#FFB703",
+                       "INSUFFICIENT": "#EF476F"}.get(evidence_grade, "#94A3B8")
+        ic = evaluation.get("rank_ic")
+        ic_text = f"Rank IC {ic:+.3f}" if ic is not None else "No IC recorded"
+        hit_text = (f"Hit {hit_rate:.1f}% vs {baseline_hit:.1f}% baseline"
+                    if hit_rate is not None and baseline_hit is not None else "")
         st.markdown(f"""
         <div class="stCard">
-            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">Model Error (MAPE)</div>
-            <div style="color: {mape_color}; font-size: 2rem; font-weight: 700;">{mape}%</div>
+            <div style="color: #94A3B8; font-size: 0.9rem; margin-bottom: 0.5rem;">Held-Out Evidence</div>
+            <div style="color: {grade_color}; font-size: 2rem; font-weight: 700;">{evidence_grade}</div>
+            <div style="color: #64748B; font-size: 0.75rem; margin-top: 6px;">
+                {ic_text}<br>{hit_text}
+            </div>
         </div>
         """, unsafe_allow_html=True)
-        
+
+    st.caption(
+        "Performance figures come from purged walk-forward validation with a "
+        "30-session embargo — folds the model never trained on — and are stated "
+        "before transaction costs."
+    )
+
     if not df.empty:
         render_price_chart(df)
 
@@ -355,8 +402,12 @@ with tab4:
 <div style="width: 16px; height: 16px; border-radius: 50%; background-color: #FFB703;"></div>
 </div>
 <div>
-<span style="color: #94A3B8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; margin-right: 1rem;">Confidence Adjustment</span>
-<span style="background-color: rgba(255, 183, 3, 0.2); color: #FFB703; padding: 4px 12px; border-radius: 12px; font-weight: 600; font-size: 0.9rem;">{state.get('critic_confidence_adjustment', 'MAINTAINED')}</span>
+<span style="color: #94A3B8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; margin-right: 1rem;">Verdict Set By</span>
+<span style="background-color: rgba(255, 183, 3, 0.2); color: #FFB703; padding: 4px 12px; border-radius: 12px; font-weight: 600; font-size: 0.9rem;">{state.get('critic_source') or 'evidence_gate'}</span>
+<div style="color: #64748B; font-size: 0.75rem; margin-top: 8px;">
+The evidence gate is deterministic and driven by held-out walk-forward metrics.
+The LLM review can add flags and downgrade a verdict, but never raise one.
+</div>
 </div>
 </div>
 </div>

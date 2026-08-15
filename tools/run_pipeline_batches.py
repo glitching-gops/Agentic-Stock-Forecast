@@ -9,10 +9,10 @@ load_dotenv()
 if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
 
-from data.tickers import TICKERS
+from data.universe import get_universe
 
 api_key    = os.getenv("ADMIN_API_KEY", "admin_secret_key_here")
-tickers    = list(TICKERS.keys())
+tickers    = get_universe()
 batch_size = 5
 
 print(f"Running pipeline for {len(tickers)} stocks in batches of {batch_size}...\n")

@@ -24,10 +24,12 @@ def trigger_pipeline(ticker: str, background_tasks: BackgroundTasks):
 
 @router.post("/run-all", dependencies=[Depends(verify_api_key)])
 def trigger_all_pipelines(background_tasks: BackgroundTasks):
-    from data.tickers import TICKERS
-    for ticker in TICKERS.keys():
+    from data.universe import get_universe
+
+    universe = get_universe()
+    for ticker in universe:
         background_tasks.add_task(_run_pipeline, ticker)
     return {
         "status": "accepted",
-        "message": f"Pipeline triggered for all {len(TICKERS)} stocks in the background"
+        "message": f"Pipeline triggered for all {len(universe)} stocks in the background"
     }

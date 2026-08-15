@@ -6,7 +6,7 @@ import sys
 import os
 sys.path.append(os.getcwd())
 
-from data.tickers import TICKERS
+from data.universe import get_universe
 from pipeline.model import load_features_for_ticker
 from pipeline.tuning import tune_hyperparameters
 from data.db import get_engine
@@ -15,9 +15,9 @@ import time
 engine = get_engine()
 results = []
 
-print(f"Starting initial tuning for {len(TICKERS)} stocks...")
+print(f"Starting initial tuning for {len(get_universe())} stocks...")
 
-for i, ticker in enumerate(TICKERS.keys()):
+for i, ticker in enumerate(get_universe()):
     start = time.time()
     try:
         X, y = load_features_for_ticker(ticker, engine)

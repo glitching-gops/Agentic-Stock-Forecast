@@ -25,12 +25,21 @@ if [ ! -f "models/joblib/RELIANCE.NS.joblib" ]; then
         -o models_store.zip
 
     echo "Download complete. Size: $(du -h models_store.zip | cut -f1). Extracting..."
+    # Validate every member path before writing. extractall() honours absolute
+    # paths and '..' segments in the archive, so a tampered zip could write
+    # outside the working directory (audit finding F15).
     python3 -c "
-import zipfile
 import os
+import zipfile
+
+DEST = os.path.abspath('.')
 print('Starting extraction...')
 with zipfile.ZipFile('models_store.zip', 'r') as zf:
-    zf.extractall('.')
+    for member in zf.infolist():
+        target = os.path.abspath(os.path.join(DEST, member.filename))
+        if not target.startswith(DEST + os.sep) and target != DEST:
+            raise SystemExit(f'Refusing unsafe archive path: {member.filename}')
+    zf.extractall(DEST)
 print('Extraction complete.')
 "
     rm models_store.zip

@@ -1,177 +1,180 @@
 """
-forecasting_agent.py
-LangGraph node that generates a 30-day price forecast and a natural language signal narrative.
+agents/forecasting_agent.py — Generates the forecast and a signal narrative.
+
+The warm path is gone. ``_generate_forecast_from_existing`` wrote a column
+named ``sentiment`` while ``FEATURES`` expected ``sentiment_score``, so
+``dropna(subset=FEATURES)`` raised ``KeyError``, a bare ``except`` swallowed it,
+and the caller's fallback persisted ``forecast_price = current_price`` with
+``mape = 100`` as though it were a real forecast (audit finding F10). Any second
+pipeline pass in a day wrote a fabricated flat forecast with no error surfaced.
+
+Rather than repair that path, it is removed. ``pipeline.model.forecast_ticker``
+is the single entry point, and it validates its own feature frame. Re-running is
+idempotent and cheap enough; a silently wrong number is not.
+
+The LLM's role here is unchanged and deliberately limited: it writes a
+narrative summarising signals it is given. It does not produce, adjust, or
+review any number.
 """
+
+from __future__ import annotations
+
 import os
 import time
-from datetime import datetime
-import joblib
-import pandas as pd
-import numpy as np
+
 from groq import Groq
+
 from agents.state import AgentState
-from pipeline.model import train_and_forecast, FEATURES, classify_confidence
+from pipeline.model import forecast_ticker
+
+
+def _groq_client() -> Groq | None:
+    key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
+    if not key or key == "your_groq_key_here":
+        return None
+    return Groq(api_key=key)
+
+
+def _failed_forecast(reason: str) -> dict:
+    """
+    Explicit failure state.
+
+    Distinct from a real forecast in every field a consumer might read, so a
+    failure can never be mistaken for a flat prediction — which is exactly how
+    F10 stayed invisible.
+    """
+    return {
+        "forecast_available": False,
+        "forecast_error": reason,
+        "forecast_price": None,
+        "forecast_direction": "UNAVAILABLE",
+        "forecast_change_pct": None,
+        "pred_excess_return": None,
+        "interval_low": None,
+        "interval_high": None,
+        "interval_coverage": None,
+        "prob_outperform": None,
+        "random_walk_price": None,
+        "benchmark_ticker": None,
+        "benchmark_sector_specific": None,
+        "eval_rank_ic": None,
+        "eval_rank_ic_t": None,
+        "eval_hit_rate": None,
+        "eval_baseline_hit_rate": None,
+        "eval_beats_naive": None,
+        "model_version": None,
+    }
+
 
 def forecasting_node(state: AgentState) -> dict:
-    # Initialize Groq client
-    groq_api_key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
-    if groq_api_key and groq_api_key != "your_groq_key_here":
-        groq_client = Groq(api_key=groq_api_key)
-    else:
-        groq_client = None
-
     ticker = state["ticker"]
-    updates = {}
-    
-    model_path = os.path.join(os.path.dirname(__file__), "..", "models", "joblib", f"{ticker}.joblib")
-    
-    # Check if model exists and was created today
-    needs_training = True
-    if os.path.exists(model_path):
-        mtime = os.path.getmtime(model_path)
-        model_date = datetime.fromtimestamp(mtime).date()
-        if model_date == datetime.today().date():
-            needs_training = False
-            
-    if needs_training:
-        print(f"[{ticker}] Retraining XGBoost model...")
-        results_dict = train_and_forecast(ticker)
-        if ticker in results_dict:
-            res = results_dict[ticker]
-        else:
-            res = None
-    else:
-        print(f"[{ticker}] Loading existing model from today...")
-        res = _generate_forecast_from_existing(state, model_path)
-        
-    if res:
-        updates["forecast_price"] = res["forecast_price"]
-        updates["forecast_direction"] = res["direction"]
-        updates["forecast_change_pct"] = res["change_pct"]
-        updates["model_mape"] = res["mape"]
-        updates["model_directional_accuracy"] = res["dir_acc"]
-        updates["feature_importances"] = res["feature_importance"]
-        
-        updates["forecast_confidence"] = classify_confidence(res["mape"], res["dir_acc"])
-    else:
-        # Fallback values
-        updates["forecast_price"] = state["current_price"]
-        updates["forecast_direction"] = "UNKNOWN"
-        updates["forecast_change_pct"] = 0.0
-        updates["forecast_confidence"] = "Low"
-        updates["model_mape"] = 100.0
-        updates["model_directional_accuracy"] = 0.0
-        updates["feature_importances"] = {}
 
-    # LLM Signal Narrative Generation
-    # Use 8b model by default to stay within free tier rate limits
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
-    updates["signal_narrative"] = "Signal narrative unavailable."
-    
-    if groq_client:
-        try:
-            sig_dict = state.get('latest_signals', {})
-            importances = updates.get("feature_importances", {})
-            if importances and len(sig_dict) > 10:
-                top_features = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:10]
-                top_keys = [k for k, v in top_features]
-                sig_dict = {k: v for k, v in sig_dict.items() if k in top_keys or k == 'close'}
+    try:
+        forecast = forecast_ticker(ticker)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"[{ticker}] forecast failed: {exc}")
+        return {**_failed_forecast(f"{type(exc).__name__}: {exc}"),
+                "signal_narrative": "Forecast unavailable."}
 
-            prompt = f"""You are a quantitative analyst summarising technical and sentiment signals for an Indian stock.
+    if forecast is None:
+        return {**_failed_forecast("insufficient history or no out-of-sample folds"),
+                "signal_narrative": "Forecast unavailable."}
 
-Stock: {state['company_name']} ({ticker})
-Current Price: ₹{state['current_price']}
-Signals (latest values):
-{sig_dict}
+    view = forecast.price_view
+    ev = forecast.evaluation
 
-Write exactly 3 sentences summarising what these signals collectively suggest about the stock's near-term momentum. Be specific about the signals. Do not make a price prediction."""
+    updates = {
+        "forecast_available": True,
+        "forecast_error": None,
+        "forecast_price": view["implied_price"],
+        "forecast_direction": "OUTPERFORM" if view["pred_excess_return"] > 0 else "UNDERPERFORM",
+        "forecast_change_pct": view["implied_change_pct"],
+        "pred_excess_return": view["pred_excess_return"],
+        "interval_low": view.get("interval_low"),
+        "interval_high": view.get("interval_high"),
+        "interval_coverage": view.get("interval_coverage"),
+        "prob_outperform": view.get("prob_outperform"),
+        "random_walk_price": view["random_walk_price"],
+        "benchmark_ticker": forecast.benchmark_ticker,
+        "benchmark_sector_specific": forecast.benchmark_sector_specific,
+        "eval_rank_ic": ev.get("rank_ic"),
+        "eval_rank_ic_t": ev.get("rank_ic_t"),
+        "eval_hit_rate": ev.get("hit_rate"),
+        "eval_baseline_hit_rate": ev.get("majority_hit_rate"),
+        "eval_beats_naive": ev.get("beats_naive"),
+        "model_version": forecast.model_version,
+        "current_price": forecast.current_price,
+    }
 
-            # Simple retry mechanism for 429 Rate Limits
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    completion = groq_client.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=model_name,
-                        temperature=0.3
-                    )
-                    updates["signal_narrative"] = completion.choices[0].message.content.strip()
-                    break
-                except Exception as e:
-                    if "429" in str(e) and attempt < max_retries - 1:
-                        time.sleep(2) # Short wait before retry
-                        continue
-                    raise e
-        except Exception as e:
-            print(f"[{ticker}] Error generating Groq narrative: {e}")
-            # Fallback to rule-based narrative if Groq fails
-            rsi = state.get("latest_signals", {}).get("rsi", 50)
-            macd = state.get("latest_signals", {}).get("macd_hist", 0)
-            sentiment = state.get("sentiment_score", 0)
-            
-            narrative = f"Technical indicators show {ticker} is {'overbought' if rsi > 70 else 'oversold' if rsi < 30 else 'in a neutral zone'} with RSI at {rsi:.1f}. "
-            narrative += f"MACD histogram is {'positive' if macd > 0 else 'negative'}, suggesting {'bullish' if macd > 0 else 'bearish'} momentum. "
-            narrative += f"Overall sentiment score is {sentiment:.2f}, indicating {'positive' if sentiment > 0.2 else 'negative' if sentiment < -0.2 else 'neutral'} market interest."
-            updates["signal_narrative"] = narrative
-
+    updates["signal_narrative"] = _narrative(state, ticker, updates)
     return updates
 
-def _generate_forecast_from_existing(state: AgentState, model_path: str) -> dict:
-    """Helper to generate forecast from loaded model using the state data."""
-    try:
-        model = joblib.load(model_path)
-        
-        signals_df = pd.DataFrame(state.get("signals_df", []))
-        if not signals_df.empty and "date" in signals_df.columns:
-            signals_df.set_index("date", inplace=True)
-            
-        macro_df = pd.DataFrame(state.get("macro_df", []))
-        if not macro_df.empty and "date" in macro_df.columns:
-            macro_df.set_index("date", inplace=True)
-        
-        df = signals_df.join(macro_df, how="left")
-        df["sentiment"] = state["sentiment_score"]
-        df.ffill(inplace=True)
-        df.bfill(inplace=True)
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        
-        # Compute actual test metrics instead of hardcoded placeholders
-        TARGET = "target"
-        df_clean = df.dropna(subset=FEATURES).copy()
-        train_df = df_clean.dropna(subset=[TARGET]).copy()
-        
-        if len(train_df) > 50:
-            val_idx = int(len(train_df) * 0.85)
-            X_test = train_df[FEATURES].iloc[val_idx:]
-            y_test = train_df[TARGET].iloc[val_idx:]
-            y_pred = model.predict(X_test)
-            
-            from sklearn.metrics import mean_absolute_percentage_error
-            mape = mean_absolute_percentage_error(y_test, y_pred) * 100
-            
-            test_prev_close = train_df["close"].iloc[val_idx:].values
-            actual_dir = np.where(y_test.values > test_prev_close, 1, 0)
-            pred_dir = np.where(y_pred > test_prev_close, 1, 0)
-            dir_acc = np.mean(actual_dir == pred_dir) * 100
-        else:
-            mape = 100.0
-            dir_acc = 0.0
 
-        latest_features = df_clean[df_clean[TARGET].isna()][FEATURES]
-        if latest_features.empty:
-            latest_features = df_clean[FEATURES].iloc[[-1]]
-            
-        forecast_price = float(model.predict(latest_features.iloc[[-1]])[0])
-        current_price = state["current_price"]
-        
-        return {
-            "forecast_price": forecast_price,
-            "direction": "UP" if forecast_price > current_price else "DOWN",
-            "change_pct": round(((forecast_price - current_price) / current_price) * 100, 2),
-            "mape": round(mape, 2), 
-            "dir_acc": round(dir_acc, 2), 
-            "feature_importance": dict(zip(FEATURES, model.feature_importances_))
-        }
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
+def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
+    """
+    Asks the LLM for a plain-English read of the signals.
+
+    The prompt withholds the forecast on purpose. Handing the model its own
+    prediction invites a narrative written to justify the number rather than to
+    describe the evidence.
+    """
+    client = _groq_client()
+    signals = state.get("latest_signals", {}) or {}
+
+    if client is None:
+        return _rule_based_narrative(ticker, signals, state.get("sentiment_score", 0.0))
+
+    interesting = {
+        k: v for k, v in signals.items()
+        if k in {"rsi", "macd_hist", "bb_width", "atr_14", "stoch_k", "williams_r",
+                 "roc_10", "prox_52w", "dev_sma50", "hurst",
+                 "sector_rel_5d", "sector_rel_20d", "close"}
+    }
+
+    prompt = f"""You are a quantitative analyst summarising technical signals for an Indian (NSE) stock.
+
+Stock: {state.get('company_name', ticker)} ({ticker})
+Benchmark: {updates.get('benchmark_ticker')}
+Latest signal values:
+{interesting}
+
+Write exactly 3 sentences describing what these signals collectively suggest about
+near-term momentum relative to the benchmark. Reference specific signals by name and value.
+Do not state a price target, a percentage move, or a buy/sell recommendation."""
+
+    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
+    for attempt in range(2):
+        try:
+            completion = client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=model_name,
+                temperature=0.3,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as exc:                               # noqa: BLE001
+            if "429" in str(exc) and attempt == 0:
+                time.sleep(2)
+                continue
+            print(f"[{ticker}] narrative generation failed: {exc}")
+            break
+
+    return _rule_based_narrative(ticker, signals, state.get("sentiment_score", 0.0))
+
+
+def _rule_based_narrative(ticker: str, signals: dict, sentiment: float) -> str:
+    """Deterministic fallback so a narrative is never fabricated by guesswork."""
+    rsi = float(signals.get("rsi", 50) or 50)
+    macd = float(signals.get("macd_hist", 0) or 0)
+    rel20 = float(signals.get("sector_rel_20d", 0) or 0)
+
+    zone = "overbought" if rsi > 70 else "oversold" if rsi < 30 else "neutral"
+    momentum = "positive" if macd > 0 else "negative"
+    relative = "ahead of" if rel20 > 0 else "behind"
+
+    return (
+        f"RSI is {rsi:.1f}, placing {ticker} in {zone} territory. "
+        f"The MACD histogram is {momentum} at {macd:.3f}. "
+        f"Over the last 20 sessions the stock has traded {relative} its benchmark "
+        f"by {abs(rel20) * 100:.1f}%."
+    )

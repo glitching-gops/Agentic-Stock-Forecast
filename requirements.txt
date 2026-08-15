@@ -1,27 +1,47 @@
+# Data
 yfinance>=0.2.40
 pandas>=2.2.2
 numpy>=1.26.4
+scipy>=1.13.0
 sqlalchemy>=2.0.30
 ta>=0.11.0
+feedparser
+requests==2.32.3
+httpx==0.27.0
+
+# Modelling
 xgboost>=2.0.3
 scikit-learn>=1.4.2
-streamlit>=1.35.0
-plotly>=5.22.0
-python-dotenv>=1.0.1
 optuna>=3.6.1
-pytz>=2024.1
-transformers
-feedparser
 joblib
-apscheduler
-groq
+
+# Agents / LLM
 langgraph
 langchain
 langchain-groq
+groq
+transformers                 # FinBERT, sentiment display only
+
+# Backend
 fastapi>=0.111.0
 uvicorn>=0.30.1
-psycopg2-binary==2.9.9
 pydantic>=2.7.1
-requests==2.32.3
-httpx==0.27.0
-torch
+psycopg2-binary==2.9.9
+
+# Frontend
+streamlit>=1.35.0
+plotly>=5.22.0
+
+# Ops
+apscheduler
+python-dotenv>=1.0.1
+pytz>=2024.1
+
+# Tests
+pytest>=8.0.0
+
+# torch was removed in Phase 0. It was needed only by the LSTM, which never
+# wrote a checkpoint and so never produced a forecast; that module now lives in
+# pipeline/archived/ and is not imported anywhere on the live path. Dropping it
+# also removes the largest contributor to memory pressure on the free tier.
+# Reinstall it if experiment E3 brings the ensemble back.

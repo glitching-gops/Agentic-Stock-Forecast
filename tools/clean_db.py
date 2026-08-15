@@ -3,11 +3,11 @@ if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
 
 from data.db import get_engine
-from data.tickers import TICKERS
+from data.universe import get_universe
 from sqlalchemy import text
 
 engine  = get_engine()
-keep    = list(TICKERS.keys())
+keep    = get_universe()
 placeholders = ",".join([f"'{t}'" for t in keep])
 
 tables_with_ticker = [

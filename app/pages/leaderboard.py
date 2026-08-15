@@ -45,7 +45,10 @@ def fetch_leaderboard(
         if verdict and verdict != "All":
             params["verdict"] = verdict
         if confidence and confidence != "All":
-            params["confidence"] = confidence
+            # The API parameter is `evidence` — the field holds an evidence
+            # grade (STRONG/WEAK/INSUFFICIENT), not the old High/Medium/Low
+            # confidence label derived from leaked metrics.
+            params["evidence"] = confidence
 
         r = requests.get(
             f"{API_BASE_URL}/api/leaderboard",
@@ -106,33 +109,53 @@ def render_header(last_updated: str, total: int) -> None:
 # ── Summary metric cards ──────────────────────────────────────────────────────
 
 def render_summary_cards(df: pd.DataFrame) -> None:
-    """Renders four summary metric cards above the leaderboard table."""
-    approved  = (df["critic_verdict"] == "APPROVED").sum()
-    flagged   = (df["critic_verdict"] == "FLAGGED").sum()
-    rejected  = (df["critic_verdict"] == "REJECTED").sum()
+    """
+    Summary cards above the leaderboard.
+
+    Directional accuracy is now shown NEXT TO the majority-class baseline it
+    has to beat. Reporting it alone is what let an 85% figure look impressive
+    while the baseline on the same window was ~59%.
+    """
+    strong = (df["forecast_confidence"] == "STRONG").sum()
+    weak = (df["forecast_confidence"] == "WEAK").sum()
+    insufficient = (df["forecast_confidence"] == "INSUFFICIENT").sum()
+
     avg_score = df["composite_score"].mean()
-    avg_mape  = df["mape"].mean()
-    avg_dir   = df["directional_accuracy"].mean()
+    avg_ic = df["eval_rank_ic"].mean() if "eval_rank_ic" in df.columns else float("nan")
+    avg_hit = df["eval_hit_rate"].mean() if "eval_hit_rate" in df.columns else float("nan")
+    avg_base = (df["eval_baseline_hit_rate"].mean()
+                if "eval_baseline_hit_rate" in df.columns else float("nan"))
+
     top_stock = df.iloc[0]["company"] if len(df) > 0 else "N/A"
     top_score = df.iloc[0]["composite_score"] if len(df) > 0 else 0
 
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        st.metric("Avg Composite Score", f"{avg_score:.1f}/100")
+        st.metric("Avg Composite Score", f"{avg_score:.1f}/100",
+                  help="Ranking heuristic, not an expected return.")
     with c2:
-        st.metric(
-            "Verdicts",
-            f"{approved} ✅  {flagged} ⚠️  {rejected} ❌"
-        )
+        st.metric("Evidence Grade",
+                  f"{strong} strong · {weak} weak · {insufficient} none",
+                  help="From purged walk-forward evaluation on held-out folds.")
     with c3:
-        st.metric(
-            "Ensemble Performance",
-            f"MAPE {avg_mape:.1f}%",
-            delta=f"Dir Acc {avg_dir:.1f}%"
-        )
+        edge = avg_hit - avg_base
+        st.metric("Directional Accuracy", f"{avg_hit:.1f}%",
+                  delta=f"{edge:+.1f}pp vs {avg_base:.1f}% baseline",
+                  help="The baseline is always predicting the more common "
+                       "direction. Accuracy only means something relative to it.")
     with c4:
-        st.metric("Top Ranked Stock", top_stock, delta=f"Score {top_score:.1f}")
+        st.metric("Avg Rank IC", f"{avg_ic:+.3f}",
+                  delta=f"Top: {top_stock[:18]} ({top_score:.0f})",
+                  delta_color="off",
+                  help="Out-of-sample Spearman correlation between predicted "
+                       "and realised excess return. 0 = no skill.")
+
+    st.caption(
+        "All performance figures are out-of-sample, measured by purged "
+        "walk-forward validation with a 30-session embargo, before transaction "
+        "costs. Predicted moves are relative to each stock's benchmark index."
+    )
 
     st.divider()
 
@@ -147,11 +170,14 @@ def render_filters() -> tuple:
     c1, c2, c3, c4, c5 = st.columns([2, 1.5, 1.5, 1.5, 1])
 
     with c1:
+        # NSE industry classifications, matching data/tickers.SECTOR_INDICES.
         sectors = [
-            "All", "Banking & Finance", "Information Technology",
-            "Energy", "FMCG", "Automobile", "Pharmaceuticals",
-            "Metals & Mining", "Infrastructure", "Telecom",
-            "Real Estate", "Consumer Discretionary"
+            "All", "Financial Services", "Information Technology",
+            "Oil Gas & Consumable Fuels", "Fast Moving Consumer Goods",
+            "Automobile and Auto Components", "Healthcare", "Metals & Mining",
+            "Capital Goods", "Power", "Telecommunication", "Realty",
+            "Consumer Durables", "Consumer Services", "Construction Materials",
+            "Chemicals", "Services", "Construction",
         ]
         sector = st.selectbox("Sector", sectors, index=0)
 
@@ -164,23 +190,24 @@ def render_filters() -> tuple:
 
     with c3:
         confidence = st.selectbox(
-            "Confidence",
-            ["All", "High", "Medium", "Low"],
-            index=0
+            "Evidence Grade",
+            ["All", "STRONG", "WEAK", "INSUFFICIENT"],
+            index=0,
+            help="Held-out evidence that this stock's model has skill.",
         )
 
     with c4:
         sort_by = st.selectbox(
             "Sort By",
             [
-                "composite_score", "upside_pct",
-                "directional_accuracy", "mape"
+                "composite_score", "pred_excess_return",
+                "prob_outperform", "eval_rank_ic",
             ],
             format_func=lambda x: {
-                "composite_score":     "Composite Score",
-                "upside_pct":          "Upside Potential",
-                "directional_accuracy":"Directional Accuracy",
-                "mape":                "MAPE (low = better)",
+                "composite_score":    "Composite Score",
+                "pred_excess_return": "Predicted Excess Return",
+                "prob_outperform":    "P(outperform)",
+                "eval_rank_ic":       "Out-of-sample Rank IC",
             }.get(x, x),
             index=0
         )
@@ -215,21 +242,34 @@ def render_leaderboard_table(df: pd.DataFrame, show_all: bool) -> str | None:
         lambda v: verdict_map.get(v, v)
     )
 
-    # Direction arrow
-    display_df["direction_display"] = display_df.apply(
-        lambda row: f"🟢 {row['upside_pct']:+.1f}%"
-        if row["upside_pct"] >= 0
-        else f"🔴 {row['upside_pct']:+.1f}%",
+    # Predicted move, relative to the stock's benchmark index.
+    display_df["excess_display"] = display_df.apply(
+        lambda row: (
+            f"🟢 {row['pred_excess_return'] * 100:+.1f}%"
+            if pd.notna(row.get("pred_excess_return")) and row["pred_excess_return"] >= 0
+            else f"🔴 {row['pred_excess_return'] * 100:+.1f}%"
+            if pd.notna(row.get("pred_excess_return")) else "—"
+        ),
+        axis=1
+    )
+
+    # The 80% conformal interval, in rupees.
+    display_df["interval_display"] = display_df.apply(
+        lambda row: (
+            f"₹{row['interval_low']:,.0f} – ₹{row['interval_high']:,.0f}"
+            if pd.notna(row.get("interval_low")) and pd.notna(row.get("interval_high"))
+            else "—"
+        ),
         axis=1
     )
 
     table_cols = [
         "rank", "company", "sector",
-        "current_price", "forecast_price",
-        "direction_display", "composite_score",
-        "directional_accuracy", "mape",
-        "verdict_display", "forecast_confidence"
+        "current_price", "forecast_price", "interval_display",
+        "excess_display", "prob_outperform", "composite_score",
+        "eval_rank_ic", "verdict_display", "forecast_confidence",
     ]
+    table_cols = [c for c in table_cols if c in display_df.columns]
 
     st.dataframe(
         display_df[table_cols],
@@ -250,26 +290,40 @@ def render_leaderboard_table(df: pd.DataFrame, show_all: bool) -> str | None:
                 "Price (₹)", format="₹%.2f", width="small"
             ),
             "forecast_price": st.column_config.NumberColumn(
-                "Target (₹)", format="₹%.2f", width="small"
+                "Implied Target (₹)", format="₹%.2f", width="small",
+                help="Assumes the benchmark index is flat. The model forecasts "
+                     "relative performance, not the level of the market."
             ),
-            "direction_display": st.column_config.TextColumn(
-                "30d Change", width="small"
+            "interval_display": st.column_config.TextColumn(
+                "80% Interval", width="medium",
+                help="Conformal prediction interval calibrated on out-of-sample "
+                     "residuals. Covers the outcome ~80% of the time."
+            ),
+            "excess_display": st.column_config.TextColumn(
+                "Excess vs Benchmark", width="small",
+                help="The model's actual output: predicted 30-session return "
+                     "relative to the stock's sector index."
+            ),
+            "prob_outperform": st.column_config.NumberColumn(
+                "P(outperform)", format="%.2f", width="small",
+                help="Calibrated probability of beating the benchmark. "
+                     "0.50 = a coin flip."
             ),
             "composite_score": st.column_config.ProgressColumn(
                 "Score", min_value=0, max_value=100,
-                format="%.1f", width="medium"
+                format="%.1f", width="medium",
+                help="Ranking heuristic: signal and conviction, gated by "
+                     "held-out evidence. Not an expected return."
             ),
-            "directional_accuracy": st.column_config.NumberColumn(
-                "Dir Acc %", format="%.1f%%", width="small"
-            ),
-            "mape": st.column_config.NumberColumn(
-                "MAPE %", format="%.1f%%", width="small"
+            "eval_rank_ic": st.column_config.NumberColumn(
+                "Rank IC", format="%.3f", width="small",
+                help="Out-of-sample rank correlation. 0 = no skill."
             ),
             "verdict_display": st.column_config.TextColumn(
                 "Verdict", width="medium"
             ),
             "forecast_confidence": st.column_config.TextColumn(
-                "Confidence", width="small"
+                "Evidence", width="small"
             ),
         }
     )

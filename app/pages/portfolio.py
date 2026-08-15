@@ -55,17 +55,17 @@ def fetch_top_stocks(limit: int = 20) -> list[dict]:
 
 
 def main():
-    st.markdown("## 💼 Portfolio Optimizer")
+    st.markdown("## 💼 Portfolio")
     st.markdown(
-        "Suggested allocations based on composite score rankings. "
-        "Full Modern Portfolio Theory optimization with risk-parity "
-        "weighting is planned for the next release."
+        "Equal-weight allocation across the top-ranked stocks. This is a view "
+        "of the ranking, **not an optimised portfolio and not a backtest**."
     )
 
     st.info(
-        "🚧 **Coming in Stage 5:** Mean-Variance Optimization using "
-        "forecast returns and historical covariance matrix. "
-        "Currently showing equal-weight allocation across top-ranked stocks."
+        "Position sizing, a cost model, and risk metrics (Sharpe, Sortino, "
+        "max drawdown, Calmar) measured against NIFTY 50 TR are Phase 4 of the "
+        "improvement roadmap. Until those exist, nothing on this page has been "
+        "shown to make money."
     )
 
     st.divider()
@@ -89,46 +89,73 @@ def main():
     # Simple equal-weight allocation
     df["allocation_pct"] = round(100.0 / len(df), 2)
 
-    # Expected portfolio return (weighted average of upside_pct)
-    expected_return = (df["upside_pct"] * df["allocation_pct"] / 100).sum()
-    avg_mape        = df["mape"].mean()
-    avg_dir_acc     = df["directional_accuracy"].mean()
+    # Aggregate the model's actual output: predicted EXCESS return relative to
+    # each stock's benchmark. This is not an expected portfolio return — it
+    # excludes market direction, transaction costs and slippage entirely.
+    excess = pd.to_numeric(df.get("pred_excess_return"), errors="coerce")
+    weighted_excess = float((excess.fillna(0.0) * df["allocation_pct"] / 100).sum())
 
-    # Summary metrics
+    avg_ic = pd.to_numeric(df.get("eval_rank_ic"), errors="coerce").mean()
+    avg_hit = pd.to_numeric(df.get("eval_hit_rate"), errors="coerce").mean()
+    avg_base = pd.to_numeric(df.get("eval_baseline_hit_rate"), errors="coerce").mean()
+    n_strong = int((df.get("forecast_confidence") == "STRONG").sum())
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Stocks", n_stocks)
-    c2.metric("Expected 30d Return", f"{expected_return:.1f}%")
-    c3.metric("Avg Model MAPE", f"{avg_mape:.1f}%")
-    c4.metric("Avg Directional Accuracy", f"{avg_dir_acc:.1f}%")
+    c2.metric("Weighted Excess Signal", f"{weighted_excess * 100:+.2f}%",
+              help="Average predicted 30-session return relative to each stock's "
+                   "benchmark. NOT an expected portfolio return: it excludes "
+                   "market direction, transaction costs and slippage.")
+    c3.metric("Avg Rank IC", f"{avg_ic:+.3f}",
+              help="Out-of-sample rank correlation. 0 = no skill.")
+    c4.metric("Strong Evidence", f"{n_strong}/{len(df)}",
+              delta=f"Hit {avg_hit:.1f}% vs {avg_base:.1f}% baseline"
+                    if pd.notna(avg_hit) and pd.notna(avg_base) else None,
+              delta_color="off")
+
+    st.warning(
+        "**This is a ranking, not a backtested strategy.** No transaction costs "
+        "(Indian delivery round trips run roughly 30–60 bps), slippage, "
+        "liquidity limits, or benchmark comparison are modelled. A cost-aware "
+        "portfolio simulator with Sharpe, Sortino, max drawdown and NIFTY 50 TR "
+        "comparison is Phase 4 of the improvement roadmap."
+    )
 
     st.divider()
 
-    # Allocation table
     st.markdown("### Suggested Allocation")
+
+    display_cols = {
+        "company": "Company",
+        "sector": "Sector",
+        "current_price": "Price (₹)",
+        "forecast_price": "Implied Target (₹)",
+        "pred_excess_return": "Excess vs Benchmark",
+        "prob_outperform": "P(outperform)",
+        "forecast_confidence": "Evidence",
+        "composite_score": "Score",
+        "allocation_pct": "Allocation %",
+    }
+    available = {k: v for k, v in display_cols.items() if k in df.columns}
+
+    table = df[list(available)].rename(columns=available)
+    if "Excess vs Benchmark" in table.columns:
+        table["Excess vs Benchmark"] = pd.to_numeric(
+            table["Excess vs Benchmark"], errors="coerce") * 100
+
     st.dataframe(
-        df[[
-            "company", "sector", "current_price",
-            "forecast_price", "upside_pct",
-            "composite_score", "allocation_pct"
-        ]].rename(columns={
-            "company":       "Company",
-            "sector":        "Sector",
-            "current_price": "Price (₹)",
-            "forecast_price":"Target (₹)",
-            "upside_pct":    "Upside %",
-            "composite_score":"Score",
-            "allocation_pct": "Allocation %",
-        }),
+        table,
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Price (₹)":   st.column_config.NumberColumn(format="₹%.2f"),
-            "Target (₹)":  st.column_config.NumberColumn(format="₹%.2f"),
-            "Upside %":    st.column_config.NumberColumn(format="%.1f%%"),
-            "Score":       st.column_config.ProgressColumn(
-                min_value=0, max_value=100, format="%.1f"
-            ),
-            "Allocation %":st.column_config.NumberColumn(format="%.1f%%"),
+            "Price (₹)":            st.column_config.NumberColumn(format="₹%.2f"),
+            "Implied Target (₹)":   st.column_config.NumberColumn(
+                format="₹%.2f", help="Assumes the benchmark index is flat."),
+            "Excess vs Benchmark":  st.column_config.NumberColumn(format="%+.1f%%"),
+            "P(outperform)":        st.column_config.NumberColumn(format="%.2f"),
+            "Score":                st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%.1f"),
+            "Allocation %":         st.column_config.NumberColumn(format="%.1f%%"),
         }
     )
 

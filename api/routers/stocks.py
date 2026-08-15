@@ -3,15 +3,25 @@ GET /api/stocks — returns the full list of tickers with company name and secto
 """
 from fastapi import APIRouter
 from api.schemas.stock import StockList, StockInfo
-from data.tickers import TICKERS
+from data.tickers import get_company, get_sector
 
 router = APIRouter()
 
 @router.get("", response_model=StockList)
 def get_stocks():
+    """
+    The current tradable universe.
+
+    Sourced from data.universe, which applies a point-in-time rule (index
+    membership + liquidity floor + listing history). The previous hard-coded
+    list was produced by ranking stocks on the model's own reported accuracy
+    (audit finding F4).
+    """
+    from data.universe import get_universe
+
     stocks = [
-        StockInfo(ticker=ticker, company=info["company"], sector=info["sector"])
-        for ticker, info in TICKERS.items()
+        StockInfo(ticker=t, company=get_company(t), sector=get_sector(t))
+        for t in get_universe()
     ]
     return StockList(stocks=stocks, total=len(stocks))
 
@@ -23,47 +33,40 @@ def get_signals(ticker: str, days: int = 30):
     """
     from data.db import get_engine
     from fastapi import HTTPException
+    from sqlalchemy import text
     import pandas as pd
+
+    days = max(1, min(days, 2000))
     engine = get_engine()
+
+    # Bound parameters only. The previous fallback branch interpolated the
+    # ticker straight into SQL, and this endpoint takes it from the URL
+    # (audit finding F15).
     try:
         df = pd.read_sql(
-            """
-            SELECT date, close, rsi, macd_hist, bb_width, obv,
-                   sma_20, ema_9, ema_21, ema_50, atr_14,
-                   stoch_k, williams_r, roc_10, vroc_10,
-                   prox_52w, lag1_ret, lag5_ret, dev_sma50,
-                   bb_upper, bb_lower, hurst,
-                   sector_rel_5d, sector_rel_10d, sector_rel_20d,
-                   earnings_surprise
-            FROM signals
-            WHERE ticker = :ticker
-            ORDER BY date DESC
-            LIMIT :days
-            """,
-            con=engine,
-            params={"ticker": ticker.upper(), "days": days}
-        )
-    except Exception:
-        # Fallback for SQLite (no named params)
-        try:
-            df = pd.read_sql(
-                f"""
+            text("""
                 SELECT date, close, rsi, macd_hist, bb_width, obv,
                        sma_20, ema_9, ema_21, ema_50, atr_14,
                        stoch_k, williams_r, roc_10, vroc_10,
                        prox_52w, lag1_ret, lag5_ret, dev_sma50,
                        bb_upper, bb_lower, hurst,
                        sector_rel_5d, sector_rel_10d, sector_rel_20d,
-                       earnings_surprise
+                       earnings_surprise,
+                       target_return, target_excess_return, benchmark_return,
+                       benchmark_ticker
                 FROM signals
-                WHERE ticker = '{ticker.upper()}'
+                WHERE ticker = :ticker
                 ORDER BY date DESC
-                LIMIT {days}
-                """,
-                con=engine
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to fetch signals for {ticker}: {str(e)}")
+                LIMIT :days
+            """),
+            con=engine,
+            params={"ticker": ticker.upper(), "days": days},
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch signals for {ticker}: {e}",
+        ) from e
 
     df = df.sort_values("date", ascending=True)
     # Replace NaN/inf with None so JSON serialisation works

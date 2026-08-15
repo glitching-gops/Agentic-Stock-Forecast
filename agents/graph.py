@@ -1,261 +1,235 @@
 """
-graph.py
-LangGraph orchestration for the Stock Forecast v3 pipeline.
+agents/graph.py — LangGraph orchestration and forecast persistence.
+
+The composite score is rebuilt. Previously it summed 30 pts directional
+accuracy + 30 pts critic verdict + 15 pts confidence + 25 pts upside. The first
+three were all functions of the leaked in-sample metrics, and the verdict was a
+near-constant APPROVED, so roughly 75 of 100 points did not vary across stocks
+and the ranking reduced to sorting by predicted upside (audit finding F9).
+
+The replacement separates two things that were tangled together:
+
+    signal    — how strong is the predicted excess return?
+    evidence  — has this model shown skill on data it did not see?
+
+Ranking is driven by signal, gated by evidence. A stock whose model failed its
+held-out checks cannot outrank one that passed simply by predicting a bigger
+move. The score is a ranking heuristic and is documented as such; it is not an
+expected return.
 """
-from langgraph.graph import StateGraph, START, END
-from agents.state import AgentState
-from agents.trading_data_agent import trading_data_node
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+
+from langgraph.graph import END, START, StateGraph
+from sqlalchemy import text
+
+from agents.critic_agent import critic_node
 from agents.external_data_agent import external_data_node
 from agents.forecasting_agent import forecasting_node
-from agents.critic_agent import critic_node
-from data.tickers import TICKERS
+from agents.state import AgentState
+from agents.trading_data_agent import trading_data_node
+
+EVIDENCE_MULTIPLIER = {"STRONG": 1.0, "WEAK": 0.5, "INSUFFICIENT": 0.0}
+
 
 def compute_composite_score(
-    upside_pct: float,
-    verdict: str,
-    confidence: str,
-    directional_accuracy: float,
+    pred_excess_return: float | None,
+    evidence_grade: str,
+    prob_outperform: float | None,
+    n_flags: int = 0,
 ) -> float:
     """
-    Computes the composite leaderboard score out of 100.
+    Ranking heuristic in [0, 100]. NOT an expected return.
 
-    Components:
-      - Directional accuracy (30 pts): most actionable signal
-      - Forecast upside potential (25 pts): expected return
-      - Critic verdict (30 pts): quality gate
-      - Model confidence (15 pts): ensemble reliability
-
-    Args:
-        upside_pct:           forecast change % (e.g. 5.2 for 5.2%)
-        verdict:              APPROVED / FLAGGED / REJECTED
-        confidence:           High / Medium / Low
-        directional_accuracy: model directional accuracy 0-100
-
-    Returns:
-        composite score 0-100 (float, rounded to 2dp)
+    signal      (0-60)  predicted excess return, saturating at +10% over 30
+                        sessions so one extreme forecast cannot dominate.
+    conviction  (0-40)  distance of P(outperform) from a coin flip.
+    evidence            multiplies the total, so a model that failed its
+                        held-out checks scores 0 regardless of its prediction.
+    flags               5-point deduction each, floored at zero.
     """
-    # Directional accuracy — linear 0 to 30
-    dir_score = (min(max(directional_accuracy, 0.0), 100.0) / 100.0) * 30.0
+    if pred_excess_return is None:
+        return 0.0
 
-    # Upside score — capped at 25 points
-    # multiplier 1.5 means 16.7% upside = max score
-    upside_score = min(max(upside_pct * 1.5, 0.0), 25.0)
+    signal = min(max(pred_excess_return, 0.0) / 0.10, 1.0) * 60.0
 
-    # Verdict score
-    verdict_score = {"APPROVED": 30.0, "FLAGGED": 12.0, "REJECTED": 0.0}.get(
-        verdict, 12.0
-    )
+    if prob_outperform is None:
+        conviction = 0.0
+    else:
+        conviction = min(max(prob_outperform - 0.5, 0.0) / 0.25, 1.0) * 40.0
 
-    # Confidence score
-    conf_score = {"High": 15.0, "Medium": 7.0, "Low": 0.0}.get(
-        confidence, 0.0
-    )
+    raw = (signal + conviction) * EVIDENCE_MULTIPLIER.get(evidence_grade, 0.0)
+    return round(max(raw - 5.0 * n_flags, 0.0), 2)
 
-    return round(dir_score + upside_score + verdict_score + conf_score, 2)
 
-def save_forecast_to_db(state: dict):
-    """
-    Saves the completed agent pipeline state to the forecasts
-    and leaderboard tables in the database.
-    Called automatically at the end of run_graph().
-    """
-    import json
+def save_forecast_to_db(state: dict) -> None:
+    """Persists the forecast, its evidence, and the leaderboard row."""
     from data.db import get_engine
-    from data.tickers import get_company, get_sector
-    from sqlalchemy import text
-    from datetime import datetime
+    from data.tickers import get_benchmark_name, get_company, get_sector
+    from data.universe import DEFAULT_RULE
 
     engine = get_engine()
     ticker = state.get("ticker", "")
-
-    # Compute composite score
-    upside_pct = state.get("forecast_change_pct", 0)
-    verdict    = state.get("critic_verdict", "FLAGGED")
-    confidence = state.get("forecast_confidence", "Low")
+    now = datetime.now(timezone.utc)
 
     composite = compute_composite_score(
-        upside_pct           = upside_pct,
-        verdict              = verdict,
-        confidence           = confidence,
-        directional_accuracy = state.get("model_directional_accuracy", 0.0),
+        pred_excess_return=state.get("pred_excess_return"),
+        evidence_grade=state.get("evidence_grade", "INSUFFICIENT"),
+        prob_outperform=state.get("prob_outperform"),
+        n_flags=len(state.get("critic_flags", []) or []),
     )
 
-    now = datetime.utcnow()
+    benchmark = state.get("benchmark_ticker") or ""
+    payload = {
+        "ticker": ticker,
+        "company": get_company(ticker),
+        "sector": get_sector(ticker),
+        "current_price": state.get("current_price"),
+        "forecast_price": state.get("forecast_price"),
+        "direction": state.get("forecast_direction"),
+        "change_pct": state.get("forecast_change_pct"),
+        "pred_excess_return": state.get("pred_excess_return"),
+        # Deliberately null: the model predicts an EXCESS return and has no
+        # view on the benchmark, so a total return cannot be derived from it.
+        # Copying the excess value into this column would mislabel it exactly
+        # the way the old xgb_mape column mislabelled its contents.
+        "pred_return": None,
+        "interval_low": state.get("interval_low"),
+        "interval_high": state.get("interval_high"),
+        "interval_coverage": state.get("interval_coverage"),
+        "prob_outperform": state.get("prob_outperform"),
+        "random_walk_price": state.get("random_walk_price"),
+        "benchmark_ticker": benchmark,
+        "benchmark_name": get_benchmark_name(benchmark) if benchmark else None,
+        "benchmark_sector_specific": int(bool(state.get("benchmark_sector_specific"))),
+        "eval_rank_ic": state.get("eval_rank_ic"),
+        "eval_hit_rate": state.get("eval_hit_rate"),
+        "eval_baseline_hit_rate": state.get("eval_baseline_hit_rate"),
+        "eval_beats_random_walk": int(bool(state.get("eval_beats_naive"))),
+        "model_version": state.get("model_version"),
+        "universe_rule": DEFAULT_RULE.fingerprint(),
+        "forecast_confidence": state.get("evidence_grade", "INSUFFICIENT"),
+        "signal_narrative": state.get("signal_narrative"),
+        "critic_verdict": state.get("critic_verdict", "REJECTED"),
+        "critic_reasoning": state.get("critic_reasoning"),
+        "critic_flags": json.dumps(state.get("critic_flags", []) or []),
+        "critic_confidence_adjustment": state.get("critic_source", "evidence_gate"),
+        "last_updated": now,
+        # mape / directional_accuracy are retained as columns for schema
+        # compatibility but are no longer written with in-sample values.
+        "mape": None,
+        "directional_accuracy": state.get("eval_hit_rate"),
+        "upside_pct": state.get("forecast_change_pct"),
+        "composite_score": composite,
+    }
+
+    forecast_cols = [
+        "ticker", "company", "sector", "current_price", "forecast_price", "direction",
+        "change_pct", "mape", "directional_accuracy", "forecast_confidence",
+        "signal_narrative", "critic_verdict", "critic_reasoning", "critic_flags",
+        "critic_confidence_adjustment", "last_updated", "pred_excess_return",
+        "pred_return", "interval_low", "interval_high", "interval_coverage",
+        "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
+        "benchmark_sector_specific", "eval_rank_ic", "eval_hit_rate",
+        "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
+        "universe_rule",
+    ]
+
+    leaderboard_cols = [
+        "ticker", "company", "sector", "current_price", "forecast_price", "upside_pct",
+        "composite_score", "critic_verdict", "forecast_confidence", "mape",
+        "directional_accuracy", "last_updated", "pred_excess_return", "interval_low",
+        "interval_high", "interval_coverage", "prob_outperform", "random_walk_price",
+        "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
+        "eval_rank_ic", "eval_hit_rate", "eval_baseline_hit_rate",
+        "eval_beats_random_walk", "model_version", "universe_rule",
+    ]
+
+    def _insert(cols: list[str], table: str) -> str:
+        names = ", ".join(cols)
+        binds = ", ".join(f":{c}" for c in cols)
+        return f"INSERT INTO {table} ({names}) VALUES ({binds})"
 
     with engine.connect() as conn:
-        # Insert into forecasts table (keep full history)
-        conn.execute(text("""
-            INSERT INTO forecasts (
-                ticker, company, sector, current_price, forecast_price,
-                direction, change_pct, mape, directional_accuracy,
-                forecast_confidence, signal_narrative, critic_verdict,
-                critic_reasoning, critic_flags, critic_confidence_adjustment,
-                last_updated
-            ) VALUES (
-                :ticker, :company, :sector, :current_price, :forecast_price,
-                :direction, :change_pct, :mape, :directional_accuracy,
-                :forecast_confidence, :signal_narrative, :critic_verdict,
-                :critic_reasoning, :critic_flags, :critic_confidence_adjustment,
-                :last_updated
-            )
-        """), {
-            "ticker":                       ticker,
-            "company":                      get_company(ticker),
-            "sector":                       get_sector(ticker),
-            "current_price":                state.get("current_price"),
-            "forecast_price":               state.get("forecast_price"),
-            "direction":                    state.get("forecast_direction"),
-            "change_pct":                   state.get("forecast_change_pct"),
-            "mape":                         state.get("model_mape"),
-            "directional_accuracy":         state.get("model_directional_accuracy"),
-            "forecast_confidence":          state.get("forecast_confidence"),
-            "signal_narrative":             state.get("signal_narrative"),
-            "critic_verdict":               verdict,
-            "critic_reasoning":             state.get("critic_reasoning"),
-            "critic_flags":                 json.dumps(state.get("critic_flags", [])),
-            "critic_confidence_adjustment": state.get("critic_confidence_adjustment"),
-            "last_updated":                 now,
-        })
+        conn.execute(text(_insert(forecast_cols, "forecasts")),
+                     {c: payload.get(c) for c in forecast_cols})
 
-        # Upsert into leaderboard table (one row per ticker, always current)
-        try:
-            conn.execute(text("""
-                INSERT INTO leaderboard (
-                    ticker, company, sector, current_price, forecast_price,
-                    upside_pct, composite_score, critic_verdict,
-                    forecast_confidence, mape, directional_accuracy, last_updated
-                ) VALUES (
-                    :ticker, :company, :sector, :current_price, :forecast_price,
-                    :upside_pct, :composite_score, :critic_verdict,
-                    :forecast_confidence, :mape, :directional_accuracy, :last_updated
-                )
-                ON CONFLICT (ticker) DO UPDATE SET
-                    company              = EXCLUDED.company,
-                    sector               = EXCLUDED.sector,
-                    current_price        = EXCLUDED.current_price,
-                    forecast_price       = EXCLUDED.forecast_price,
-                    upside_pct           = EXCLUDED.upside_pct,
-                    composite_score      = EXCLUDED.composite_score,
-                    critic_verdict       = EXCLUDED.critic_verdict,
-                    forecast_confidence  = EXCLUDED.forecast_confidence,
-                    mape                 = EXCLUDED.mape,
-                    directional_accuracy = EXCLUDED.directional_accuracy,
-                    last_updated         = EXCLUDED.last_updated
-            """), {
-                "ticker":               ticker,
-                "company":              get_company(ticker),
-                "sector":               get_sector(ticker),
-                "current_price":        state.get("current_price"),
-                "forecast_price":       state.get("forecast_price"),
-                "upside_pct":           upside_pct,
-                "composite_score":      composite,
-                "critic_verdict":       verdict,
-                "forecast_confidence":  confidence,
-                "mape":                 state.get("model_mape"),
-                "directional_accuracy": state.get("model_directional_accuracy"),
-                "last_updated":         now,
-            })
-        except Exception:
-            # Fallback for local SQLite development
-            conn.execute(text("""
-                INSERT OR REPLACE INTO leaderboard (
-                    ticker, company, sector, current_price, forecast_price,
-                    upside_pct, composite_score, critic_verdict,
-                    forecast_confidence, mape, directional_accuracy, last_updated
-                ) VALUES (
-                    :ticker, :company, :sector, :current_price, :forecast_price,
-                    :upside_pct, :composite_score, :critic_verdict,
-                    :forecast_confidence, :mape, :directional_accuracy, :last_updated
-                )
-            """), {
-                "ticker":               ticker,
-                "company":              get_company(ticker),
-                "sector":               get_sector(ticker),
-                "current_price":        state.get("current_price"),
-                "forecast_price":       state.get("forecast_price"),
-                "upside_pct":           upside_pct,
-                "composite_score":      composite,
-                "critic_verdict":       verdict,
-                "forecast_confidence":  confidence,
-                "mape":                 state.get("model_mape"),
-                "directional_accuracy": state.get("model_directional_accuracy"),
-                "last_updated":         now,
-            })
-
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in leaderboard_cols if c != "ticker")
+        conn.execute(
+            text(f"{_insert(leaderboard_cols, 'leaderboard')} "
+                 f"ON CONFLICT (ticker) DO UPDATE SET {updates}"),
+            {c: payload.get(c) for c in leaderboard_cols},
+        )
         conn.commit()
+
 
 def build_graph():
     workflow = StateGraph(AgentState)
-    
-    # Add nodes
+
     workflow.add_node("trading_data", trading_data_node)
     workflow.add_node("external_data", external_data_node)
     workflow.add_node("forecasting", forecasting_node)
     workflow.add_node("critic", critic_node)
-    
-    # Add edges
+
     workflow.add_edge(START, "trading_data")
     workflow.add_edge(START, "external_data")
-    
-    # Forecasting waits for both parallel data nodes
     workflow.add_edge(["trading_data", "external_data"], "forecasting")
-    
     workflow.add_edge("forecasting", "critic")
     workflow.add_edge("critic", END)
-    
+
     return workflow.compile()
+
 
 graph = build_graph()
 
+
 def run_graph(ticker: str) -> dict:
-    print(f"\n--- Running Agent Graph for {ticker} ---")
-    
+    """
+    Runs the agent graph for one ticker and persists the result.
+
+    On failure it returns an explicit failure state rather than a plausible
+    flat forecast — the distinction that F10 erased.
+    """
+    from data.tickers import get_company
+
+    print(f"\n--- Running agent graph for {ticker} ---")
+
     try:
-        # Initialize state
-        initial_state = AgentState(
-            ticker=ticker,
-            company_name=TICKERS.get(ticker, {}).get("company", ticker),
-            current_price=0.0,
-            signals_df=[],
-            latest_signals={},
-            sentiment_score=0.0,
-            macro_df=[],
-            forecast_price=0.0,
-            forecast_direction="UNKNOWN",
-            forecast_change_pct=0.0,
-            forecast_confidence="Low",
-            model_mape=0.0,
-            model_directional_accuracy=0.0,
-            feature_importances={},
-            signal_narrative="",
-            critic_verdict="FLAGGED",
-            critic_reasoning="",
-            critic_flags=[],
-            critic_confidence_adjustment="MAINTAINED"
-        )
-        
-        final_state = graph.invoke(initial_state)
+        initial: AgentState = {
+            "ticker": ticker,
+            "company_name": get_company(ticker),
+            "current_price": 0.0,
+            "signals_df": [],
+            "latest_signals": {},
+            "sentiment_score": 0.0,
+            "macro_df": [],
+            "forecast_available": False,
+        }
+
+        final_state = graph.invoke(initial)
         save_forecast_to_db(final_state)
-        print(f"--- Completed Agent Graph for {ticker} ---\n")
+        print(f"--- Completed {ticker} "
+              f"({final_state.get('evidence_grade')}, "
+              f"{final_state.get('critic_verdict')}) ---\n")
         return final_state
-        
-    except Exception as e:
-        safe_err = str(e).encode("ascii", "backslashreplace").decode("ascii")
-        print(f"--- FAILED Agent Graph for {ticker}: {safe_err} ---\n")
+
+    except Exception as exc:                                   # noqa: BLE001
+        safe = str(exc).encode("ascii", "backslashreplace").decode("ascii")
+        print(f"--- FAILED {ticker}: {safe} ---\n")
         import traceback
         traceback.print_exc()
         return {
             "ticker": ticker,
-            "company_name": TICKERS.get(ticker, {}).get("company", ticker),
-            "current_price": 0.0,
-            "forecast_price": 0.0,
-            "forecast_direction": "ERROR",
-            "forecast_change_pct": 0.0,
-            "forecast_confidence": "Low",
-            "model_mape": 100.0,
-            "model_directional_accuracy": 0.0,
+            "company_name": get_company(ticker),
+            "forecast_available": False,
+            "forecast_error": safe,
+            "forecast_direction": "UNAVAILABLE",
+            "evidence_grade": "INSUFFICIENT",
             "critic_verdict": "REJECTED",
-            "critic_reasoning": f"Catastrophic Graph Failure: {safe_err}",
+            "critic_reasoning": f"Pipeline failure: {safe}",
             "critic_flags": ["Pipeline Error"],
-            "critic_confidence_adjustment": "DOWNGRADED"
+            "critic_source": "exception",
         }
