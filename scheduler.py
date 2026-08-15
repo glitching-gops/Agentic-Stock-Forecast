@@ -72,7 +72,7 @@ def run_pipeline_job():
         from pipeline.signals import compute_and_store, count_labelled_rows
         from pipeline.sentiment import fetch_and_score
         from pipeline.macro import fetch_and_store as fetch_macro
-        from agents.graph import run_graph
+        from agents.graph import prune_leaderboard, run_graph
 
         logger.info("[0/5] Syncing point-in-time universe...")
         sync_current_membership()
@@ -132,6 +132,15 @@ def run_pipeline_job():
                 failed += 1
                 logger.error(f"[5/5] {ticker}: run_graph failed — {exc}")
         logger.info(f"[5/5] Forecasting complete: {succeeded} succeeded, {failed} failed")
+
+        # Names that have left the index keep their last leaderboard row
+        # otherwise, and those rows carry pre-Phase-0 composite scores that
+        # outrank every evidence-gated score written today. See
+        # agents.graph.prune_leaderboard.
+        removed = prune_leaderboard(universe)
+        if removed:
+            logger.info(f"[5/5] Pruned {removed} leaderboard row(s) for tickers "
+                       f"no longer in the universe")
 
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
