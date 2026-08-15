@@ -39,7 +39,7 @@ import pandas as pd
 from sqlalchemy import text
 from xgboost import XGBRegressor
 
-from data.db import get_engine
+from data.db import get_engine, to_native, to_native_params
 from pipeline.conformal import ConformalCalibration, fit_conformal, to_price_view
 from pipeline.evaluation import (
     PurgedWalkForward,
@@ -230,7 +230,7 @@ def _persist_evaluation(ticker: str, payload: dict) -> None:
                 conformal_residuals    = EXCLUDED.conformal_residuals,
                 model_version          = EXCLUDED.model_version,
                 evaluated_at           = EXCLUDED.evaluated_at
-        """), {
+        """), to_native_params({
             "ticker": ticker,
             "ic": payload.get("rank_ic"),
             "ic_t": payload.get("rank_ic_t"),
@@ -248,7 +248,7 @@ def _persist_evaluation(ticker: str, payload: dict) -> None:
                   if payload.get("conformal_residuals") is not None else None,
             "version": MODEL_VERSION,
             "evaluated_at": payload.get("evaluated_at"),
-        })
+        }))
         conn.commit()
 
 
@@ -284,23 +284,30 @@ def _load_persisted_evaluation(ticker: str) -> dict | None:
         except (json.JSONDecodeError, TypeError):
             protocol = {}
 
+    # to_native on every scalar: pd.read_sql returns numpy dtypes, and these
+    # values flow through the agent state straight back into an INSERT in
+    # agents.graph.save_forecast_to_db. A numpy scalar there does not raise —
+    # psycopg2 renders it with repr(), which under numpy 2.x emits
+    # "np.float64(0.117)" into the SQL text and fails as schema "np" does not
+    # exist. Converting at the read boundary keeps numpy inside the modelling
+    # code, where it belongs, rather than leaking into transport.
     return {
-        "rank_ic": r.get("eval_rank_ic"),
-        "rank_ic_t": r.get("eval_rank_ic_t"),
-        "hit_rate": r.get("eval_hit_rate"),
-        "majority_hit_rate": r.get("eval_baseline_hit_rate"),
-        "mae": r.get("eval_mae"),
-        "mae_naive_zero": r.get("eval_mae_naive"),
+        "rank_ic": to_native(r.get("eval_rank_ic")),
+        "rank_ic_t": to_native(r.get("eval_rank_ic_t")),
+        "hit_rate": to_native(r.get("eval_hit_rate")),
+        "majority_hit_rate": to_native(r.get("eval_baseline_hit_rate")),
+        "mae": to_native(r.get("eval_mae")),
+        "mae_naive_zero": to_native(r.get("eval_mae_naive")),
         "beats_naive": (bool(r["eval_mae"] < r["eval_mae_naive"])
                         if pd.notna(r.get("eval_mae")) and pd.notna(r.get("eval_mae_naive"))
                         else None),
-        "n_oos_predictions": r.get("eval_n_oos"),
-        "n_effective": r.get("eval_n_effective"),
+        "n_oos_predictions": to_native(r.get("eval_n_oos")),
+        "n_effective": to_native(r.get("eval_n_effective")),
         "protocol": protocol,
         "evaluated_at": str(r["evaluated_at"]) if pd.notna(r.get("evaluated_at")) else None,
-        "conformal_quantile": r.get("conformal_quantile"),
-        "conformal_coverage": r.get("conformal_coverage"),
-        "conformal_n": r.get("conformal_n"),
+        "conformal_quantile": to_native(r.get("conformal_quantile")),
+        "conformal_coverage": to_native(r.get("conformal_coverage")),
+        "conformal_n": to_native(r.get("conformal_n")),
         "conformal_residuals": residuals,
     }
 

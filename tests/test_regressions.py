@@ -401,3 +401,207 @@ def test_price_view_states_its_benchmark_assumption():
     assert "assumption" in view
     assert "flat" in view["assumption"].lower()
     assert view["random_walk_price"] == 1000.0
+
+
+# ── Numpy scalars must never reach the database driver ────────────────────────
+#
+# The daily pipeline ran green for every ticker while writing nothing. Every
+# insert died with `psycopg2.errors.InvalidSchemaName: schema "np" does not
+# exist` because a numpy scalar reached psycopg2, which adapts it with the
+# float adapter and renders it via repr(). numpy 2.x changed that repr from
+# "42.75" to "np.float64(42.75)", so the value landed in the SQL text as a
+# schema-qualified name.
+#
+# It hid because SQLite accepts a float subclass without calling repr(), and
+# because the numpy values only reach the write for tickers that already have
+# a persisted weekly evaluation. The run that exposed it failed on exactly the
+# 33 tickers the weekly job had reached and succeeded on the other 62.
+
+def test_numpy_scalar_passes_an_isinstance_float_check():
+    """
+    Documents why a type guard would not have caught this. np.float64
+    subclasses float, so the driver accepts it and fails later at the SQL
+    parser instead of raising a clean adaptation error.
+    """
+    assert isinstance(np.float64(42.75), float)
+
+
+def test_to_native_unwraps_numpy_scalars_and_leaves_everything_else():
+    from data.db import to_native, to_native_params
+
+    assert type(to_native(np.float64(1.5))) is float
+    assert type(to_native(np.int64(3))) is int
+    assert type(to_native(np.bool_(True))) is bool
+
+    for passthrough in [None, "RELIANCE.NS", 1.5, 3, True]:
+        assert to_native(passthrough) is passthrough
+
+    cleaned = to_native_params({"a": np.float64(1.5), "b": None, "c": "x"})
+    assert not any(isinstance(v, np.generic) for v in cleaned.values())
+
+
+def test_save_forecast_to_db_sends_no_numpy_scalars_to_the_driver():
+    """
+    End-to-end guard on the write path: build a state carrying numpy scalars
+    exactly where the real one does (the persisted evaluation is read with
+    pd.read_sql; the conformal interval and probability are computed in
+    numpy) and assert nothing numpy survives into the bind parameters.
+    """
+    import agents.graph as graph_mod
+    import data.db as db_mod
+    import data.tickers as tickers_mod
+
+    captured = []
+
+    class _FakeConn:
+        def execute(self, _statement, params=None):
+            captured.append(params or {})
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeEngine:
+        def connect(self):
+            return _FakeConn()
+
+    original = (db_mod.get_engine, tickers_mod.get_company,
+                tickers_mod.get_sector, tickers_mod.get_benchmark_name)
+    db_mod.get_engine = lambda: _FakeEngine()
+    tickers_mod.get_company = lambda t: "Test Co"
+    tickers_mod.get_sector = lambda t: "Test Sector"
+    tickers_mod.get_benchmark_name = lambda t: "NIFTY 50"
+
+    try:
+        graph_mod.save_forecast_to_db({
+            "ticker": "TEST.NS",
+            "forecast_available": True,
+            "current_price": 100.0,
+            "forecast_price": np.float64(101.5),
+            "forecast_direction": "OUTPERFORM",
+            "forecast_change_pct": np.float64(1.5),
+            "pred_excess_return": np.float64(0.015),
+            "interval_low": np.float64(90.0),
+            "interval_high": np.float64(112.0),
+            "interval_coverage": np.float64(0.8),
+            "prob_outperform": np.float64(0.61),
+            "random_walk_price": np.float64(100.0),
+            "benchmark_ticker": "^NSEI",
+            "eval_rank_ic": np.float64(-0.116661),
+            "eval_hit_rate": np.float64(42.7513),
+            "eval_baseline_hit_rate": np.float64(51.6402),
+            "eval_beats_naive": np.bool_(False),
+            "evidence_grade": "WEAK",
+            "model_version": "test",
+        })
+    finally:
+        (db_mod.get_engine, tickers_mod.get_company,
+         tickers_mod.get_sector, tickers_mod.get_benchmark_name) = original
+
+    assert len(captured) == 2, "expected a forecasts insert and a leaderboard upsert"
+    for params in captured:
+        offenders = {k: type(v).__name__ for k, v in params.items()
+                     if isinstance(v, np.generic)}
+        assert not offenders, f"numpy scalars reached the driver: {offenders}"
+
+
+def test_persisted_evaluation_loader_returns_no_numpy_scalars():
+    """
+    _load_persisted_evaluation reads with pd.read_sql, whose values are numpy
+    dtypes, and its output flows through the agent state straight back into an
+    INSERT. It must convert at that boundary.
+    """
+    import pipeline.model as model_mod
+
+    frame = pd.DataFrame([{
+        "ticker": "TEST.NS",
+        "eval_rank_ic": 0.117, "eval_rank_ic_t": 0.92,
+        "eval_hit_rate": 57.3, "eval_baseline_hit_rate": 54.7,
+        "eval_mae": 0.041, "eval_mae_naive": 0.043,
+        "eval_n_oos": 945, "eval_n_effective": 31,
+        "eval_protocol": None, "conformal_quantile": 0.05,
+        "conformal_coverage": 0.8, "conformal_n": 500,
+        "conformal_residuals": None, "evaluated_at": "2026-08-15 17:01:32",
+    }])
+    # Round-trips through numpy dtypes exactly as pd.read_sql would.
+    assert isinstance(frame.iloc[0]["eval_rank_ic"], np.generic)
+
+    original = model_mod.pd.read_sql
+    model_mod.pd.read_sql = lambda *a, **kw: frame
+    try:
+        loaded = model_mod._load_persisted_evaluation("TEST.NS")
+    finally:
+        model_mod.pd.read_sql = original
+
+    assert loaded is not None
+    offenders = {k: type(v).__name__ for k, v in loaded.items()
+                 if isinstance(v, np.generic)}
+    assert not offenders, f"loader leaked numpy scalars: {offenders}"
+
+
+# ── Departed tickers must not outrank the live universe ───────────────────────
+
+def test_prune_leaderboard_removes_only_tickers_outside_the_universe():
+    """
+    save_forecast_to_db upserts and never deletes, so a name that leaves the
+    index keeps its last row — carrying a pre-Phase-0 composite score with no
+    evidence gate, which outranks every gated score written today. The live
+    leaderboard was still headed by IDEA.NS and SAIL.NS months after both left
+    the NIFTY 100.
+    """
+    import agents.graph as graph_mod
+    import data.db as db_mod
+
+    deleted_params = []
+
+    class _FakeResult:
+        rowcount = 2
+
+    class _FakeConn:
+        def execute(self, statement, params=None):
+            deleted_params.append((str(statement), params))
+            return _FakeResult()
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeEngine:
+        def connect(self):
+            return _FakeConn()
+
+    original = db_mod.get_engine
+    db_mod.get_engine = lambda: _FakeEngine()
+    try:
+        removed = graph_mod.prune_leaderboard(["RELIANCE.NS", "WIPRO.NS"])
+        # An empty universe must never trigger a delete — that would wipe the
+        # whole leaderboard on a bad universe fetch.
+        empty = graph_mod.prune_leaderboard([])
+    finally:
+        db_mod.get_engine = original
+
+    assert removed == 2
+    assert empty == 0
+    assert len(deleted_params) == 1, "empty universe must not issue a DELETE"
+
+    statement, params = deleted_params[0]
+    assert "DELETE FROM leaderboard" in statement
+    assert "NOT IN" in statement
+    assert params["tickers"] == ["RELIANCE.NS", "WIPRO.NS"]
+
+
+def test_daily_job_prunes_the_leaderboard_after_forecasting():
+    import scheduler
+
+    source = inspect.getsource(scheduler.run_pipeline_job)
+    assert "prune_leaderboard(universe)" in source

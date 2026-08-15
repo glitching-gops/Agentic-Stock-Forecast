@@ -2,6 +2,7 @@
 # Creates tables: ohlcv, signals, sentiment, and macro
 
 import os
+import numpy as np
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -27,6 +28,37 @@ elif DATABASE_URL.startswith("postgresql+psycopg://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql+psycopg://", "postgresql+psycopg2://", 1)
 
 _ENGINE = None
+
+
+def to_native(value):
+    """
+    Converts a numpy scalar to its plain Python equivalent, leaving anything
+    else untouched.
+
+    This is not cosmetic. np.float64 subclasses Python float, so psycopg2
+    happily accepts it and adapts it with the float adapter — which renders
+    the value with repr(). Under numpy 1.x that produced "42.75"; numpy 2.x
+    changed the repr to "np.float64(42.75)", which Postgres parses as a
+    schema-qualified name and rejects with:
+
+        InvalidSchemaName: schema "np" does not exist
+
+    Two things kept this hidden. SQLite accepts a float subclass without ever
+    calling repr(), so it only breaks against Postgres; and the numpy values
+    reach the write only for tickers that already have a persisted weekly
+    evaluation, so any ticker never yet evaluated inserts cleanly. The daily
+    run that exposed it failed on exactly the 33 tickers the weekly job had
+    reached (alphabetically ABB->GAIL) and succeeded on the other 62.
+    """
+    if isinstance(value, np.generic):       # np.float64, np.int64, np.bool_, ...
+        return value.item()
+    return value
+
+
+def to_native_params(params: dict) -> dict:
+    """Applies to_native() across a bind-parameter dict."""
+    return {k: to_native(v) for k, v in params.items()}
+
 
 def get_engine():
     global _ENGINE

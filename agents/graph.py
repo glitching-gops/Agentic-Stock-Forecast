@@ -24,7 +24,7 @@ import json
 from datetime import datetime, timezone
 
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from agents.critic_agent import critic_node
 from agents.external_data_agent import external_data_node
@@ -67,7 +67,7 @@ def compute_composite_score(
 
 def save_forecast_to_db(state: dict) -> None:
     """Persists the forecast, its evidence, and the leaderboard row."""
-    from data.db import get_engine
+    from data.db import get_engine, to_native_params
     from data.tickers import get_benchmark_name, get_company, get_sector
     from data.universe import DEFAULT_RULE
 
@@ -154,17 +154,53 @@ def save_forecast_to_db(state: dict) -> None:
         binds = ", ".join(f":{c}" for c in cols)
         return f"INSERT INTO {table} ({names}) VALUES ({binds})"
 
+    # to_native_params is the last line of defence before psycopg2. Much of
+    # this payload originates in pandas/numpy (the persisted evaluation is
+    # read with pd.read_sql; the conformal interval and probability are
+    # computed in numpy), and a numpy scalar reaching the driver produces a
+    # repr-mangled SQL literal rather than a type error — see data.db.to_native.
     with engine.connect() as conn:
         conn.execute(text(_insert(forecast_cols, "forecasts")),
-                     {c: payload.get(c) for c in forecast_cols})
+                     to_native_params({c: payload.get(c) for c in forecast_cols}))
 
         updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in leaderboard_cols if c != "ticker")
         conn.execute(
             text(f"{_insert(leaderboard_cols, 'leaderboard')} "
                  f"ON CONFLICT (ticker) DO UPDATE SET {updates}"),
-            {c: payload.get(c) for c in leaderboard_cols},
+            to_native_params({c: payload.get(c) for c in leaderboard_cols}),
         )
         conn.commit()
+
+
+def prune_leaderboard(universe: list[str]) -> int:
+    """
+    Deletes leaderboard rows for tickers no longer in the tradable universe.
+
+    save_forecast_to_db upserts per ticker and never deletes, so a name that
+    leaves the index keeps its last row forever. That is not merely untidy:
+    those rows carry a composite_score computed under the pre-Phase-0 formula,
+    which had no evidence gate and routinely produced scores near 100, while
+    every score written today is gated by evidence and is 0.0 whenever the
+    weekly evaluation has not yet cleared the ticker. Sorted by score, the
+    orphans outrank the entire live universe — the leaderboard was still
+    headed by IDEA.NS and SAIL.NS, neither of which is in the NIFTY 100,
+    months after they left it.
+
+    Returns the number of rows removed.
+    """
+    from data.db import get_engine
+
+    if not universe:                    # never prune on an empty universe
+        return 0
+
+    engine = get_engine()
+    stmt = text("DELETE FROM leaderboard WHERE ticker NOT IN :tickers").bindparams(
+        bindparam("tickers", expanding=True)
+    )
+    with engine.connect() as conn:
+        result = conn.execute(stmt, {"tickers": list(universe)})
+        conn.commit()
+    return result.rowcount or 0
 
 
 def build_graph():
