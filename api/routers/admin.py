@@ -4,17 +4,19 @@ background task so the HTTP response returns immediately.
 
 /run/{ticker} and /run-all drive the LangGraph agent path (trading_data_node,
 external_data_node, forecasting_node, critic_node) for one or all tickers.
-That path recomputes signals from whatever is ALREADY in the ohlcv table —
-it does not fetch new prices. Useful for re-forecasting after a code change,
-not for a daily refresh.
+As of Lever 1, that path calls pipeline.model.forecast_ticker_daily() — cached
+hyperparameters, no Optuna search — so these stay cheap even triggered from
+Render's single free-tier core.
 
-/run-daily-pipeline is the one an external scheduler should call. It runs the
-full sequence the in-process APScheduler job runs (universe sync, fetch,
-signals, sentiment, macro, train) — added because the in-process scheduler
-only fires if the instance happens to be awake at 18:30 IST. On Render's free
-tier, an idle instance sleeps, the scheduled job silently never runs, and
-nothing surfaces the gap. An external cron hitting this endpoint is what
-actually guarantees the pipeline runs daily; see .github/workflows/.
+/run-daily-pipeline is the light daily job (see scheduler.run_pipeline_job).
+
+/run-weekly-evaluation is the EXPENSIVE purged walk-forward evaluation
+(scheduler.run_weekly_evaluation_job) — hundreds of XGBoost fits per ticker.
+It is what OOM-killed this instance when it ran daily. As of Lever 4, an
+external GitHub Actions workflow runs this directly against Supabase instead
+of through Render (see .github/workflows/weekly-evaluation.yml); this route
+exists only as a manual/fallback trigger and should not be called routinely
+from here — prefer re-running the GH Actions workflow.
 """
 from fastapi import APIRouter, Depends, BackgroundTasks
 
@@ -37,6 +39,14 @@ def _run_daily_pipeline():
         run_pipeline_job()
     except Exception as e:                                      # noqa: BLE001
         print(f"[Admin] Daily pipeline failed: {e}")
+
+
+def _run_weekly_evaluation():
+    try:
+        from scheduler import run_weekly_evaluation_job
+        run_weekly_evaluation_job()
+    except Exception as e:                                      # noqa: BLE001
+        print(f"[Admin] Weekly evaluation failed: {e}")
 
 
 @router.post("/run/{ticker}", dependencies=[Depends(verify_api_key)])
@@ -64,15 +74,31 @@ def trigger_all_pipelines(background_tasks: BackgroundTasks):
 @router.post("/run-daily-pipeline", dependencies=[Depends(verify_api_key)])
 def trigger_daily_pipeline(background_tasks: BackgroundTasks):
     """
-    Runs the full daily pipeline: universe sync -> fetch OHLCV -> compute
-    signals -> fetch sentiment -> fetch macro -> train and forecast.
-
-    Call this from an external scheduler (see .github/workflows/daily-pipeline.yml)
-    rather than relying on the in-process APScheduler job, which does not fire
-    if the instance is asleep when 18:30 IST arrives.
+    Runs the light daily pipeline: universe sync -> fetch OHLCV -> compute
+    signals -> fetch sentiment -> fetch macro -> forecast with cached
+    hyperparameters. No Optuna search. Safe to trigger from Render.
     """
     background_tasks.add_task(_run_daily_pipeline)
     return {
         "status": "accepted",
         "message": "Daily pipeline triggered in the background",
+    }
+
+
+@router.post("/run-weekly-evaluation", dependencies=[Depends(verify_api_key)])
+def trigger_weekly_evaluation(background_tasks: BackgroundTasks):
+    """
+    Runs the expensive purged walk-forward evaluation for the whole universe.
+
+    Manual/fallback only. This is the workload that OOM-killed a free-tier
+    Render instance running it daily; the primary path is the GitHub Actions
+    weekly-evaluation.yml workflow, which runs this against Supabase without
+    touching Render's CPU/RAM at all. Prefer re-running that workflow over
+    calling this endpoint unless GH Actions is unavailable.
+    """
+    background_tasks.add_task(_run_weekly_evaluation)
+    return {
+        "status": "accepted",
+        "message": ("Weekly evaluation triggered in the background. This is "
+                    "expensive — prefer the GitHub Actions workflow when possible."),
     }

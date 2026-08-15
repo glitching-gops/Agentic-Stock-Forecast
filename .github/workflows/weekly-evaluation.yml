@@ -1,0 +1,63 @@
+name: Weekly evaluation
+
+# Lever 1 + Lever 4 combined. This is the EXPENSIVE job: purged walk-forward
+# evaluation with nested Optuna tuning, run once per ticker per week instead
+# of once per ticker per day. This exact workload — run daily, in-process, on
+# Render's single free-tier core — is what starved the CPU for over an hour
+# and then OOM-killed the instance. It now runs here instead, on GitHub's
+# 2-core / ~7GB runner, writing evaluation results and conformal calibration
+# straight to Supabase for the daily job (daily-pipeline.yml) to read all
+# week without recomputing any of it.
+
+on:
+  schedule:
+    # Saturday 08:30 IST = Saturday 03:00 UTC. Saturday rather than
+    # immediately after Friday close so a multi-hour run has the whole
+    # weekend as buffer before Monday's market open, and NSE is closed both
+    # days so there's no daily run competing for the same database rows.
+    - cron: "0 3 * * 6"
+  workflow_dispatch: {}
+
+jobs:
+  weekly-evaluation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.0"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore tuned hyperparameters cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tuned_params/
+          key: tuned-params-${{ github.run_id }}
+          restore-keys: |
+            tuned-params-
+
+      - name: Run weekly evaluation
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python -c "
+          from data.db import init_db
+          from data.universe import init_universe_tables
+          init_db()
+          init_universe_tables()
+          from scheduler import run_weekly_evaluation_job
+          run_weekly_evaluation_job()
+          "
+
+      - name: Save tuned hyperparameters cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: tuned_params/
+          key: tuned-params-${{ github.run_id }}

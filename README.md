@@ -117,7 +117,14 @@ system actually achieves.
 
 ## Architecture
 
+Compute runs on two independent cadences, on GitHub Actions — not on the
+backend. The first production run tried to do all of this in one process on
+Render's free tier; it starved the instance's single CPU core for over an
+hour and then OOM-killed it. Splitting by cadence and moving the compute off
+the serving process fixed both problems at once.
+
 ```text
+              DAILY (GitHub Actions, weekdays 18:30 IST)
 NSE constituent list ──► point-in-time universe (index + liquidity + listing rule)
                                     │
                     ┌───────────────┴───────────────┐
@@ -128,8 +135,8 @@ NSE constituent list ──► point-in-time universe (index + liquidity + listi
                     └───────────────┬───────────────┘
                                     ▼
                           Forecasting Agent
-              XGBoost → 30-session excess return
-              conformal interval + P(outperform)
+              XGBoost, CACHED hyperparameters — one fit, no search
+              conformal interval + P(outperform), read from last weekly run
               LLM narrative (no numbers)
                                     │
                                     ▼
@@ -138,18 +145,22 @@ NSE constituent list ──► point-in-time universe (index + liquidity + listi
               LLM signal review — may only downgrade
                                     │
                                     ▼
-              PostgreSQL ──► FastAPI ──► Streamlit dashboard
+                          Supabase PostgreSQL
+                                    ▲
+                                    │  reads evaluation + calibration
+              WEEKLY (GitHub Actions, Saturday 08:30 IST)
+              purged walk-forward evaluation, nested Optuna tuning
+              conformal calibration on out-of-sample residuals
+              refreshes cached production hyperparameters
+                                    │
+                                    ▼
+              Supabase PostgreSQL ──► FastAPI (Render) ──► Streamlit dashboard
 ```
 
-Evaluation runs alongside, not inside, this path:
-
-```text
-purged walk-forward (30-session embargo)
-  └─ tuning nested inside each training fold
-  └─ baselines: random walk · majority class · momentum
-  └─ overlap-corrected t-statistics
-  └─ conformal coverage check
-```
+Render only ever serves reads and on-demand admin-triggered single-ticker
+forecasts (still the cheap daily path) — it runs no scheduled compute and no
+Optuna search. An evidence grade can therefore be up to a week older than the
+price it's attached to; that gap is reported as `evaluated_at`, not hidden.
 
 ---
 
@@ -166,11 +177,12 @@ This is the part that matters most, so it is stated explicitly.
 | **Baselines** | Directional accuracy is always shown beside the majority-class rate; error beside the naive zero-excess forecast |
 | **Overlap correction** | Consecutive 30-session labels are ~97% overlapping, so effective sample size is `n / 30`. Skipping this inflates every t-statistic by ~5.5× |
 | **Coverage check** | Conformal intervals claim 80%; realised coverage is measured against that claim |
+| **Cadence separation** | The purged walk-forward evaluation runs weekly, not daily — it measures a slow-moving property ("does this model form have skill"), and re-running it daily was the direct cause of an OOM crash. Daily runs fit fresh with cached hyperparameters and read the last weekly result; `evaluated_at` on every forecast states exactly how old that evidence is |
 
 Run it yourself:
 
 ```bash
-pytest tests/          # 40 leakage and regression tests
+pytest tests/          # leakage, regression, and daily/weekly split tests
 ```
 
 The suite fails if any audited defect is reintroduced — verified by mutation
@@ -214,7 +226,7 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 | Backend | FastAPI + Uvicorn |
 | Frontend | Streamlit + Plotly |
 | Database | Supabase PostgreSQL |
-| Scheduler | APScheduler (daily, 18:30 IST) |
+| Compute | GitHub Actions — daily forecast (weekdays 18:30 IST) + weekly evaluation (Saturday 08:30 IST), both writing directly to Supabase |
 | Tests | pytest |
 
 ---
@@ -235,8 +247,11 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 ## Project Structure
 
 ```text
+├── .github/workflows/
+│   ├── daily-pipeline.yml      light daily job, runs against Supabase directly
+│   └── weekly-evaluation.yml   expensive purged walk-forward evaluation
 ├── agents/            LangGraph nodes and shared state
-├── api/               FastAPI routers and schemas
+├── api/               FastAPI routers and schemas — reads + on-demand admin only
 ├── app/               Streamlit dashboard
 ├── data/
 │   ├── universe.py    point-in-time universe rule and membership history
@@ -245,15 +260,16 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 ├── pipeline/
 │   ├── fetch.py       OHLCV ingestion (raw + adjusted)
 │   ├── signals.py     indicators and the excess-return target
-│   ├── model.py       training, forecasting, evaluation entry points
+│   ├── model.py       forecast_ticker_daily (cheap) / evaluate_and_persist_ticker (weekly)
 │   ├── evaluation.py  purged walk-forward harness, metrics, baselines
 │   ├── conformal.py   prediction intervals and calibrated probabilities
 │   ├── tuning.py      nested, seeded hyperparameter search
 │   └── archived/      LSTM and meta-learner, with the reasons they were removed
-├── tests/             leakage and regression suite
+├── tests/             leakage, regression, and daily/weekly split suite
 ├── tools/             maintenance scripts
 ├── main.py            local entry point
-└── scheduler.py       daily pipeline and weekly retune
+└── scheduler.py       run_pipeline_job (daily) / run_weekly_evaluation_job (weekly);
+                        start_scheduler() is for local dev only, not called on Render
 ```
 
 ---
@@ -285,6 +301,28 @@ Recover historical index membership when archive.org is responsive:
 ```bash
 python -c "from data.universe import backfill_membership_from_wayback as b; print(b())"
 ```
+
+---
+
+## Production Deployment
+
+Two independent pieces, deployed separately:
+
+- **Backend (Render)** — serves reads and on-demand admin-triggered forecasts
+  only. Needs `DATABASE_URL`, `GROQ_API_KEY`, `ADMIN_API_KEY`, `ALLOWED_ORIGINS`
+  as environment variables. Runs no scheduled compute.
+- **Compute (GitHub Actions)** — `.github/workflows/daily-pipeline.yml` and
+  `weekly-evaluation.yml` run the actual pipeline directly against Supabase,
+  independent of whether Render is awake. Needs `DATABASE_URL` and
+  `GROQ_API_KEY` added as **repository secrets** (Settings → Secrets and
+  variables → Actions) — the same values as Render's env vars. Both workflows
+  also accept `workflow_dispatch` for a manual run from the Actions tab.
+
+Render's admin routes remain as a fallback: `POST /api/admin/run-daily-pipeline`
+for the light job, `POST /api/admin/run-weekly-evaluation` for the expensive
+one (prefer re-running the GitHub Actions workflow over calling this directly
+— it's the workload that OOM-killed the first production deployment when it
+ran daily, in-process, on Render's single free-tier core).
 
 ---
 

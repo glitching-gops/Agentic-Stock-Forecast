@@ -38,6 +38,9 @@ class LeaderboardEntry(BaseModel):
     eval_hit_rate: Optional[float] = None
     eval_baseline_hit_rate: Optional[float] = None
     eval_beats_random_walk: Optional[bool] = None
+    evaluated_at: Optional[str] = Field(
+        None, description="When the evidence behind this row was last measured "
+                          "(weekly, not daily) — may be older than last_updated.")
 
 
 class LeaderboardResponse(BaseModel):

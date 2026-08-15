@@ -23,6 +23,10 @@ class EvaluationEvidence(BaseModel):
     beats_random_walk: Optional[bool] = Field(
         None, description="Whether mean absolute error beats forecasting zero excess return.")
     model_version: Optional[str] = None
+    evaluated_at: Optional[str] = Field(
+        None, description="When this evidence was last measured (Lever 1: weekly, not "
+                          "daily). Distinct from the forecast's own last_updated, which "
+                          "changes every day — this may be up to a week older.")
 
 
 class ForecastResponse(BaseModel):

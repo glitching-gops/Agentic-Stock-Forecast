@@ -105,10 +105,20 @@ def grade_evidence(state: dict) -> tuple[str, list[str]]:
                 f"{baseline:.1f}% ({edge:+.1f}pp)."
             )
 
+    evaluated_at = state.get("eval_evaluated_at")
+
     if checks == 0:
-        return "INSUFFICIENT", ["No held-out evaluation metrics available."]
+        reason = ("No held-out evaluation metrics available yet — this ticker "
+                 "has not been through a weekly evaluation run.")
+        return "INSUFFICIENT", [reason]
 
     grade = "STRONG" if passed == checks else "WEAK" if passed >= 1 else "INSUFFICIENT"
+
+    # The evaluation behind this forecast is refreshed WEEKLY, not daily
+    # (Lever 1) — surfaced here rather than left implicit, since the badge
+    # sits next to a price that regenerates every day.
+    if evaluated_at:
+        reasons.append(f"Evidence last measured {evaluated_at}.")
 
     # The dashboard shows a rupee price target, which depends on the forecast's
     # MAGNITUDE, while rank IC and hit rate only establish ORDERING and

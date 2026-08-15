@@ -243,6 +243,11 @@ def init_db():
             ("eval_beats_random_walk", "INTEGER"),
             ("model_version",        "TEXT"),
             ("universe_rule",        "TEXT"),
+            # When the held-out evaluation behind this forecast was last
+            # measured. Distinct from last_updated (the forecast itself is
+            # regenerated daily; the evidence backing it is only re-measured
+            # weekly) — surfaced so staleness is visible, not implied away.
+            ("evaluated_at",         "TEXT"),
         ]
         for table in ["forecasts", "leaderboard"]:
             for col, coltype in forecast_extra:
@@ -297,6 +302,13 @@ def init_db():
             "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate",
             "eval_baseline_hit_rate", "eval_mae", "eval_mae_naive",
             "eval_n_oos", "eval_n_effective",
+            # Conformal calibration, persisted so the daily job can build a
+            # price view without recomputing the purged walk-forward run that
+            # produced it. conformal_residuals stores the calibration pool as
+            # a JSON list — needed (not just the quantile) because
+            # ConformalCalibration.prob_positive() is a distribution-free
+            # empirical estimate over those residuals, not a parametric one.
+            "conformal_quantile", "conformal_coverage", "conformal_n",
         ]
         for col in meta_new_columns:
             try:
@@ -305,12 +317,24 @@ def init_db():
             except Exception:
                 pass  # Column already exists, skip
 
-        for col in ["model_version", "eval_protocol"]:
+        for col in ["model_version", "eval_protocol", "conformal_residuals"]:
             try:
                 with conn.begin_nested():
                     conn.execute(text(f"ALTER TABLE model_metadata ADD COLUMN {col} TEXT"))
             except Exception:
                 pass  # Column already exists, skip
+
+        # evaluated_at is separate from last_trained: last_trained updates
+        # every DAY (the production model is refit daily with cached
+        # hyperparameters); evaluated_at only updates when the WEEKLY
+        # purged walk-forward evaluation actually reruns. The gap between
+        # them is exactly how stale the evidence grade is, and that gap is
+        # reported rather than hidden.
+        try:
+            with conn.begin_nested():
+                conn.execute(text("ALTER TABLE model_metadata ADD COLUMN evaluated_at TIMESTAMP"))
+        except Exception:
+            pass  # Column already exists, skip
 
         conn.commit()
     print("Database initialised.")

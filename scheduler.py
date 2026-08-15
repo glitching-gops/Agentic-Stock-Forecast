@@ -1,4 +1,24 @@
-# scheduler.py — Runs the pipeline daily at 6:30 PM IST
+# scheduler.py — Daily forecast job and weekly evaluation job.
+#
+# Split into two cadences (Lever 1). The first production run on Render ran
+# the full purged walk-forward evaluation (hundreds of XGBoost fits per
+# ticker) for every ticker, EVERY DAY — the instance starved its one free-tier
+# CPU core for over an hour and eventually OOM-killed. "Does this model form
+# have skill" doesn't need daily re-measurement; it's a slow-moving property.
+#
+#   run_pipeline_job()          — DAILY. Fresh data in, cheap forecast out.
+#                                  No Optuna search runs here.
+#   run_weekly_evaluation_job() — WEEKLY. The expensive purged walk-forward
+#                                  evaluation + hyperparameter retune, once.
+#
+# As of Lever 4, the primary trigger for both is an external GitHub Actions
+# workflow that runs this module's functions directly against Supabase (see
+# .github/workflows/daily-pipeline.yml and weekly-evaluation.yml) — not
+# Render. start_scheduler() below still exists for local development, but
+# api/main.py no longer calls it: an in-process scheduler on the same
+# single-core instance that serves API requests is exactly the CPU
+# contention that caused the OOM crash, and running it there AS WELL AS the
+# external GH Actions trigger risks both firing at once.
 
 import time
 import logging
@@ -12,7 +32,7 @@ import pytz
 # Setup logging to file
 os.makedirs(os.path.join(os.path.dirname(__file__), "logs"), exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(os.path.join(os.path.dirname(__file__), "logs", "scheduler.log")),
@@ -21,19 +41,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Lock file approach removed — APScheduler job_defaults handle
-# concurrent run prevention natively via coalesce + max_instances.
 
 def run_pipeline_job():
     """
-    Daily pipeline.
+    Daily pipeline: universe sync, fresh data, cheap per-ticker forecast.
 
-    Step 0 is new: the universe is resynced from its point-in-time rule before
-    anything else runs, and the labelled-row count is asserted non-decreasing
-    afterwards. That assertion is the guard against F6 silently returning — the
-    old append-only writer froze the training labels without any visible symptom.
+    Calls pipeline.model.train_and_forecast(), which internally uses
+    forecast_ticker_daily() — cached hyperparameters, one XGBoost fit per
+    ticker, no Optuna search. The evidence grade attached to each forecast
+    comes from whatever run_weekly_evaluation_job() last persisted, which may
+    be up to a week old; that staleness is surfaced via `evaluated_at`, not
+    hidden.
     """
-    logger.info("Starting scheduled pipeline run...")
+    logger.info("Starting daily pipeline run...")
     try:
         from data.universe import (
             get_ingest_universe, get_universe, sync_current_membership,
@@ -88,54 +108,57 @@ def run_pipeline_job():
         logger.info("[4/5] Fetching macro data...")
         fetch_macro()
 
-        logger.info("[5/5] Training and forecasting...")
+        logger.info("[5/5] Forecasting (cached hyperparameters, no search)...")
         train_and_forecast(tickers=universe)
 
-        logger.info("Scheduled pipeline run completed successfully.")
+        logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
-        logger.error(f"Error during scheduled pipeline run: {e}", exc_info=True)
+        logger.error(f"Error during daily pipeline run: {e}", exc_info=True)
 
-def weekly_retune_all():
+
+def run_weekly_evaluation_job():
     """
-    Re-tunes the PRODUCTION model's hyperparameters for every ticker.
+    Weekly evaluation: the expensive purged walk-forward run, once per ticker.
 
-    These parameters are used only to fit the model that generates the next
-    forecast. Reported metrics never come from them: ``walk_forward`` re-tunes
-    inside each evaluation fold, so a configuration is never chosen with sight
-    of the rows it is later scored on (audit finding F2).
-
-    The LSTM retrain is gone — that module is archived because it never wrote a
-    checkpoint (F5). See pipeline/archived/README.md.
+    For each ticker: runs evaluate_ticker() (nested-tuned purged walk-forward),
+    calibrates conformal intervals on the out-of-sample residuals, refreshes
+    the cached production hyperparameters (force=True), and persists all of
+    it to model_metadata. The daily job reads this all week; it never
+    recomputes it.
     """
-    from data.universe import get_universe
-    from pipeline.model import load_features_for_ticker, FEATURES, TARGET
-    from pipeline.signals import HORIZON_SESSIONS
-    from pipeline.tuning import tune_and_cache
+    from data.universe import get_universe, sync_current_membership
+    from data.tickers import refresh_metadata
+    from pipeline.model import evaluate_and_persist_universe
+
+    # Idempotent and cheap even if the daily job already did this today —
+    # the weekly workflow runs in its own environment (Lever 4) and should
+    # not assume a daily run has happened recently.
+    try:
+        sync_current_membership()
+        refresh_metadata()
+    except Exception as exc:                                        # noqa: BLE001
+        logger.warning(f"[Scheduler] universe sync failed, using last known "
+                       f"membership: {exc}")
 
     universe = get_universe()
-    logger.info(f"[Scheduler] Weekly retune started for {len(universe)} stocks")
+    logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")
 
-    for ticker in universe:
-        try:
-            df = load_features_for_ticker(ticker)
-            labelled = df[df[TARGET].notna()] if not df.empty and TARGET in df else df
-            if labelled.empty or len(labelled) < 300:
-                logger.info(f"[Scheduler] {ticker}: insufficient labelled data, skipping")
-                continue
+    if not universe:
+        logger.error("[Scheduler] Universe is empty — aborting weekly evaluation.")
+        return
 
-            tune_and_cache(ticker, labelled[FEATURES], labelled[TARGET],
-                           horizon=HORIZON_SESSIONS, force=True)
-            logger.info(f"[Scheduler] {ticker}: retuned on {len(labelled)} rows")
-        except Exception as e:
-            logger.error(f"[Scheduler] {ticker}: retuning failed — {e}")
+    results = evaluate_and_persist_universe(tickers=universe)
+    logger.info(f"[Scheduler] Weekly evaluation complete: "
+               f"{len(results)}/{len(universe)} tickers evaluated")
 
-    logger.info("[Scheduler] Weekly retune complete")
 
 def start_scheduler():
-    """Starts the APScheduler background scheduler.
+    """
+    Starts the in-process APScheduler background scheduler.
 
-    Uses APScheduler's native coalesce + max_instances to prevent duplicate
-    runs — no lock files needed or created.
+    Local development only. Production (Render) does not call this — see the
+    module docstring. Uses APScheduler's native coalesce + max_instances to
+    prevent duplicate runs if it ever IS used somewhere long-running.
     """
     ist_tz = pytz.timezone("Asia/Kolkata")
 
@@ -158,20 +181,25 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Weekly full Optuna retune — Sunday 02:00 IST
+    # Weekly evaluation — Saturday 08:30 IST. Saturday rather than Sunday
+    # 02:00 (the old weekly_retune_all schedule) so a run that takes hours
+    # has the whole weekend as buffer before Monday's market open, and NSE
+    # is closed both days so there's no competing daily run same-day.
     scheduler.add_job(
-        weekly_retune_all,
+        run_weekly_evaluation_job,
         trigger="cron",
-        day_of_week="sun",
-        hour=2,
-        minute=0,
-        id="weekly_retune",
+        day_of_week="sat",
+        hour=8,
+        minute=30,
+        id="weekly_evaluation",
         replace_existing=True,
     )
 
     scheduler.start()
-    logger.info("Scheduler started. Pipeline will run daily at 18:30 IST.")
+    logger.info("Scheduler started (local). Daily pipeline at 18:30 IST, "
+               "weekly evaluation Saturday 08:30 IST.")
     return scheduler
+
 
 if __name__ == "__main__":
     scheduler = start_scheduler()

@@ -1,67 +1,68 @@
-name: Trigger daily pipeline
+name: Daily forecast pipeline
 
-# The pipeline used to run via an in-process APScheduler job inside the
-# FastAPI process, scheduled for 18:30 IST. On Render's free tier the
-# instance spins down after ~15 minutes of no inbound traffic — if it's
-# asleep at 18:30, the in-process job simply never fires, with no error and
-# no visible symptom other than the data quietly going stale. That's what
-# happened: forecasts were 3 months old before anyone noticed.
+# Lever 4: runs the pipeline directly on GitHub's runner (2 cores, ~7GB RAM),
+# writing straight to Supabase. Render is not involved and does none of this
+# compute — it only ever serves reads plus on-demand admin-triggered
+# forecasts. Render's single free-tier core running this same work is what
+# OOM-killed the first production deployment.
 #
-# This workflow decouples the trigger from the instance's sleep state. The
-# HTTP call itself wakes a sleeping instance (Render just serves it slower,
-# ~50-90s, on that one request); the retries below tolerate that cold start.
+# This is the DAILY (light) job: fresh data in, cheap forecast out, cached
+# hyperparameters, no Optuna search. See weekly-evaluation.yml for the
+# expensive purged walk-forward run.
 
 on:
   schedule:
     # 18:30 IST = 13:00 UTC, Monday-Friday (NSE trading days).
-    # Cron is UTC; a stray run on an NSE holiday is a harmless no-op.
     - cron: "0 13 * * 1-5"
-  workflow_dispatch: {}   # manual trigger from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
-  trigger:
+  daily-forecast:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - name: Trigger the full daily pipeline
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.0"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restores whatever the most recent run (daily OR weekly) saved.
+      # Cache keys must be unique to be saved, so restore uses a prefix match
+      # against the last save rather than an exact key.
+      - name: Restore tuned hyperparameters cache
+        uses: actions/cache/restore@v4
+        with:
+          path: tuned_params/
+          key: tuned-params-${{ github.run_id }}
+          restore-keys: |
+            tuned-params-
+
+      - name: Run daily pipeline
         env:
-          API_BASE_URL: ${{ vars.API_BASE_URL || 'https://agentic-stock-forecast.onrender.com' }}
-          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          set -e
-          if [ -z "$ADMIN_API_KEY" ]; then
-            echo "::error::ADMIN_API_KEY repository secret is not set. Add it under Settings > Secrets and variables > Actions."
-            exit 1
-          fi
+          python -c "
+          from data.db import init_db
+          from data.universe import init_universe_tables
+          init_db()
+          init_universe_tables()
+          from scheduler import run_pipeline_job
+          run_pipeline_job()
+          "
 
-          echo "Triggering $API_BASE_URL/api/admin/run-daily-pipeline"
-
-          # --retry tolerates the cold-start wake-up; --max-time is per-attempt,
-          # not total, since the endpoint just backgrounds the work and returns
-          # "accepted" quickly once the instance is actually awake.
-          response=$(curl -sS -w "\n%{http_code}" \
-            --max-time 120 \
-            --retry 4 \
-            --retry-delay 20 \
-            --retry-all-errors \
-            -X POST \
-            -H "X-API-Key: ${ADMIN_API_KEY}" \
-            "${API_BASE_URL}/api/admin/run-daily-pipeline")
-
-          http_code=$(echo "$response" | tail -n1)
-          body=$(echo "$response" | sed '$d')
-
-          echo "HTTP $http_code"
-          echo "$body"
-
-          if [ "$http_code" != "200" ]; then
-            echo "::error::Pipeline trigger failed with HTTP $http_code"
-            exit 1
-          fi
-
-      - name: Confirm the service is reachable
+      # Always save, even if tune_and_cache created params for a ticker that
+      # had none before — actions/cache refuses to overwrite an existing key,
+      # so this always writes under a fresh (run-id-scoped) key rather than
+      # trying to update the one just restored.
+      - name: Save tuned hyperparameters cache
         if: always()
-        env:
-          API_BASE_URL: ${{ vars.API_BASE_URL || 'https://agentic-stock-forecast.onrender.com' }}
-        run: |
-          curl -sS --max-time 30 "${API_BASE_URL}/api/health" || \
-            echo "::warning::Health check failed after triggering the pipeline"
+        uses: actions/cache/save@v4
+        with:
+          path: tuned_params/
+          key: tuned-params-${{ github.run_id }}

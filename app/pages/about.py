@@ -168,10 +168,20 @@ def main():
         target. Hyperparameters are searched with Optuna inside each training
         fold and the study is seeded, so a tuning run is reproducible.
 
+        This search runs **weekly, not daily** — every ticker was originally
+        re-evaluated with a full nested Optuna search every single day, which
+        starved a production server's CPU for over an hour and eventually
+        crashed it. "Does this model form have skill" doesn't change day to
+        day, so it's now measured once a week; each day just fits fresh with
+        the hyperparameters that search already found. The evidence badge on
+        every forecast states exactly when it was last measured, which can be
+        up to a week before the price it sits next to.
+
         **Conformal prediction** calibrates an 80% interval on out-of-sample
         residuals and yields a probability that the stock beats its benchmark.
         Coverage is measured, not assumed — if the 80% interval does not cover
-        ~80% of held-out outcomes, that is reported.
+        ~80% of held-out outcomes, that is reported. This calibration is also
+        refreshed weekly, alongside the hyperparameter search.
 
         The LLM writes a plain-English read of the signals. It does not produce,
         adjust or review any number, and it is not shown the forecast when
@@ -300,11 +310,12 @@ def main():
     with col2:
         st.markdown("""
         **Infrastructure**
-        - FastAPI + Uvicorn (backend)
+        - FastAPI + Uvicorn (backend — reads only, no scheduled compute)
         - Streamlit + Plotly (dashboard)
         - Supabase PostgreSQL
         - Render / Streamlit Community Cloud
-        - APScheduler (daily pipeline)
+        - GitHub Actions (daily forecast + weekly evaluation,
+          run directly against Supabase)
         - pytest (leakage and regression suite)
 
         **Repository**

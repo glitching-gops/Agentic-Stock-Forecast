@@ -8,9 +8,17 @@ and the caller's fallback persisted ``forecast_price = current_price`` with
 ``mape = 100`` as though it were a real forecast (audit finding F10). Any second
 pipeline pass in a day wrote a fabricated flat forecast with no error surfaced.
 
-Rather than repair that path, it is removed. ``pipeline.model.forecast_ticker``
+Rather than repair that path, it is removed. ``pipeline.model.forecast_ticker_daily``
 is the single entry point, and it validates its own feature frame. Re-running is
 idempotent and cheap enough; a silently wrong number is not.
+
+This graph node calls the DAILY (Lever 1) path only — cached hyperparameters,
+one XGBoost fit, no Optuna search. It must never call ``evaluate_and_persist_ticker``
+or ``forecast_ticker_full``: this node is reachable from Render's admin HTTP
+routes (``/run/{ticker}``, ``/run-all``), and running the expensive weekly
+evaluation from there is exactly what OOM-killed the first production
+deployment. The weekly evaluation runs externally — see
+.github/workflows/weekly-evaluation.yml.
 
 The LLM's role here is unchanged and deliberately limited: it writes a
 narrative summarising signals it is given. It does not produce, adjust, or
@@ -25,7 +33,7 @@ import time
 from groq import Groq
 
 from agents.state import AgentState
-from pipeline.model import forecast_ticker
+from pipeline.model import forecast_ticker_daily
 
 
 def _groq_client() -> Groq | None:
@@ -62,6 +70,7 @@ def _failed_forecast(reason: str) -> dict:
         "eval_hit_rate": None,
         "eval_baseline_hit_rate": None,
         "eval_beats_naive": None,
+        "eval_evaluated_at": None,
         "model_version": None,
     }
 
@@ -70,7 +79,7 @@ def forecasting_node(state: AgentState) -> dict:
     ticker = state["ticker"]
 
     try:
-        forecast = forecast_ticker(ticker)
+        forecast = forecast_ticker_daily(ticker)
     except Exception as exc:                                   # noqa: BLE001
         print(f"[{ticker}] forecast failed: {exc}")
         return {**_failed_forecast(f"{type(exc).__name__}: {exc}"),
@@ -102,6 +111,7 @@ def forecasting_node(state: AgentState) -> dict:
         "eval_hit_rate": ev.get("hit_rate"),
         "eval_baseline_hit_rate": ev.get("majority_hit_rate"),
         "eval_beats_naive": ev.get("beats_naive"),
+        "eval_evaluated_at": ev.get("evaluated_at"),
         "model_version": forecast.model_version,
         "current_price": forecast.current_price,
     }

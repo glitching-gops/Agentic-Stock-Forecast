@@ -1,7 +1,16 @@
 """
 FastAPI application entry point.
-Initialises the database, mounts routers, configures CORS,
-and starts the APScheduler daily pipeline job on startup.
+Initialises the database, mounts routers, and configures CORS.
+
+Does NOT start the in-process APScheduler. The first production run pegged
+this instance's one free-tier CPU core for over an hour running Optuna
+searches and eventually OOM-killed the process — running that same work
+in-process, in the same container that serves API requests, is what caused
+it. As of Lever 4, an external GitHub Actions workflow runs the daily and
+weekly jobs directly against Supabase (see .github/workflows/), and this
+process only ever serves reads plus on-demand admin-triggered forecasts.
+scheduler.start_scheduler() still exists for local development (see
+scheduler.py's module docstring) but is intentionally not called here.
 """
 import os
 
@@ -9,16 +18,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from data.db import init_db
+
 from api.routers import stocks, forecasts, leaderboard, admin, signals, sentiment
-from scheduler import start_scheduler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run on startup (DB init is handled by render_start.sh)
-    try:
-        start_scheduler()
-    except Exception as e:
-        print(f"Warning: Scheduler failed to start: {e}")
+    # DB init is handled by render_start.sh. Nothing else to do on startup —
+    # see the module docstring for why the scheduler is not started here.
     yield
     # Run on shutdown (if needed)
 

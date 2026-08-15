@@ -50,6 +50,10 @@ class AgentState(TypedDict, total=False):
     eval_hit_rate: Optional[float]
     eval_baseline_hit_rate: Optional[float]
     eval_beats_naive: Optional[bool]
+    eval_evaluated_at: Optional[str]        # when the WEEKLY evaluation ran;
+                                             # may be up to a week older than
+                                             # last_updated (the forecast itself
+                                             # regenerates daily)
     model_version: Optional[str]
 
     # Critic Agent

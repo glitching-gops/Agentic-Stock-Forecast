@@ -111,6 +111,7 @@ def save_forecast_to_db(state: dict) -> None:
         "eval_beats_random_walk": int(bool(state.get("eval_beats_naive"))),
         "model_version": state.get("model_version"),
         "universe_rule": DEFAULT_RULE.fingerprint(),
+        "evaluated_at": state.get("eval_evaluated_at"),
         "forecast_confidence": state.get("evidence_grade", "INSUFFICIENT"),
         "signal_narrative": state.get("signal_narrative"),
         "critic_verdict": state.get("critic_verdict", "REJECTED"),
@@ -135,7 +136,7 @@ def save_forecast_to_db(state: dict) -> None:
         "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
         "benchmark_sector_specific", "eval_rank_ic", "eval_hit_rate",
         "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
-        "universe_rule",
+        "universe_rule", "evaluated_at",
     ]
 
     leaderboard_cols = [
@@ -145,7 +146,7 @@ def save_forecast_to_db(state: dict) -> None:
         "interval_high", "interval_coverage", "prob_outperform", "random_walk_price",
         "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
         "eval_rank_ic", "eval_hit_rate", "eval_baseline_hit_rate",
-        "eval_beats_random_walk", "model_version", "universe_rule",
+        "eval_beats_random_walk", "model_version", "universe_rule", "evaluated_at",
     ]
 
     def _insert(cols: list[str], table: str) -> str:

@@ -57,6 +57,7 @@ def get_forecast(ticker: str):
         baseline_hit_rate=data.get("eval_baseline_hit_rate"),
         beats_random_walk=_to_bool(data.get("eval_beats_random_walk")),
         model_version=data.get("model_version"),
+        evaluated_at=str(data["evaluated_at"]) if data.get("evaluated_at") else None,
     )
 
     return ForecastResponse(

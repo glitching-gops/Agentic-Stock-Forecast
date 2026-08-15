@@ -40,7 +40,14 @@ PARAMS_DIR = os.path.join(
 os.makedirs(PARAMS_DIR, exist_ok=True)
 
 SEED = 42
-N_TRIALS = 40
+# Lever 2 (moderate cut): 40 -> 25 production-tuning trials. Chosen jointly
+# with the frequency cut in pipeline/model.py (weekly, not daily) rather than
+# in isolation: this runs once a week now, not once a day, so the total
+# monthly search budget still went UP even after this per-run cut. Also
+# defensible on its own terms — the honest re-score measured near-zero/
+# negative rank IC on this target, which argues against spending a large
+# trial budget chasing precision the underlying signal doesn't support.
+N_TRIALS = 25
 INNER_FOLDS = 3
 
 
