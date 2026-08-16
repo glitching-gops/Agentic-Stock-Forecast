@@ -179,7 +179,7 @@ def run_weekly_evaluation_job():
     )
     from data.tickers import refresh_metadata
     from pipeline.fetch import fetch_and_store
-    from pipeline.signals import compute_and_store
+    from pipeline.signals import compute_and_store, count_labelled_rows
     from pipeline.model import evaluate_and_persist_universe
 
     # Idempotent and cheap even if the daily job already did this today —
@@ -207,8 +207,30 @@ def run_weekly_evaluation_job():
                      "weekly evaluation.")
         return
 
+    # Same F6 monotonicity check the daily job runs. It belongs here for the
+    # same reason it belongs there, and its absence cost real data: the first
+    # run of this rewritten job (2026-08-16) recomputed signals while three
+    # sector indices were transiently unavailable, wrote a null target over
+    # every row of the 22 tickers benchmarked to them, and evaluated anyway —
+    # reporting them as "no out-of-sample predictions". The daily job would
+    # have aborted on the same input. Giving this job the same write power
+    # without the same guard is what let it through.
+    labelled_before = count_labelled_rows()
+
     logger.info(f"[Scheduler] Recomputing signals for {len(universe)} tickers...")
     compute_and_store(tickers=universe)
+
+    labelled_after = count_labelled_rows()
+    if labelled_after < labelled_before:
+        logger.error(
+            f"Labelled rows fell from {labelled_before} to {labelled_after} "
+            f"after recomputing signals — aborting before any evaluation is "
+            f"persisted. The most likely cause is a benchmark index that "
+            f"failed to download, which NULLs the excess-return target for "
+            f"every stock mapped to it (regression of F6)."
+        )
+        return
+    logger.info(f"[Scheduler] Labelled rows: {labelled_before} -> {labelled_after}")
 
     logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")
     results = evaluate_and_persist_universe(tickers=universe)

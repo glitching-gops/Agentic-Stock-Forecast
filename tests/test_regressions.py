@@ -961,3 +961,97 @@ def test_narrative_is_written_only_for_tickers_that_can_rank():
     assert _deserves_a_written_narrative(
         {"eval_evaluated_at": "2026-08-15 17:02:11",
          "pred_excess_return": None}) is False
+
+
+# ── A missing benchmark must never erase a ticker's labels ────────────────────
+
+def test_missing_benchmark_skips_the_ticker_instead_of_nulling_its_target():
+    """
+    The excess-return target is `stock return - benchmark return`, so an index
+    that resolves to nothing NULLs the target for every row of every stock
+    mapped to it — and _upsert_signals DELETEs the recomputed range before
+    reinserting, so writing that frame ERASES existing labels.
+
+    On 2026-08-16 ^CNXAUTO, ^CNXINFRA and ^CNXREALTY came back unusable in a
+    single run and 22 tickers went from ~2,390 labelled rows to 0. All three
+    served full history again minutes later. Returning None keeps the old rows.
+    """
+    import pipeline.signals as sig
+
+    dates = pd.date_range("2015-01-01", periods=400, freq="B").strftime("%Y-%m-%d")
+    ohlcv = pd.DataFrame({
+        "date": dates,
+        "ticker": "MARUTI.NS",
+        "open": np.linspace(100, 200, 400),
+        "high": np.linspace(101, 202, 400),
+        "low": np.linspace(99, 198, 400),
+        "close": np.linspace(100, 200, 400),
+        "adj_close": np.linspace(100, 200, 400),
+        "volume": np.full(400, 1_000_000.0),
+    })
+
+    empty = pd.DataFrame(columns=["date", "benchmark_close"])
+    original = sig.get_benchmark_series
+    sig.get_benchmark_series = lambda *a, **k: empty
+    try:
+        frame = sig.compute_signals_frame("MARUTI.NS", ohlcv)
+    finally:
+        sig.get_benchmark_series = original
+
+    assert frame is None, (
+        "a frame whose target is null on every row must never reach the writer"
+    )
+
+
+def test_benchmark_fetch_retries_and_reports_an_unusable_response():
+    """
+    The old code raised only on an outright empty response, so a frame that
+    arrived non-empty but cleaned down to nothing fell through the SUCCESS path
+    and cached an empty result with no message at all — which is why the
+    2026-08-16 log contains no benchmark error despite three indices failing.
+    """
+    import pipeline.signals as sig
+
+    source = inspect.getsource(sig.get_benchmark_series)
+    assert "BENCHMARK_FETCH_ATTEMPTS" in source, "a transient miss must be retried"
+    assert "cleaned.empty" in source, (
+        "a response that cleans down to nothing is a failure, not a result"
+    )
+
+    calls = {"n": 0}
+
+    def _always_fails(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("network")
+
+    original_dl, original_sleep = sig.yf.download, sig.time.sleep
+    sig.yf.download = _always_fails
+    sig.time.sleep = lambda *a, **k: None
+    sig._benchmark_cache.pop("^CNXAUTO", None)
+    try:
+        out = sig.get_benchmark_series("^CNXAUTO")
+    finally:
+        sig.yf.download, sig.time.sleep = original_dl, original_sleep
+        sig._benchmark_cache.pop("^CNXAUTO", None)
+
+    assert out.empty
+    assert calls["n"] == sig.BENCHMARK_FETCH_ATTEMPTS
+
+
+def test_weekly_job_aborts_if_recomputing_signals_destroys_labels():
+    """
+    The daily job has carried this check since F6. The weekly job was given the
+    same signal-writing power without it, and promptly wrote null targets over
+    22 tickers and evaluated anyway.
+    """
+    import scheduler
+
+    source = inspect.getsource(scheduler.run_weekly_evaluation_job)
+
+    assert "count_labelled_rows()" in source
+    assert "labelled_after < labelled_before" in source
+    # The check must sit between the write and the evaluation to be worth
+    # anything.
+    assert source.index("compute_and_store(tickers=") < source.index(
+        "labelled_after < labelled_before"
+    ) < source.index("evaluate_and_persist_universe(")

@@ -27,6 +27,8 @@ Three Phase 0 changes:
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -120,35 +122,76 @@ def _rolling_hurst(close: pd.Series, window: int = 60) -> pd.Series:
 
 
 # ── Benchmark series ──────────────────────────────────────────────────────────
+BENCHMARK_FETCH_ATTEMPTS = 3
+
+
 def get_benchmark_series(index_ticker: str, period: str = "10y") -> pd.DataFrame:
     """
     Downloads a benchmark index close series, cached per process.
 
     The previous code downloaded the sector index once per stock, so a
     100-ticker run made 100 redundant requests for the same handful of indices.
+
+    RETRIES, AND NEVER FAILS QUIETLY. A transient miss here is not a cosmetic
+    problem: the excess-return target is `stock return - benchmark return`, so
+    an index that resolves to nothing NULLs the target for every row of every
+    stock benchmarked to it, and compute_and_store then writes those NULLs over
+    good labels. On 2026-08-16 exactly that happened — ^CNXAUTO, ^CNXINFRA and
+    ^CNXREALTY came back unusable in one run and 22 tickers went from ~2,390
+    labelled rows to 0, with no error anywhere in the log. All three indices
+    served full history again minutes later, so the failure was transient.
+
+    It produced no log line because the old code only raised on an outright
+    empty response. A frame that arrived non-empty but cleaned down to nothing
+    (all-NaN closes) fell straight through `.dropna()` into an empty result via
+    the success path, so even the "unavailable" message never printed. Both
+    outcomes are now the same failure and both are reported.
+
+    The empty frame is still cached on failure so a dead index is not retried
+    once per stock, but see compute_signals_frame: callers must now SKIP a
+    ticker whose benchmark is missing rather than compute a null target for it.
     """
     if index_ticker in _benchmark_cache:
         return _benchmark_cache[index_ticker]
 
-    try:
-        data = yf.download(index_ticker, period=period, interval="1d",
-                           auto_adjust=True, progress=False)
-        if data is None or data.empty:
-            raise ValueError("empty response")
+    out = pd.DataFrame(columns=["date", "benchmark_close"])
 
-        data = data.reset_index()
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = [str(c[0]).lower() for c in data.columns]
-        else:
-            data.columns = [str(c).lower() for c in data.columns]
+    for attempt in range(1, BENCHMARK_FETCH_ATTEMPTS + 1):
+        try:
+            data = yf.download(index_ticker, period=period, interval="1d",
+                               auto_adjust=True, progress=False)
+            if data is None or data.empty:
+                raise ValueError("empty response")
 
-        out = pd.DataFrame({
-            "date": data["date"].astype(str).str[:10],
-            "benchmark_close": data["close"].astype(float),
-        }).dropna()
-    except Exception as exc:                                  # noqa: BLE001
-        print(f"[Signals] benchmark {index_ticker} unavailable: {exc}")
-        out = pd.DataFrame(columns=["date", "benchmark_close"])
+            data = data.reset_index()
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = [str(c[0]).lower() for c in data.columns]
+            else:
+                data.columns = [str(c).lower() for c in data.columns]
+
+            cleaned = pd.DataFrame({
+                "date": data["date"].astype(str).str[:10],
+                "benchmark_close": data["close"].astype(float),
+            }).dropna()
+
+            # Non-empty on arrival but empty once cleaned is a FAILURE, not a
+            # result. Treating it as success is what made this silent.
+            if cleaned.empty:
+                raise ValueError(
+                    f"{len(data)} rows returned, none with a usable close")
+
+            out = cleaned
+            break
+        except Exception as exc:                              # noqa: BLE001
+            print(f"[Signals] benchmark {index_ticker} attempt "
+                  f"{attempt}/{BENCHMARK_FETCH_ATTEMPTS} failed: {exc}")
+            if attempt < BENCHMARK_FETCH_ATTEMPTS:
+                time.sleep(2 * attempt)
+
+    if out.empty:
+        print(f"[Signals] benchmark {index_ticker} UNAVAILABLE after "
+              f"{BENCHMARK_FETCH_ATTEMPTS} attempts — every ticker benchmarked "
+              f"to it will be skipped rather than written with a null target.")
 
     _benchmark_cache[index_ticker] = out
     return out
@@ -246,6 +289,7 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     Returns None when there is not enough history.
     """
     if ohlcv.empty or len(ohlcv) < 120:
+        print(f"[Signals] {ticker}: insufficient history ({len(ohlcv)} rows)")
         return None
 
     df = ohlcv.sort_values("date").reset_index(drop=True)
@@ -301,6 +345,17 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     # ── Benchmark, relative momentum, and the target ─────────────────────────
     index_ticker, is_sector = get_benchmark(ticker)
     benchmark = get_benchmark_series(index_ticker)
+
+    # Without a benchmark there is no excess return, so every row's target
+    # would be NULL — and _upsert_signals DELETEs the recomputed range before
+    # reinserting, so writing that frame destroys whatever labels the ticker
+    # already had. Refusing to compute leaves the existing rows intact; a stale
+    # label is recoverable on the next run, an erased one is not.
+    if benchmark.empty:
+        print(f"[Signals] {ticker}: SKIPPED — benchmark {index_ticker} "
+              f"unavailable, refusing to overwrite existing labels with a "
+              f"null target.")
+        return None
 
     df = compute_sector_momentum(df, benchmark)
     df = compute_earnings_surprise(ticker, df)
@@ -366,6 +421,7 @@ def compute_and_store(single_ticker: str | None = None,
         to_process = get_universe()
 
     total = 0
+    skipped: list[str] = []
     for ticker in to_process:
         ohlcv = pd.read_sql(
             text("SELECT * FROM ohlcv WHERE ticker = :t ORDER BY date ASC"),
@@ -373,7 +429,7 @@ def compute_and_store(single_ticker: str | None = None,
         )
         frame = compute_signals_frame(ticker, ohlcv)
         if frame is None or frame.empty:
-            print(f"[Signals] {ticker}: insufficient history")
+            skipped.append(ticker)          # reason already printed by the callee
             continue
 
         with engine.connect() as conn:
@@ -384,7 +440,9 @@ def compute_and_store(single_ticker: str | None = None,
         total += written
         print(f"[Signals] {ticker}: {written} rows ({labelled} labelled)")
 
-    print(f"[Signals] Complete. {total} rows written.")
+    print(f"[Signals] Complete. {total} rows written, {len(skipped)} skipped.")
+    if skipped:
+        print(f"[Signals] Skipped: {', '.join(skipped)}")
     return total
 
 
