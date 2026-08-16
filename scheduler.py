@@ -156,9 +156,30 @@ def run_weekly_evaluation_job():
     the cached production hyperparameters (force=True), and persists all of
     it to model_metadata. The daily job reads this all week; it never
     recomputes it.
+
+    INGESTS ITS OWN DATA FIRST. This job used to sync index membership and then
+    evaluate straight out of the `signals` table, which only the DAILY job ever
+    writes. That made a silent ordering dependency, and on 2026-08-15 it bit:
+    the run finished normally in 14 minutes and reported "33/95 tickers
+    evaluated", with the other 62 refused for insufficient history — including
+    INFY, TCS, RELIANCE and HDFCBANK, none of which is short of history. The
+    signals table was simply half-built at the time, and the daily run 90
+    minutes later populated the rest and forecast all 62 without complaint.
+
+    Nothing in the output distinguished "this ticker has no track record" from
+    "this table was not ready yet", so an infrastructure race was reported as a
+    data-quality verdict, and the leaderboard sat on 33 evaluated names for a
+    week. Fetching and recomputing here costs minutes against an evaluation
+    measured in hours, and makes the job's result depend on the database rather
+    than on what ran before it — which is what the membership sync below
+    already assumed.
     """
-    from data.universe import get_universe, sync_current_membership
+    from data.universe import (
+        get_ingest_universe, get_universe, sync_current_membership,
+    )
     from data.tickers import refresh_metadata
+    from pipeline.fetch import fetch_and_store
+    from pipeline.signals import compute_and_store
     from pipeline.model import evaluate_and_persist_universe
 
     # Idempotent and cheap even if the daily job already did this today —
@@ -171,13 +192,25 @@ def run_weekly_evaluation_job():
         logger.warning(f"[Scheduler] universe sync failed, using last known "
                        f"membership: {exc}")
 
-    universe = get_universe()
-    logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")
-
-    if not universe:
-        logger.error("[Scheduler] Universe is empty — aborting weekly evaluation.")
+    ingest_list = get_ingest_universe()
+    if not ingest_list:
+        logger.error("[Scheduler] Index membership is empty — aborting weekly "
+                     "evaluation.")
         return
 
+    logger.info(f"[Scheduler] Refreshing OHLCV for {len(ingest_list)} index members...")
+    fetch_and_store(tickers=ingest_list)
+
+    universe = get_universe()
+    if not universe:
+        logger.error("[Scheduler] Universe is empty after screening — aborting "
+                     "weekly evaluation.")
+        return
+
+    logger.info(f"[Scheduler] Recomputing signals for {len(universe)} tickers...")
+    compute_and_store(tickers=universe)
+
+    logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")
     results = evaluate_and_persist_universe(tickers=universe)
     logger.info(f"[Scheduler] Weekly evaluation complete: "
                f"{len(results)}/{len(universe)} tickers evaluated")

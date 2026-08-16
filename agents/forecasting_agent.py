@@ -30,17 +30,11 @@ from __future__ import annotations
 import os
 import time
 
-from groq import Groq
-
+from agents.llm import DEFAULT_GROQ_MODEL, groq_client
 from agents.state import AgentState
 from pipeline.model import forecast_ticker_daily
 
-
-def _groq_client() -> Groq | None:
-    key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
-    if not key or key == "your_groq_key_here":
-        return None
-    return Groq(api_key=key)
+_groq_client = groq_client       # re-exported; see agents/llm.py
 
 
 def _failed_forecast(reason: str) -> dict:
@@ -120,6 +114,40 @@ def forecasting_node(state: AgentState) -> dict:
     return updates
 
 
+def _deserves_a_written_narrative(updates: dict) -> bool:
+    """
+    Whether this ticker is worth spending a Groq call on.
+
+    The daily job runs the whole universe, two LLM calls per ticker, against a
+    free-tier daily token budget. On 2026-08-15 that budget ran out partway
+    through and the tail of the alphabet fell back to the rule-based narrative
+    anyway — so the cap was already choosing which stocks got a written
+    narrative, by arrival order, which is the worst possible selection rule.
+
+    Choosing deliberately instead: a narrative is only ever read next to a
+    ranked row, and a row can only rank if it has a persisted evaluation behind
+    it AND a positive predicted excess return (compute_composite_score floors
+    both of its components at zero, so a predicted underperformer scores 0.0
+    and sinks regardless of what the narrative says). Both facts are already in
+    ``updates`` by the time this is called. That takes NARRATIVE calls from one
+    per ticker (~95) to roughly 15.
+
+    Note this gates one of the two LLM calls per ticker. critic_agent's
+    _llm_review still runs unconditionally, so the daily total is ~95 + ~15
+    rather than ~15 — comfortably inside 500k tokens/day, but the critic is now
+    the larger consumer of the two.
+
+    Everything else still gets _rule_based_narrative, which is deterministic
+    and states only what the signals say — not a degraded output, just an
+    unwritten one.
+    """
+    if not updates.get("eval_evaluated_at"):
+        return False
+
+    pred = updates.get("pred_excess_return")
+    return pred is not None and pred > 0
+
+
 def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     """
     Asks the LLM for a plain-English read of the signals.
@@ -128,9 +156,12 @@ def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     prediction invites a narrative written to justify the number rather than to
     describe the evidence.
     """
-    client = _groq_client()
     signals = state.get("latest_signals", {}) or {}
 
+    if not _deserves_a_written_narrative(updates):
+        return _rule_based_narrative(ticker, signals)
+
+    client = _groq_client()
     if client is None:
         return _rule_based_narrative(ticker, signals)
 
@@ -152,7 +183,7 @@ Write exactly 3 sentences describing what these signals collectively suggest abo
 near-term momentum relative to the benchmark. Reference specific signals by name and value.
 Do not state a price target, a percentage move, or a buy/sell recommendation."""
 
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    model_name = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
 
     for attempt in range(2):
         try:

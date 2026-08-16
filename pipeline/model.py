@@ -71,6 +71,30 @@ MODELS_DIR = os.path.join(
 EVAL_N_FOLDS = 5        # was 6
 EVAL_TUNE_TRIALS = 10   # per-fold nested Optuna trials, was 15
 
+# Row offset at which the FIRST test window opens. Comfortably above the
+# longest feature lookback (252 rows for 52-week proximity), so the first fold
+# is not fitted on a window shorter than the features it depends on.
+EVAL_MIN_TRAIN = 500
+
+# Enough rows to fit a production model and predict the latest row. The daily
+# path needs nothing more than this — it performs no cross-validation.
+MIN_ROWS_FOR_FORECAST = 350
+
+# Enough rows for the splitter to yield at least one out-of-sample prediction.
+# This MUST be derived rather than guessed. Every one of these guards used to
+# read `len(df) < 350` while PurgedWalkForward was constructed with
+# min_train=500, and split() computes `usable = n_samples - min_train` and
+# returns nothing when that is <= 0. So any ticker holding 350-500 rows cleared
+# the guard and then silently produced zero predictions — 17 of 95 tickers on
+# 2026-08-15 landed in exactly that dead zone and were reported as
+# "no out-of-sample predictions", which reads like a property of the data
+# rather than an arithmetic contradiction between two constants.
+#
+# The hard floor is EVAL_MIN_TRAIN + 1, below which split() yields nothing at
+# all. One row per fold is required instead, so that every fold covers a
+# non-empty test window rather than the last few collapsing to zero width.
+MIN_ROWS_FOR_EVALUATION = EVAL_MIN_TRAIN + EVAL_N_FOLDS
+
 
 @dataclass
 class TickerForecast:
@@ -169,7 +193,7 @@ def evaluate_ticker(
     why it is on the weekly path, not the daily one.
     """
     df = load_features_for_ticker(ticker) if df is None else df
-    if df.empty or len(df) < 350:
+    if df.empty or len(df) < MIN_ROWS_FOR_EVALUATION:
         return WalkForwardResult(ticker, 0, 0,
                                  pd.DataFrame(columns=["date", "y_true", "y_pred", "fold"]))
 
@@ -185,10 +209,12 @@ def evaluate_ticker(
     return walk_forward(
         X=X, y=y, dates=df["date"].tolist(),
         model_factory=_model_factory(),
-        # min_train=500 (~2 years) so the first fold is not fitted on a
-        # window shorter than the feature lookbacks it depends on.
+        # EVAL_MIN_TRAIN (~2 years) so the first fold is not fitted on a
+        # window shorter than the feature lookbacks it depends on. The row
+        # guard above is derived from it — see MIN_ROWS_FOR_EVALUATION.
         splitter=PurgedWalkForward(n_folds=n_folds, horizon=HORIZON_SESSIONS,
-                                   embargo=HORIZON_SESSIONS, min_train=500),
+                                   embargo=HORIZON_SESSIONS,
+                                   min_train=EVAL_MIN_TRAIN),
         ticker=ticker,
         tuner=tuner,
     )
@@ -349,8 +375,9 @@ def evaluate_and_persist_ticker(ticker: str, df: pd.DataFrame | None = None) -> 
     day's fresher data, using the hyperparameters this call just refreshed.
     """
     df = load_features_for_ticker(ticker) if df is None else df
-    if df.empty or len(df) < 350:
-        print(f"[Model] {ticker}: insufficient history for weekly evaluation")
+    if df.empty or len(df) < MIN_ROWS_FOR_EVALUATION:
+        print(f"[Model] {ticker}: insufficient history for weekly evaluation "
+              f"({len(df)} rows, need {MIN_ROWS_FOR_EVALUATION})")
         return None
 
     result = evaluate_ticker(ticker, df)
@@ -449,8 +476,9 @@ def forecast_ticker_daily(ticker: str) -> TickerForecast | None:
     staleness is reported via ``evaluation["evaluated_at"]``, not hidden.
     """
     df = load_features_for_ticker(ticker)
-    if df.empty or len(df) < 350:
-        print(f"[Model] {ticker}: insufficient history ({len(df)} rows)")
+    if df.empty or len(df) < MIN_ROWS_FOR_FORECAST:
+        print(f"[Model] {ticker}: insufficient history "
+              f"({len(df)} rows, need {MIN_ROWS_FOR_FORECAST})")
         return None
 
     model, n_train = fit_production_model(ticker, df, force_tune=False)
@@ -540,7 +568,8 @@ def forecast_ticker_full(ticker: str) -> TickerForecast | None:
     newly-added ticker that has no persisted evaluation yet.
     """
     df = load_features_for_ticker(ticker)
-    if df.empty or len(df) < 350:
+    # Runs BOTH paths, so it needs the stricter of the two floors.
+    if df.empty or len(df) < MIN_ROWS_FOR_EVALUATION:
         return None
     evaluate_and_persist_ticker(ticker, df)
     return forecast_ticker_daily(ticker)

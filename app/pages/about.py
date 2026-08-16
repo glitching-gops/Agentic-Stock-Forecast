@@ -301,7 +301,7 @@ def main():
 
         **Agents**
         - LangGraph (orchestration)
-        - Groq API — `openai/gpt-oss-20b` (narrative + signal review)
+        - Groq API — `llama-3.1-8b-instant` (narrative + signal review)
 
         **Data**
         - yfinance (OHLCV, benchmarks, macro)

@@ -33,9 +33,9 @@ import json
 import os
 import re
 
-from groq import Groq
 from dotenv import load_dotenv
 
+from agents.llm import DEFAULT_GROQ_MODEL, groq_client
 from agents.state import AgentState
 
 load_dotenv(override=True)
@@ -47,12 +47,34 @@ MIN_RANK_IC = 0.02
 MIN_IC_TSTAT = 2.0
 MIN_HIT_RATE_EDGE_PP = 1.0     # percentage points above the majority baseline
 
+# How many of those checks a forecast must pass to earn each grade.
+#
+# WEAK used to require ONE of three, which meant the rank-IC floor alone was
+# enough — and at +0.02 that floor is very low. The result was a leaderboard
+# whose visible top was carried by single, statistically insignificant
+# correlations: on 2026-08-15, BEL.NS ranked 3rd on a rank IC of +0.049 while
+# its hit rate sat 4.7pp BELOW the majority-class baseline, its IC t-statistic
+# was +0.39 (indistinguishable from noise), and its mean absolute error was
+# worse than a random walk's. Twelve more names held the same badge on the same
+# basis. A validation badge that one weak correlation can buy is not reporting
+# evidence, it is laundering it — the same shape of overclaim Phase 0 was
+# convened to remove, just milder than the leaked in-sample metrics were.
+#
+# Requiring two independent checks cuts WEAK from 13 names to 5 on that day's
+# numbers (DMART, BAJAJFINSV, CANBK, ADANIPOWER, BAJFINANCE — each with both a
+# positive IC and a hit rate above its baseline). In practice this means "IC
+# and hit-rate edge", because the t-statistic check almost never passes at this
+# horizon; that is a fact about the signal, not a reason to lower the bar.
+MIN_CHECKS_FOR_WEAK = 2
 
-def _groq_client() -> Groq | None:
-    key = os.getenv("GROQ_API_KEY", "").strip('"').strip("'")
-    if not key or key == "your_groq_key_here":
-        return None
-    return Groq(api_key=key)
+# STRONG additionally requires that all three checks actually RAN. Grading on
+# `passed == checks` alone would hand STRONG to a ticker whose only available
+# metric happened to clear its floor, which is a statement about missing data
+# rather than about skill.
+REQUIRED_CHECKS_FOR_STRONG = 3
+
+
+_groq_client = groq_client       # re-exported; see agents/llm.py
 
 
 def grade_evidence(state: dict) -> tuple[str, list[str]]:
@@ -112,7 +134,18 @@ def grade_evidence(state: dict) -> tuple[str, list[str]]:
                  "has not been through a weekly evaluation run.")
         return "INSUFFICIENT", [reason]
 
-    grade = "STRONG" if passed == checks else "WEAK" if passed >= 1 else "INSUFFICIENT"
+    if checks >= REQUIRED_CHECKS_FOR_STRONG and passed == checks:
+        grade = "STRONG"
+    elif passed >= MIN_CHECKS_FOR_WEAK:
+        grade = "WEAK"
+    else:
+        grade = "INSUFFICIENT"
+
+    reasons.append(
+        f"{passed} of {checks} held-out checks passed "
+        f"({MIN_CHECKS_FOR_WEAK} needed for WEAK, "
+        f"{REQUIRED_CHECKS_FOR_STRONG} for STRONG)."
+    )
 
     # The evaluation behind this forecast is refreshed WEEKLY, not daily
     # (Lever 1) — surfaced here rather than left implicit, since the badge
@@ -175,7 +208,7 @@ Do not comment on whether the model is accurate; you have no way to verify that.
 Respond ONLY with JSON:
 {{"flags": ["..."], "reasoning": "2-3 sentences"}}"""
 
-    model_name = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    model_name = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
 
     try:
         completion = client.chat.completions.create(

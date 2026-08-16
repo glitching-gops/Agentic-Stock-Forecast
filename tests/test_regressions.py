@@ -773,3 +773,191 @@ def test_sentiment_view_does_not_plot_a_gauge_without_a_reading():
 
     assert "if sentiment_score is None:" in source
     assert "NOT SCORED" in source
+
+
+# ── The evidence gate must need more than one weak correlation ────────────────
+
+def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
+    return {
+        "forecast_available": True,
+        "eval_rank_ic": ic,
+        "eval_rank_ic_t": ic_t,
+        "eval_hit_rate": hit,
+        "eval_baseline_hit_rate": baseline,
+        "eval_beats_naive": beats_naive,
+    }
+
+
+def test_weak_evidence_requires_two_independent_checks():
+    """
+    WEAK used to need ONE of three checks, so the +0.02 rank-IC floor alone
+    bought the badge. BEL.NS ranked 3rd on the live leaderboard with a rank IC
+    of +0.049 while its hit rate sat 4.7pp BELOW the majority-class baseline,
+    its IC t-statistic was +0.39, and its error was worse than a random walk's.
+    """
+    from agents.critic_agent import grade_evidence
+
+    # BEL.NS, 2026-08-15. Passes the IC floor and nothing else.
+    bel, _ = grade_evidence(_evidence_state(
+        ic=0.049, ic_t=0.39, hit=54.9, baseline=59.5, beats_naive=False))
+    assert bel == "INSUFFICIENT", "one weak correlation must not earn a badge"
+
+    # CUMMINSIND.NS — same shape, 6.4pp below its baseline.
+    cummins, _ = grade_evidence(_evidence_state(
+        ic=0.083, ic_t=0.66, hit=50.6, baseline=57.0, beats_naive=False))
+    assert cummins == "INSUFFICIENT"
+
+    # DMART.NS — positive IC AND a 7.3pp hit-rate edge. Two checks, so WEAK.
+    dmart, _ = grade_evidence(_evidence_state(
+        ic=0.193, ic_t=1.4, hit=59.7, baseline=52.4))
+    assert dmart == "WEAK"
+
+    # Tying the baseline exactly is not an edge (ADANIENT.NS, +0.0pp).
+    tied, _ = grade_evidence(_evidence_state(
+        ic=0.092, ic_t=1.1, hit=54.9, baseline=54.9))
+    assert tied == "INSUFFICIENT"
+
+
+def test_strong_requires_every_check_to_have_actually_run():
+    """
+    Grading on `passed == checks` alone hands STRONG to a ticker whose single
+    available metric happened to clear its floor — a statement about missing
+    data, not about skill.
+    """
+    from agents.critic_agent import grade_evidence
+
+    only_ic, _ = grade_evidence(_evidence_state(
+        ic=0.30, ic_t=None, hit=None, baseline=None))
+    assert only_ic != "STRONG"
+
+    everything, _ = grade_evidence(_evidence_state(
+        ic=0.30, ic_t=3.1, hit=61.0, baseline=52.0))
+    assert everything == "STRONG"
+
+    # ...unless the magnitude is worse than a random walk, which still caps it.
+    capped, _ = grade_evidence(_evidence_state(
+        ic=0.30, ic_t=3.1, hit=61.0, baseline=52.0, beats_naive=False))
+    assert capped == "WEAK"
+
+
+# ── The row guard must match what the splitter actually needs ─────────────────
+
+def test_evaluation_row_guard_is_derived_from_the_splitter():
+    """
+    Every guard read `len(df) < 350` while PurgedWalkForward was built with
+    min_train=500, and split() returns nothing when `n_samples - min_train <=
+    0`. Tickers holding 350-500 rows therefore cleared the guard and produced
+    zero predictions — 17 of 95 on 2026-08-15, reported as "no out-of-sample
+    predictions" as though it were a property of the data.
+    """
+    from pipeline.evaluation import PurgedWalkForward
+    from pipeline.model import (
+        EVAL_MIN_TRAIN, EVAL_N_FOLDS, MIN_ROWS_FOR_EVALUATION,
+        MIN_ROWS_FOR_FORECAST,
+    )
+    from pipeline.signals import HORIZON_SESSIONS
+
+    splitter = PurgedWalkForward(n_folds=EVAL_N_FOLDS, horizon=HORIZON_SESSIONS,
+                                 embargo=HORIZON_SESSIONS,
+                                 min_train=EVAL_MIN_TRAIN)
+
+    assert MIN_ROWS_FOR_EVALUATION > EVAL_MIN_TRAIN
+
+    # The old dead zone: enough rows to pass the forecast floor, not enough to
+    # yield a single fold.
+    assert list(splitter.split(MIN_ROWS_FOR_FORECAST)) == []
+    assert list(splitter.split(EVAL_MIN_TRAIN)) == []
+
+    # At the derived guard, every fold covers a non-empty test window.
+    folds = list(splitter.split(MIN_ROWS_FOR_EVALUATION))
+    assert len(folds) == EVAL_N_FOLDS
+    assert all(len(test) > 0 for _, test in folds)
+
+
+def test_no_hardcoded_row_guard_survives_in_the_model_module():
+    """The literal must be gone from the code, not merely from one call site."""
+    source = (REPO / "pipeline" / "model.py").read_text(encoding="utf-8")
+
+    offenders = [
+        f"{lineno}: {line.strip()}"
+        for lineno, line in enumerate(source.splitlines(), 1)
+        if "len(df) < 350" in line and not line.strip().startswith("#")
+    ]
+    assert not offenders, (
+        f"row guards must be derived from the splitter, not restated as "
+        f"literals: {offenders}"
+    )
+
+
+# ── The weekly job must not depend on the daily job having run ────────────────
+
+def test_weekly_job_ingests_its_own_data_before_evaluating():
+    """
+    The weekly job evaluated straight out of the `signals` table, which only
+    the DAILY job writes. On 2026-08-15 it read a half-built table, refused 62
+    of 95 tickers for "insufficient history" — INFY, TCS, RELIANCE, HDFCBANK
+    among them — and reported an infrastructure race as a data-quality verdict.
+    """
+    import scheduler
+
+    source = inspect.getsource(scheduler.run_weekly_evaluation_job)
+
+    # Must be CALLED, not merely imported — the import alone satisfies a
+    # substring check while the pipeline step is gone.
+    assert "fetch_and_store(tickers=" in source, "weekly run must refresh OHLCV itself"
+    assert "compute_and_store(tickers=" in source, (
+        "weekly run must recompute signals itself"
+    )
+
+    # And it must do so BEFORE evaluating, or the ordering bug simply moves.
+    assert source.index("compute_and_store(tickers=") < source.index(
+        "evaluate_and_persist_universe("
+    )
+    assert source.index("fetch_and_store(tickers=") < source.index(
+        "compute_and_store(tickers="
+    )
+
+
+# ── LLM budget: choose which tickers get a written narrative ──────────────────
+
+def test_default_groq_model_has_the_larger_free_tier_budget():
+    """
+    openai/gpt-oss-20b allows 200k tokens/day; the daily job makes two calls
+    per ticker across ~95 tickers and exhausted it partway through the
+    2026-08-15 run. llama-3.1-8b-instant allows 500k/day on the same tier.
+    """
+    from agents.llm import DEFAULT_GROQ_MODEL
+
+    assert DEFAULT_GROQ_MODEL == "llama-3.1-8b-instant"
+
+    # And the model must be configured in exactly one place.
+    for module in ["critic_agent.py", "forecasting_agent.py"]:
+        source = (REPO / "agents" / module).read_text(encoding="utf-8")
+        assert "gpt-oss" not in source, f"{module} still hardcodes a model name"
+
+
+def test_narrative_is_written_only_for_tickers_that_can_rank():
+    """
+    Without a gate the token cap chose which stocks got a written narrative by
+    arrival order — the tail of the alphabet logged "narrative generation
+    failed". A row cannot rank without a persisted evaluation and a positive
+    predicted excess return, and a narrative is only read beside a ranked row.
+    """
+    from agents.forecasting_agent import _deserves_a_written_narrative
+
+    rankable = {"eval_evaluated_at": "2026-08-15 17:02:11",
+                "pred_excess_return": 0.031}
+    assert _deserves_a_written_narrative(rankable) is True
+
+    # No evidence -> composite is gated to 0.0 regardless of the prediction.
+    assert _deserves_a_written_narrative(
+        {"eval_evaluated_at": None, "pred_excess_return": 0.031}) is False
+
+    # Predicted underperformer -> both score components floor at zero.
+    assert _deserves_a_written_narrative(
+        {"eval_evaluated_at": "2026-08-15 17:02:11",
+         "pred_excess_return": -0.02}) is False
+
+    assert _deserves_a_written_narrative(
+        {"eval_evaluated_at": "2026-08-15 17:02:11",
+         "pred_excess_return": None}) is False
