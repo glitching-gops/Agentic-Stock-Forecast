@@ -25,7 +25,10 @@ class AgentState(TypedDict, total=False):
     latest_signals: dict
 
     # External Data Agent
-    sentiment_score: float
+    # None means "no scored headline exists", which is distinct from 0.0
+    # ("the news balanced out"). No scorer currently runs — see
+    # pipeline/sentiment.py.
+    sentiment_score: Optional[float]
     macro_df: Any
 
     # Forecasting Agent — the forecast itself

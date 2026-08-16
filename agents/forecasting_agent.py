@@ -132,7 +132,7 @@ def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     signals = state.get("latest_signals", {}) or {}
 
     if client is None:
-        return _rule_based_narrative(ticker, signals, state.get("sentiment_score", 0.0))
+        return _rule_based_narrative(ticker, signals)
 
     interesting = {
         k: v for k, v in signals.items()
@@ -172,8 +172,14 @@ Do not state a price target, a percentage move, or a buy/sell recommendation."""
     return _rule_based_narrative(ticker, signals, state.get("sentiment_score", 0.0))
 
 
-def _rule_based_narrative(ticker: str, signals: dict, sentiment: float) -> str:
-    """Deterministic fallback so a narrative is never fabricated by guesswork."""
+def _rule_based_narrative(ticker: str, signals: dict) -> str:
+    """
+    Deterministic fallback so a narrative is never fabricated by guesswork.
+
+    Took a ``sentiment`` argument it never referenced. Dropped rather than
+    wired in: sentiment is unscored (see pipeline/sentiment.py), so the only
+    honest use of it here would have been to say nothing about it.
+    """
     rsi = float(signals.get("rsi", 50) or 50)
     macd = float(signals.get("macd_hist", 0) or 0)
     rel20 = float(signals.get("sector_rel_20d", 0) or 0)

@@ -20,7 +20,6 @@ langgraph
 langchain
 langchain-groq
 groq
-transformers                 # FinBERT, sentiment display only
 
 # Backend
 fastapi>=0.111.0
@@ -40,6 +39,13 @@ pytz>=2024.1
 # Tests
 pytest>=8.0.0
 
+# transformers went with it. Its only use was FinBERT sentiment scoring, which
+# needs torch and therefore failed to load on every production run since Phase 0
+# ("Error loading FinBERT: name 'torch' is not defined"), scoring nothing while
+# the dashboard displayed a permanently-neutral gauge. Headlines are now stored
+# unscored — see pipeline/sentiment.py. Restoring a scorer is a Phase 2 item and
+# needs a dated news archive before it can be backtested at all.
+#
 # torch was removed in Phase 0. It was needed only by the LSTM, which never
 # wrote a checkpoint and so never produced a forecast; that module now lives in
 # pipeline/archived/ and is not imported anywhere on the live path. Dropping it

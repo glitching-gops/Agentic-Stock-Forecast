@@ -280,6 +280,12 @@ def init_db():
             # regenerated daily; the evidence backing it is only re-measured
             # weekly) — surfaced so staleness is visible, not implied away.
             ("evaluated_at",         "TEXT"),
+            # Why composite_score is what it is — chiefly, why it is zero.
+            # Most of the leaderboard scores 0.0, and that single value covers
+            # "never evaluated", "predicted to underperform" and "flagged out",
+            # which are very different statements. See
+            # agents.graph.classify_score_basis.
+            ("score_basis",          "TEXT"),
         ]
         for table in ["forecasts", "leaderboard"]:
             for col, coltype in forecast_extra:

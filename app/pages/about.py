@@ -273,9 +273,12 @@ def main():
       are different questions; only the first is currently measured.
     - **Survivorship bias.** Point-in-time index membership is only recorded from
       the first universe sync onward.
-    - **News sentiment is not a model feature.** It only ever existed for the
-      current date, so it was zero across the training set and non-zero only for
-      the row being predicted. It returns when a dated news archive exists.
+    - **News sentiment is not a model feature, and is not scored at all.**
+      As a feature it only ever existed for the current date, so it was zero
+      across the training set and non-zero only for the row being predicted.
+      The scorer itself is also gone: FinBERT required torch, which was removed
+      in Phase 0, so it failed to load on every run. Headlines are collected and
+      shown unscored. Both return when a dated news archive exists.
     - **T+1 settlement is not modelled.** A signal computed at the 15:30 close is
       actionable at the next open at the earliest.
     - **No demonstrated edge.** As measured, the model does not beat a
@@ -299,7 +302,6 @@ def main():
         **Agents**
         - LangGraph (orchestration)
         - Groq API — `openai/gpt-oss-20b` (narrative + signal review)
-        - ProsusAI/FinBERT (sentiment, display only)
 
         **Data**
         - yfinance (OHLCV, benchmarks, macro)

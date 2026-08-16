@@ -336,7 +336,7 @@ with tab2:
 # TAB 3: Sentiment
 # ==========================================
 with tab3:
-    agg_score = state.get("sentiment_score", 0.0)
+    agg_score = state.get("sentiment_score")   # None when nothing is scored
     render_sentiment_view(selected_ticker, agg_score)
 
 

@@ -557,47 +557,79 @@ def test_prune_leaderboard_removes_only_tickers_outside_the_universe():
     import agents.graph as graph_mod
     import data.db as db_mod
 
-    deleted_params = []
-
-    class _FakeResult:
-        rowcount = 2
-
-    class _FakeConn:
-        def execute(self, statement, params=None):
-            deleted_params.append((str(statement), params))
-            return _FakeResult()
-
-        def commit(self):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    class _FakeEngine:
-        def connect(self):
-            return _FakeConn()
+    engine = _leaderboard_fixture(
+        ["RELIANCE.NS", "WIPRO.NS", "IDEA.NS", "SAIL.NS"]
+    )
 
     original = db_mod.get_engine
-    db_mod.get_engine = lambda: _FakeEngine()
+    db_mod.get_engine = lambda: engine
     try:
-        removed = graph_mod.prune_leaderboard(["RELIANCE.NS", "WIPRO.NS"])
+        # 2 of 4 rows leave, which exceeds the default 25% guard, so this call
+        # states its own tolerance rather than relying on the default.
+        removed = graph_mod.prune_leaderboard(
+            ["RELIANCE.NS", "WIPRO.NS"], max_fraction=1.0)
         # An empty universe must never trigger a delete — that would wipe the
         # whole leaderboard on a bad universe fetch.
-        empty = graph_mod.prune_leaderboard([])
+        empty = graph_mod.prune_leaderboard([], max_fraction=1.0)
     finally:
         db_mod.get_engine = original
 
     assert removed == 2
     assert empty == 0
-    assert len(deleted_params) == 1, "empty universe must not issue a DELETE"
+    assert _tickers(engine) == ["RELIANCE.NS", "WIPRO.NS"]
 
-    statement, params = deleted_params[0]
-    assert "DELETE FROM leaderboard" in statement
-    assert "NOT IN" in statement
-    assert params["tickers"] == ["RELIANCE.NS", "WIPRO.NS"]
+
+def test_prune_leaderboard_refuses_to_delete_most_of_the_table():
+    """
+    A short universe is not evidence of a mass delisting.
+
+    get_universe() applies a liquidity floor and a listing-history floor over
+    freshly fetched OHLCV, so a partial yfinance response or a half-written
+    ohlcv table produces a SHORT universe rather than an empty one. Guarding
+    only against the empty case leaves the far likelier failure wide open:
+    every healthy name missing from a truncated universe looks exactly like a
+    departure, and the prune would delete the live leaderboard on the strength
+    of a bad download.
+    """
+    import agents.graph as graph_mod
+    import data.db as db_mod
+
+    universe = [f"T{i}.NS" for i in range(20)]
+    engine = _leaderboard_fixture(universe)
+
+    original = db_mod.get_engine
+    db_mod.get_engine = lambda: engine
+    try:
+        # Only 3 of 20 names survive the screen — 85% of the table would go.
+        removed = graph_mod.prune_leaderboard(universe[:3])
+    finally:
+        db_mod.get_engine = original
+
+    assert removed == 0
+    assert len(_tickers(engine)) == 20, "a bad universe must not empty the table"
+
+
+def _leaderboard_fixture(tickers):
+    """An in-memory leaderboard table holding one row per ticker."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")          # single shared connection
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE leaderboard "
+                          "(ticker TEXT PRIMARY KEY, composite_score REAL)"))
+        for i, ticker in enumerate(tickers):
+            conn.execute(text("INSERT INTO leaderboard VALUES (:t, :s)"),
+                         {"t": ticker, "s": float(i)})
+        conn.commit()
+    return engine
+
+
+def _tickers(engine):
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        return sorted(r[0] for r in
+                      conn.execute(text("SELECT ticker FROM leaderboard")))
 
 
 def test_daily_job_prunes_the_leaderboard_after_forecasting():
@@ -619,3 +651,125 @@ def test_leaderboard_total_counts_matches_not_page_size():
     assert "total_matching = len(df)" in source
     # The count must be taken before the page is sliced.
     assert source.index("total_matching = len(df)") < source.index("df.head(limit)")
+
+
+# ── A composite of 0.0 must say which kind of zero it is ──────────────────────
+
+def test_score_basis_separates_no_evidence_from_a_bearish_forecast():
+    """
+    85 of 95 leaderboard rows scored exactly 0.0 on 2026-08-15, for unrelated
+    reasons that the number alone could not distinguish. compute_composite_score
+    floors both of its components, so a stock the model actively predicted would
+    UNDERPERFORM — with evidence in hand and real conviction — landed on the
+    same 0.0 as a stock the weekly evaluation had never reached. Sorted by
+    score they formed one undifferentiated block, so the single number a reader
+    ranks on silently conflated "no view" with "negative view".
+    """
+    from agents.graph import classify_score_basis, compute_composite_score
+
+    bearish = dict(pred_excess_return=-0.04, evidence_grade="WEAK",
+                   prob_outperform=0.31)
+    unevaluated = dict(pred_excess_return=0.06, evidence_grade="INSUFFICIENT",
+                       prob_outperform=0.62)
+
+    # The defect: both score zero and are indistinguishable by score alone.
+    assert compute_composite_score(**bearish) == 0.0
+    assert compute_composite_score(**unevaluated) == 0.0
+
+    # The fix: the reason is recorded, so they are distinguishable.
+    assert classify_score_basis(**bearish) == "NOT_LONG"
+    assert classify_score_basis(**unevaluated) == "NO_EVIDENCE"
+
+    assert classify_score_basis(pred_excess_return=None,
+                                evidence_grade="WEAK",
+                                prob_outperform=None) == "NO_FORECAST"
+
+    ranked = dict(pred_excess_return=0.05, evidence_grade="STRONG",
+                  prob_outperform=0.70)
+    assert compute_composite_score(**ranked) > 0
+    assert classify_score_basis(**ranked) == "RANKED"
+
+    # Flags can drive a genuine long signal to zero; that is a fourth reason.
+    assert classify_score_basis(**ranked, n_flags=20) == "FLAGGED_OUT"
+
+
+def test_score_basis_is_persisted_to_both_tables():
+    """A basis that never reaches the database explains nothing to a reader."""
+    import agents.graph as graph_mod
+
+    source = inspect.getsource(graph_mod.save_forecast_to_db)
+    assert '"score_basis": score_basis' in source
+
+    db_source = (REPO / "data" / "db.py").read_text(encoding="utf-8")
+    assert '"score_basis"' in db_source, "column must exist in the schema migration"
+
+    schema = (REPO / "api" / "schemas" / "leaderboard.py").read_text(encoding="utf-8")
+    assert "score_basis" in schema, "the API must expose it or nothing changed"
+
+
+# ── Sentiment must not report a reading it never took ─────────────────────────
+
+def test_finbert_is_gone_from_the_live_path():
+    """
+    FinBERT needs torch, and torch was removed in Phase 0. The loader therefore
+    raised on every production run ("name 'torch' is not defined"), scored
+    nothing, and returned before a single headline was stored — while the
+    dashboard went on rendering a sentiment gauge fed by a hardcoded 0.0.
+    """
+    source = (REPO / "pipeline" / "sentiment.py").read_text(encoding="utf-8")
+
+    assert "get_finbert" not in source
+    assert "ProsusAI/finbert" not in source
+    assert "from transformers import" not in source
+
+    requirements = (REPO / "requirements.txt").read_text(encoding="utf-8")
+    declared = [line.split("#")[0].strip() for line in requirements.splitlines()]
+    assert "transformers" not in declared, "dependency exists only for FinBERT"
+
+
+def test_aggregate_sentiment_is_none_when_nothing_is_scored():
+    """
+    None means "no measurement"; 0.0 means "measured, and it balanced out".
+    Returning 0.0 for the first is what let the UI show NEUTRAL for every stock
+    in the universe, indefinitely, without a scorer running at all.
+    """
+    from sqlalchemy import create_engine, text
+
+    import pipeline.sentiment as sent_mod
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE sentiment (date TEXT, ticker TEXT, "
+                          "headline TEXT, sentiment_label TEXT, "
+                          "sentiment_score REAL)"))
+        conn.execute(text("INSERT INTO sentiment VALUES "
+                          "('2026-08-15', 'RELIANCE.NS', 'a', 'unscored', NULL)"))
+        conn.execute(text("INSERT INTO sentiment VALUES "
+                          "('2026-08-15', 'TCS.NS', 'b', 'positive', 0.9)"))
+        conn.execute(text("INSERT INTO sentiment VALUES "
+                          "('2026-08-15', 'TCS.NS', 'c', 'unscored', NULL)"))
+        conn.commit()
+
+    original = sent_mod.get_engine
+    sent_mod.get_engine = lambda: engine
+    try:
+        unscored = sent_mod.get_aggregate_sentiment("RELIANCE.NS")
+        mixed = sent_mod.get_aggregate_sentiment("TCS.NS")
+        absent = sent_mod.get_aggregate_sentiment("NOSUCH.NS")
+    finally:
+        sent_mod.get_engine = original
+
+    assert unscored is None
+    assert absent is None
+    # Unscored rows are ignored rather than counted as neutral, which would
+    # otherwise drag a real reading toward zero.
+    assert mixed == pytest.approx(0.9)
+
+
+def test_sentiment_view_does_not_plot_a_gauge_without_a_reading():
+    """A needle parked mid-dial reads as a measured neutral, not as missing."""
+    source = (REPO / "app" / "components" / "sentiment_view.py").read_text(
+        encoding="utf-8")
+
+    assert "if sentiment_score is None:" in source
+    assert "NOT SCORED" in source

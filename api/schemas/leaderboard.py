@@ -30,6 +30,11 @@ class LeaderboardEntry(BaseModel):
         None, description="Ranking heuristic in [0,100]: predicted excess return and "
                           "conviction, multiplied by an evidence grade. NOT an "
                           "expected return.")
+    score_basis: Optional[str] = Field(
+        None, description="Why composite_score is what it is, and in particular why "
+                          "it is zero: RANKED / NO_FORECAST / NO_EVIDENCE / "
+                          "NOT_LONG / FLAGGED_OUT. Most rows score 0.0, and that "
+                          "one value otherwise covers several unrelated situations.")
     critic_verdict: Optional[str] = None
     forecast_confidence: Optional[str] = Field(
         None, description="Evidence grade: STRONG / WEAK / INSUFFICIENT.")
@@ -54,7 +59,9 @@ class LeaderboardResponse(BaseModel):
             "conviction, gated by held-out evidence from purged walk-forward "
             "evaluation with a 30-session embargo. Metrics are out-of-sample. "
             "The composite score is a ranking heuristic, not an expected return, "
-            "and is reported before transaction costs."
+            "and is reported before transaction costs. It ranks LONG candidates "
+            "only: a predicted underperformer floors at zero rather than ranking "
+            "below one, so read score_basis before reading a 0.0 as 'no signal'."
         ),
         description="How to read these numbers.",
     )

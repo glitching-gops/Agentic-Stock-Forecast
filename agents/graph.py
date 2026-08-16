@@ -34,6 +34,36 @@ from agents.trading_data_agent import trading_data_node
 
 EVIDENCE_MULTIPLIER = {"STRONG": 1.0, "WEAK": 0.5, "INSUFFICIENT": 0.0}
 
+# Refuse to prune more of the leaderboard than this in one run. See
+# prune_leaderboard().
+PRUNE_MAX_FRACTION = 0.25
+
+
+def _score_parts(
+    pred_excess_return: float,
+    prob_outperform: float | None,
+) -> tuple[float, float]:
+    """
+    The two ungated components of the composite, before evidence and flags.
+
+    signal      (0-60)  predicted excess return, saturating at +10% over 30
+                        sessions so one extreme forecast cannot dominate.
+    conviction  (0-40)  distance of P(outperform) from a coin flip.
+
+    Both floor at zero, which is what makes the composite a LONG-ONLY ranking:
+    a confidently predicted underperformer scores exactly the same as a
+    confidently predicted flat one. classify_score_basis() exists to keep that
+    fact visible rather than buried in a 0.0.
+    """
+    signal = min(max(pred_excess_return, 0.0) / 0.10, 1.0) * 60.0
+
+    if prob_outperform is None:
+        conviction = 0.0
+    else:
+        conviction = min(max(prob_outperform - 0.5, 0.0) / 0.25, 1.0) * 40.0
+
+    return signal, conviction
+
 
 def compute_composite_score(
     pred_excess_return: float | None,
@@ -44,25 +74,60 @@ def compute_composite_score(
     """
     Ranking heuristic in [0, 100]. NOT an expected return.
 
-    signal      (0-60)  predicted excess return, saturating at +10% over 30
-                        sessions so one extreme forecast cannot dominate.
-    conviction  (0-40)  distance of P(outperform) from a coin flip.
-    evidence            multiplies the total, so a model that failed its
-                        held-out checks scores 0 regardless of its prediction.
-    flags               5-point deduction each, floored at zero.
+    signal + conviction, multiplied by an evidence grade so a model that failed
+    its held-out checks scores 0 regardless of its prediction, less a 5-point
+    deduction per critic flag, floored at zero.
     """
     if pred_excess_return is None:
         return 0.0
 
-    signal = min(max(pred_excess_return, 0.0) / 0.10, 1.0) * 60.0
-
-    if prob_outperform is None:
-        conviction = 0.0
-    else:
-        conviction = min(max(prob_outperform - 0.5, 0.0) / 0.25, 1.0) * 40.0
-
+    signal, conviction = _score_parts(pred_excess_return, prob_outperform)
     raw = (signal + conviction) * EVIDENCE_MULTIPLIER.get(evidence_grade, 0.0)
     return round(max(raw - 5.0 * n_flags, 0.0), 2)
+
+
+def classify_score_basis(
+    pred_excess_return: float | None,
+    evidence_grade: str,
+    prob_outperform: float | None,
+    n_flags: int = 0,
+) -> str:
+    """
+    Why a row scored what it scored — in particular, why it scored zero.
+
+    A composite of 0.0 was previously ambiguous across four unrelated
+    situations, and the leaderboard is mostly zeros: of 95 rows on 2026-08-15,
+    85 scored 0.0. A stock the model actively predicted would UNDERPERFORM
+    (evidence in hand, conviction real) was indistinguishable from one the
+    weekly evaluation had simply never reached. Sorting by score put them in
+    the same undifferentiated block, so the one number a reader is invited to
+    rank on silently conflated "no view" with "negative view".
+
+    The score itself is unchanged — this only names the reason:
+
+        RANKED        scored above zero and ranks normally.
+        NO_FORECAST   the model produced no prediction at all.
+        NO_EVIDENCE   the evidence gate zeroed it; the weekly walk-forward
+                      has not cleared this ticker (grade INSUFFICIENT).
+        NOT_LONG      evidence exists, but the prediction is flat-to-negative,
+                      and the composite only ranks long candidates.
+        FLAGGED_OUT   a real long signal that critic flags drove to zero.
+    """
+    if pred_excess_return is None:
+        return "NO_FORECAST"
+
+    if EVIDENCE_MULTIPLIER.get(evidence_grade, 0.0) == 0.0:
+        return "NO_EVIDENCE"
+
+    signal, conviction = _score_parts(pred_excess_return, prob_outperform)
+    if signal + conviction <= 0.0:
+        return "NOT_LONG"
+
+    if compute_composite_score(pred_excess_return, evidence_grade,
+                               prob_outperform, n_flags) <= 0.0:
+        return "FLAGGED_OUT"
+
+    return "RANKED"
 
 
 def save_forecast_to_db(state: dict) -> None:
@@ -75,12 +140,14 @@ def save_forecast_to_db(state: dict) -> None:
     ticker = state.get("ticker", "")
     now = datetime.now(timezone.utc)
 
-    composite = compute_composite_score(
-        pred_excess_return=state.get("pred_excess_return"),
-        evidence_grade=state.get("evidence_grade", "INSUFFICIENT"),
-        prob_outperform=state.get("prob_outperform"),
-        n_flags=len(state.get("critic_flags", []) or []),
-    )
+    score_args = {
+        "pred_excess_return": state.get("pred_excess_return"),
+        "evidence_grade": state.get("evidence_grade", "INSUFFICIENT"),
+        "prob_outperform": state.get("prob_outperform"),
+        "n_flags": len(state.get("critic_flags", []) or []),
+    }
+    composite = compute_composite_score(**score_args)
+    score_basis = classify_score_basis(**score_args)
 
     benchmark = state.get("benchmark_ticker") or ""
     payload = {
@@ -125,6 +192,7 @@ def save_forecast_to_db(state: dict) -> None:
         "directional_accuracy": state.get("eval_hit_rate"),
         "upside_pct": state.get("forecast_change_pct"),
         "composite_score": composite,
+        "score_basis": score_basis,
     }
 
     forecast_cols = [
@@ -136,7 +204,7 @@ def save_forecast_to_db(state: dict) -> None:
         "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
         "benchmark_sector_specific", "eval_rank_ic", "eval_hit_rate",
         "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
-        "universe_rule", "evaluated_at",
+        "universe_rule", "evaluated_at", "score_basis",
     ]
 
     leaderboard_cols = [
@@ -147,6 +215,7 @@ def save_forecast_to_db(state: dict) -> None:
         "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
         "eval_rank_ic", "eval_hit_rate", "eval_baseline_hit_rate",
         "eval_beats_random_walk", "model_version", "universe_rule", "evaluated_at",
+        "score_basis",
     ]
 
     def _insert(cols: list[str], table: str) -> str:
@@ -172,7 +241,8 @@ def save_forecast_to_db(state: dict) -> None:
         conn.commit()
 
 
-def prune_leaderboard(universe: list[str]) -> int:
+def prune_leaderboard(universe: list[str],
+                      max_fraction: float = PRUNE_MAX_FRACTION) -> int:
     """
     Deletes leaderboard rows for tickers no longer in the tradable universe.
 
@@ -186,7 +256,19 @@ def prune_leaderboard(universe: list[str]) -> int:
     headed by IDEA.NS and SAIL.NS, neither of which is in the NIFTY 100,
     months after they left it.
 
-    Returns the number of rows removed.
+    ``max_fraction`` bounds the blast radius. Refusing to prune an EMPTY
+    universe is not enough of a guard, because the input is the same
+    get_universe() call whose output already varies run to run: it applies a
+    liquidity floor and a listing-history floor over freshly fetched OHLCV, so
+    a partial yfinance response or a half-written ohlcv table yields a short
+    universe rather than an empty one. At that point every healthy name
+    missing from the short list looks exactly like a delisting, and this
+    function would delete the live leaderboard on the strength of a bad
+    download. A legitimate index reconstitution moves a handful of names; a
+    quarter of the table disappearing at once is a broken input, so it is
+    reported and skipped rather than executed.
+
+    Returns the number of rows removed (0 when the prune is refused).
     """
     from data.db import get_engine
 
@@ -194,12 +276,37 @@ def prune_leaderboard(universe: list[str]) -> int:
         return 0
 
     engine = get_engine()
-    stmt = text("DELETE FROM leaderboard WHERE ticker NOT IN :tickers").bindparams(
-        bindparam("tickers", expanding=True)
-    )
+
+    def outside_universe(sql: str):
+        """`sql` must contain the `:tickers` placeholder for the IN list."""
+        return text(sql).bindparams(bindparam("tickers", expanding=True))
+
+    params = {"tickers": list(universe)}
+
     with engine.connect() as conn:
-        result = conn.execute(stmt, {"tickers": list(universe)})
+        total = conn.execute(text("SELECT COUNT(*) FROM leaderboard")).scalar() or 0
+        if not total:
+            return 0
+
+        doomed = conn.execute(
+            outside_universe("SELECT COUNT(*) FROM leaderboard "
+                             "WHERE ticker NOT IN :tickers"),
+            params,
+        ).scalar() or 0
+
+        if doomed > total * max_fraction:
+            print(f"[Leaderboard] REFUSING to prune {doomed} of {total} rows "
+                  f"(>{max_fraction:.0%}) against a universe of {len(universe)} "
+                  f"tickers — treating this as a bad universe, not a mass "
+                  f"delisting. Leaderboard left untouched.")
+            return 0
+
+        result = conn.execute(
+            outside_universe("DELETE FROM leaderboard WHERE ticker NOT IN :tickers"),
+            params,
+        )
         conn.commit()
+
     return result.rowcount or 0
 
 
@@ -241,7 +348,7 @@ def run_graph(ticker: str) -> dict:
             "current_price": 0.0,
             "signals_df": [],
             "latest_signals": {},
-            "sentiment_score": 0.0,
+            "sentiment_score": None,
             "macro_df": [],
             "forecast_available": False,
         }
