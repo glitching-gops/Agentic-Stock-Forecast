@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+/*
+  Palette lineage is deliberate: cyan #00B4D8, mint #06D6A0, amber #FFB703 and
+  rose #EF476F are carried over from the Streamlit theme so the app still reads
+  as the same product. The surfaces underneath them are new — the old #0D1B3E
+  base sat too close to its own cards to separate them without borders.
+*/
+@theme {
+  --color-ink-900: #060b1a;
+  --color-ink-800: #0a1129;
+  --color-ink-700: #0f1834;
+  --color-ink-600: #16203f;
+  --color-ink-500: #1e2b52;
+  --color-ink-400: #2b3a66;
+
+  --color-mist-500: #64748b;
+  --color-mist-400: #8c9bb8;
+  --color-mist-300: #b6c2d9;
+  --color-mist-100: #e8f0fe;
+
+  --color-brand-500: #00b4d8;
+  --color-brand-400: #22c9e8;
+  --color-brand-300: #67e0f5;
+
+  --color-pos-500: #06d6a0;
+  --color-neg-500: #ef476f;
+  --color-warn-500: #ffb703;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+/*
+  Single-theme by intent. A dashboard whose whole job is to say "this signal is
+  absent" should not also be negotiating two colour schemes; the semantic
+  colours (mint = outperform, rose = underperform) are tuned for one background.
+*/
+html {
+  color-scheme: dark;
+  background-color: var(--color-ink-900);
+}
+
+body {
+  background-color: var(--color-ink-900);
+  color: var(--color-mist-100);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tabular figures everywhere a number sits in a column. */
+.nums {
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background-color: color-mix(in srgb, var(--color-brand-500) 35%, transparent);
+}
+
+/* Scrollbars — the default light thumb is jarring on this background. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-500) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-ink-500);
+  border-radius: 999px;
+  border: 2px solid var(--color-ink-900);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Recharts injects inline focus outlines on its surfaces; suppress only those. */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}
