@@ -645,13 +645,46 @@ def test_leaderboard_total_counts_matches_not_page_size():
     `total` must report how many rows matched, not how many were returned.
     Returning len(entries) made it a restatement of `limit`, hiding the
     difference between a leaderboard holding 5 rows and one holding 500.
-    """
-    source = (REPO / "api" / "routers" / "leaderboard.py").read_text(encoding="utf-8")
 
-    assert "total=len(entries)" not in source
-    assert "total_matching = len(df)" in source
-    # The count must be taken before the page is sliced.
-    assert source.index("total_matching = len(df)") < source.index("df.head(limit)")
+    Asserted through the endpoint rather than by grepping its source: the
+    previous version of this test pinned the literal line `total_matching =
+    len(df)`, which passed for the right reason exactly once and then failed
+    the moment the count moved into SQL without the behaviour changing at all.
+    """
+    rows = [("CANBK.NS", 23.86, "RANKED", "Financial Services"),
+            ("ADANIPOWER.NS", 13.64, "RANKED", "Power")]
+    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "Power") for i in range(30)]
+    engine = _leaderboard_api_fixture(rows)
+
+    page = _call_leaderboard(engine, limit=5)
+
+    assert len(page.entries) == 5, "the page must still be capped by limit"
+    assert page.total == 32, (
+        f"total must count the 32 matching rows, not the 5 returned; "
+        f"got {page.total}")
+
+
+def test_leaderboard_filters_and_ranks_the_full_match_set_not_the_page():
+    """
+    Filtering, counting and ranking must all happen over the matched set
+    before the page is sliced. Ranking within the page would restart the
+    numbering on every request, so the same stock would carry a different
+    rank depending on the caller's `limit`.
+    """
+    rows = [("CANBK.NS", 23.86, "RANKED", "Financial Services"),
+            ("ADANIPOWER.NS", 13.64, "RANKED", "Power")]
+    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "Power") for i in range(30)]
+    engine = _leaderboard_api_fixture(rows)
+
+    power = _call_leaderboard(engine, sector="Power", limit=5)
+
+    assert power.total == 31, "the filter must be applied before the count"
+    assert power.filters_applied == {"sector": "Power"}
+    assert [e.ticker for e in power.entries][0] == "ADANIPOWER.NS"
+    assert [e.rank for e in power.entries] == [1, 2, 2, 2, 2], (
+        "CANBK is filtered out, so ADANIPOWER leads the Power sector at rank 1 "
+        "and the tied zeros all take rank 2 — even where the page cuts the "
+        f"tie group in half; got {[e.rank for e in power.entries]}")
 
 
 # ── A composite of 0.0 must say which kind of zero it is ──────────────────────
@@ -1100,6 +1133,52 @@ def test_conviction_requires_the_point_forecast_to_agree():
 
 # ── Rank must not invent an ordering the score cannot support ─────────────────
 
+def _leaderboard_api_fixture(rows):
+    """
+    An in-memory leaderboard table. `rows` is (ticker, score, basis, sector).
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")          # single shared connection
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE leaderboard (ticker TEXT, company TEXT, sector TEXT, "
+            "composite_score REAL, score_basis TEXT, upside_pct REAL, "
+            "critic_verdict TEXT, forecast_confidence TEXT, last_updated TEXT)"))
+        for ticker, score, basis, sector in rows:
+            conn.execute(
+                text("INSERT INTO leaderboard VALUES (:t, :t, :sec, :s, :b, 1.0, "
+                     "'REJECTED', 'INSUFFICIENT', '2026-08-17')"),
+                {"t": ticker, "s": score, "b": basis, "sec": sector})
+        conn.commit()
+    return engine
+
+
+def _call_leaderboard(engine, **kwargs):
+    """
+    Calls the endpoint against `engine`.
+
+    Every argument is passed explicitly because calling the endpoint outside a
+    request leaves FastAPI's Query() defaults unresolved. The column cache is
+    cleared on both sides so a fixture engine's schema never leaks into another
+    test through the lru_cache.
+    """
+    import api.routers.leaderboard as lb
+
+    args = dict(sector=None, verdict=None, evidence=None,
+                sort_by="composite_score", limit=50)
+    args.update(kwargs)
+
+    original = lb.get_engine
+    lb.get_engine = lambda: engine
+    lb._leaderboard_columns.cache_clear()
+    try:
+        return lb.get_leaderboard(**args)
+    finally:
+        lb.get_engine = original
+        lb._leaderboard_columns.cache_clear()
+
+
 def test_tied_rows_share_a_rank():
     """
     93 of 95 rows share composite_score 0.0 under the 2-of-3 gate, and
@@ -1107,34 +1186,11 @@ def test_tied_rows_share_a_rank():
     pandas left them in — publishing "rank 47" as a fact about a stock the
     score cannot separate from 92 others.
     """
-    from sqlalchemy import create_engine, text
+    rows = [("CANBK.NS", 23.86, "RANKED", "S"),
+            ("ADANIPOWER.NS", 13.64, "RANKED", "S")]
+    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "S") for i in range(6)]
 
-    import api.routers.leaderboard as lb
-
-    engine = create_engine("sqlite://")
-    with engine.connect() as conn:
-        conn.execute(text(
-            "CREATE TABLE leaderboard (ticker TEXT, company TEXT, sector TEXT, "
-            "composite_score REAL, score_basis TEXT, upside_pct REAL, "
-            "critic_verdict TEXT, forecast_confidence TEXT, last_updated TEXT)"))
-        rows = [("CANBK.NS", 23.86, "RANKED"), ("ADANIPOWER.NS", 13.64, "RANKED")]
-        rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE") for i in range(6)]
-        for ticker, score, basis in rows:
-            conn.execute(
-                text("INSERT INTO leaderboard VALUES (:t, :t, 'S', :s, :b, 1.0, "
-                     "'REJECTED', 'INSUFFICIENT', '2026-08-17')"),
-                {"t": ticker, "s": score, "b": basis})
-        conn.commit()
-
-    original = lb.get_engine
-    lb.get_engine = lambda: engine
-    try:
-        # Every argument is passed explicitly: calling the endpoint outside a
-        # request leaves FastAPI's Query() defaults unresolved.
-        response = lb.get_leaderboard(sector=None, verdict=None, evidence=None,
-                                      sort_by="composite_score", limit=50)
-    finally:
-        lb.get_engine = original
+    response = _call_leaderboard(_leaderboard_api_fixture(rows))
 
     ranks = [e.rank for e in response.entries]
     assert response.total == 8
