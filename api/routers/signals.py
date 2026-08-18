@@ -1,60 +1,67 @@
 """
-GET /api/signals/{ticker} — returns the historical signals DataFrame and
-the most recent row as latest_signals, used by the dashboard chart and
-signals view components. Reads directly from the signals table in the DB.
+GET /api/signals/{ticker} — the historical signals frame plus its most recent
+row as `latest_signals`, used by the dashboard chart and signals view. Reads
+directly from the signals table.
 """
-from fastapi import APIRouter, HTTPException
-from data.db import get_engine
 import pandas as pd
+from fastapi import APIRouter, HTTPException, Query
+from sqlalchemy import text
+
+from api.serialization import json_safe, records
+from data.db import get_engine
 
 router = APIRouter()
 
+
 @router.get("/{ticker}")
-def get_signals(ticker: str, days: int = 200):
+def get_signals(ticker: str, days: int = Query(200, ge=1, le=2000)):
     """
-    Returns up to `days` rows of signals data for the given ticker,
-    sorted ascending by date, plus the most recent row as `latest_signals`.
+    Up to `days` rows for `ticker`, oldest first, plus `latest_signals`.
+
+    Bound parameters only. The previous version tried a bound query and, on any
+    exception, fell back to a second query with the ticker and row count
+    interpolated straight into the SQL string — the exact pattern audit finding
+    F15 removed from the neighbouring router, left behind here. It was not
+    reachable in normal operation (the bound query does not raise), which is
+    precisely what let it survive: an injection sink one unrelated exception
+    away from being live. There is no fallback now.
     """
-    engine = get_engine()
     try:
         df = pd.read_sql(
-            "SELECT * FROM signals WHERE ticker = :ticker ORDER BY date DESC LIMIT :days",
-            con=engine,
-            params={"ticker": ticker.upper(), "days": days}
+            text("SELECT * FROM signals WHERE ticker = :ticker "
+                 "ORDER BY date DESC LIMIT :days"),
+            con=get_engine(),
+            params={"ticker": ticker.upper(), "days": days},
         )
-    except Exception as e:
-        # Fallback: try without named params for SQLite
-        try:
-            df = pd.read_sql(
-                f"SELECT * FROM signals WHERE ticker = '{ticker.upper()}' ORDER BY date DESC LIMIT {days}",
-                con=engine,
-            )
-        except Exception as e2:
-            raise HTTPException(status_code=500, detail=str(e2))
+    except Exception as exc:                                    # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch signals for {ticker}: {exc}",
+        ) from exc
 
     if df.empty:
         raise HTTPException(
             status_code=404,
-            detail=f"No signal data found for {ticker}. Run the pipeline first."
+            detail=f"No signal data found for {ticker}. Run the pipeline first.",
         )
 
-    # Return in ascending order for charting
     df = df.sort_values("date", ascending=True)
 
-    # Replace NaN/inf with None so JSON serialisation works
-    df = df.where(df.notna(), other=None)
+    # NaN must be replaced on the way out, not masked with df.where(): pandas
+    # coerces None back to NaN in a float column, and json.dumps then refuses
+    # the response with a 500. See api/serialization.py.
+    rows = records(df)
 
-    # Latest signals dict from the most recent row
-    latest_row = df.iloc[-1].to_dict()
+    latest = rows[-1]
     latest_signals = {
-        k: (float(v) if isinstance(v, float) and pd.notna(v) else (None if pd.isna(v) else v))
-        for k, v in latest_row.items()
-        if k not in ("date", "ticker", "target")
+        key: json_safe(value)
+        for key, value in latest.items()
+        if key not in ("date", "ticker", "target")
     }
 
     return {
         "ticker": ticker.upper(),
-        "signals_df": df.to_dict(orient="records"),
+        "signals_df": rows,
         "latest_signals": latest_signals,
-        "rows": len(df),
+        "rows": len(rows),
     }

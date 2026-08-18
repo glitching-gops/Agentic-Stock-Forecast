@@ -1311,3 +1311,143 @@ def test_universe_screen_does_not_query_per_ticker():
     assert len(large_queries) <= 3, (
         f"the whole screen must take a constant handful of queries, "
         f"got {len(large_queries)}")
+
+
+# ── Signals endpoints: JSON serialisation and the removed SQL fallback ──────
+#
+# Both signals endpoints returned 500 for EVERY ticker. `df.where(df.notna(),
+# other=None)` reads as "null out the missing values" and does not: pandas
+# cannot hold None in a float64 column, so it coerces straight back to NaN and
+# json.dumps refuses the response. It was invisible because the last
+# HORIZON_SESSIONS rows of `signals` always carry a null target — the label
+# looks 30 sessions into a future that has not happened — and because the
+# dashboard's bare `except` turned the 500 into a blank chart.
+
+def _signals_fixture():
+    """
+    A signals table shaped like the real one.
+
+    Carries every column `/api/stocks/{ticker}/signals` names explicitly, plus:
+    a fully populated float column; a forward-looking label whose most recent
+    rows are null exactly as the real one's are; and an infinity, which
+    json.dumps emits as bare `Infinity` — valid JavaScript, invalid JSON.
+    """
+    from sqlalchemy import create_engine, text
+
+    columns = [
+        "close", "rsi", "macd_hist", "bb_width", "obv", "sma_20", "ema_9",
+        "ema_21", "ema_50", "atr_14", "stoch_k", "williams_r", "roc_10",
+        "vroc_10", "prox_52w", "lag1_ret", "lag5_ret", "dev_sma50", "bb_upper",
+        "bb_lower", "hurst", "sector_rel_5d", "sector_rel_10d",
+        "sector_rel_20d", "earnings_surprise", "target_return",
+        "target_excess_return", "benchmark_return",
+    ]
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE signals (ticker TEXT, date TEXT, "
+            + ", ".join(f"{c} REAL" for c in columns)
+            + ", benchmark_ticker TEXT)"))
+
+        placeholders = ", ".join(f":{c}" for c in columns)
+        for i in range(10):
+            values = {c: float(i) for c in columns}
+            values["close"] = 100.0 + i
+            values["rsi"] = float("inf") if i == 3 else 50.0 + i
+            # The trailing rows have no label yet, like every real ticker.
+            for label in ("target_return", "target_excess_return",
+                          "benchmark_return"):
+                values[label] = None if i >= 7 else 0.01 * i
+            conn.execute(
+                text(f"INSERT INTO signals VALUES (:t, :d, {placeholders}, "
+                     f"'^NSEI')"),
+                {"t": "TEST.NS", "d": f"2026-08-{i + 1:02d}", **values},
+            )
+        conn.commit()
+    return engine
+
+
+def _call_signals(engine, ticker="TEST.NS", days=200):
+    import api.routers.signals as sig
+
+    original = sig.get_engine
+    sig.get_engine = lambda: engine
+    try:
+        return sig.get_signals(ticker, days=days)
+    finally:
+        sig.get_engine = original
+
+
+def test_signals_response_is_json_serialisable():
+    """
+    The guarantee, asserted the way Starlette asserts it: json.dumps must
+    accept the response with allow_nan disabled, which is exactly what
+    JSONResponse does.
+    """
+    import json
+
+    payload = _call_signals(_signals_fixture())
+
+    try:
+        json.dumps(payload, allow_nan=False)
+    except ValueError as exc:                                   # pragma: no cover
+        pytest.fail(
+            f"signals response is not JSON serialisable: {exc}. "
+            "A non-finite float reached the response; json.dumps rejects it "
+            "and FastAPI turns that into a 500 for every ticker."
+        )
+
+    nulled = [row["target_excess_return"] for row in payload["signals_df"][-3:]]
+    assert nulled == [None, None, None], (
+        f"unlabelled trailing rows must serialise as null, got {nulled}"
+    )
+    assert payload["signals_df"][3]["rsi"] is None, (
+        "a non-finite float must serialise as null, not as bare Infinity"
+    )
+
+
+def test_stocks_signals_response_is_json_serialisable():
+    """The same defect lived in the second copy of this endpoint."""
+    import json
+
+    import api.routers.stocks as stocks
+    import data.db
+
+    engine = _signals_fixture()
+    real = data.db.get_engine
+    data.db.get_engine = lambda: engine
+    try:
+        rows = stocks.get_signals("TEST.NS", days=200)
+    finally:
+        data.db.get_engine = real
+
+    try:
+        json.dumps(rows, allow_nan=False)
+    except ValueError as exc:                                   # pragma: no cover
+        pytest.fail(
+            f"/api/stocks/{{ticker}}/signals is not JSON serialisable: {exc}")
+
+    assert rows[-1]["target_excess_return"] is None, (
+        "unlabelled trailing rows must serialise as null")
+
+
+def test_signals_router_has_no_interpolated_sql_fallback():
+    """
+    F15 removed f-string SQL interpolation of a URL-supplied ticker from the
+    neighbouring router and left this copy behind, as a fallback that only ran
+    if the bound query raised. It never did, which is what let an injection
+    sink sit one unrelated exception away from being live.
+
+    Asserted behaviourally: a tautology payload must return nothing, not the
+    whole table.
+    """
+    engine = _signals_fixture()
+    with pytest.raises(Exception) as caught:
+        _call_signals(engine, ticker="TEST.NS' OR '1'='1")
+
+    # A 404 (no such ticker) is the correct outcome; anything that returns rows
+    # means the predicate was defeated.
+    assert getattr(caught.value, "status_code", None) == 404, (
+        f"an injection payload must match no ticker, got {caught.value!r}"
+    )

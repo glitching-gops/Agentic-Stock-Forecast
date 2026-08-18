@@ -3,6 +3,7 @@ GET /api/stocks — returns the full list of tickers with company name and secto
 """
 from fastapi import APIRouter
 from api.schemas.stock import StockList, StockInfo
+from api.serialization import records
 from data.tickers import get_company, get_sector
 
 router = APIRouter()
@@ -69,6 +70,7 @@ def get_signals(ticker: str, days: int = 30):
         ) from e
 
     df = df.sort_values("date", ascending=True)
-    # Replace NaN/inf with None so JSON serialisation works
-    df = df.where(df.notna(), other=None)
-    return df.to_dict(orient="records")
+    # df.where(df.notna(), None) claimed to do this and did not: pandas coerces
+    # None back to NaN in a float column, and json.dumps then 500s the whole
+    # response. See api/serialization.py.
+    return records(df)
