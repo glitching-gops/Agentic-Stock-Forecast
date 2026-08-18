@@ -5,6 +5,7 @@ One test (or group) per finding. Each fails if the defect returns.
 """
 
 import inspect
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -1142,3 +1143,115 @@ def test_tied_rows_share_a_rank():
         f"tied rows must share a rank, got {ranks[2:]}"
     )
     assert max(ranks) == 3, "no row may be numbered past the last real ordering"
+
+
+# ── /api/stocks latency: the universe screen must not be N+1 ──────────────────
+
+AS_OF = "2026-08-18"
+TEST_RULE_KWARGS = dict(min_listing_days=10, liquidity_window=5,
+                        liquidity_floor_inr=1000)
+
+
+def _universe_fixture(liquid_fillers: int = 0):
+    """
+    An in-memory ohlcv + index_membership pair with one ticker per outcome.
+
+    Dates run consecutively up to AS_OF so the liquidity window (as_of minus
+    2 x liquidity_window days) captures the recent rows.
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")          # single shared connection
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE ohlcv (date TEXT, ticker TEXT, "
+                          "close REAL, volume REAL)"))
+        conn.execute(text("CREATE TABLE index_membership (ticker TEXT, "
+                          "index_name TEXT, effective_from TEXT, "
+                          "effective_to TEXT, company TEXT, industry TEXT, "
+                          "source TEXT)"))
+
+        def member(ticker):
+            conn.execute(
+                text("INSERT INTO index_membership VALUES (:t, 'NIFTY100', "
+                     "'2020-01-01', '9999-12-31', :t, 'X', 'test')"),
+                {"t": ticker})
+
+        def bars(ticker, n, close, volume):
+            for i in range(n):
+                day = (date.fromisoformat(AS_OF) - timedelta(days=i)).isoformat()
+                conn.execute(
+                    text("INSERT INTO ohlcv VALUES (:d, :t, :c, :v)"),
+                    {"d": day, "t": ticker, "c": close, "v": volume})
+
+        member("LIQUID.NS");   bars("LIQUID.NS",   12, 100.0, 100.0)
+        member("ILLIQUID.NS"); bars("ILLIQUID.NS", 12,   1.0,   1.0)
+        member("SHORT.NS");    bars("SHORT.NS",     5, 100.0, 100.0)
+        member("NODATA.NS")    # in the index, never ingested
+
+        for i in range(liquid_fillers):
+            t = f"FILL{i}.NS"
+            member(t); bars(t, 12, 100.0, 100.0)
+
+        conn.commit()
+    return engine
+
+
+def _screen(engine, rule):
+    """Runs get_universe against `engine`, counting SELECTs against ohlcv."""
+    from sqlalchemy import event
+    import data.universe as uni
+
+    ohlcv_queries = []
+
+    def record(conn, cursor, statement, params, context, executemany):
+        if "ohlcv" in statement.lower():
+            ohlcv_queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    original = uni.get_engine
+    uni.get_engine = lambda: engine
+    try:
+        result = uni.get_universe(as_of=AS_OF, rule=rule)
+    finally:
+        uni.get_engine = original
+        event.remove(engine, "before_cursor_execute", record)
+
+    return result, ohlcv_queries
+
+
+def test_universe_screen_decisions_are_unchanged():
+    """
+    The bulk-query rewrite must screen exactly as the per-ticker loop did:
+    liquid + long history is kept, and each rejection reason still rejects.
+    """
+    from data.universe import UniverseRule
+
+    rule = UniverseRule(**TEST_RULE_KWARGS)
+    universe, _ = _screen(_universe_fixture(), rule)
+
+    assert universe == ["LIQUID.NS"], (
+        f"expected only the liquid, long-history name; got {universe}")
+
+
+def test_universe_screen_does_not_query_per_ticker():
+    """
+    get_universe() ran two queries PER TICKER inside a Python loop — ~200
+    sequential round trips to Supabase for a 100-name index, on every call.
+    /api/stocks calls this on every request and was measured at 51 seconds
+    against a warm Render instance, which is what made the dashboard slow to
+    open. The query count must not scale with the size of the universe.
+    """
+    from data.universe import UniverseRule
+
+    rule = UniverseRule(**TEST_RULE_KWARGS)
+
+    small, small_queries = _screen(_universe_fixture(liquid_fillers=1), rule)
+    large, large_queries = _screen(_universe_fixture(liquid_fillers=40), rule)
+
+    assert len(small) == 2 and len(large) == 41, "fixture sanity"
+    assert len(large_queries) == len(small_queries), (
+        f"query count scales with universe size: {len(small_queries)} queries "
+        f"for 5 tickers vs {len(large_queries)} for 44 — the N+1 is back")
+    assert len(large_queries) <= 3, (
+        f"the whole screen must take a constant handful of queries, "
+        f"got {len(large_queries)}")

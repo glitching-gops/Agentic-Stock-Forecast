@@ -46,7 +46,7 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from data.db import get_engine
 
@@ -327,6 +327,22 @@ def get_universe(
     Applies index membership, then the liquidity floor and listing-history
     minimum, both computed only from data dated on or before ``as_of``. No step
     references model output, forecast accuracy, or realised returns.
+
+    SCREENS THE WHOLE UNIVERSE IN TWO QUERIES. This used to run two queries per
+    ticker inside a Python loop — roughly 200 sequential round trips to Supabase
+    for a 100-name index, on every single call. That is invisible inside a
+    pipeline run that already takes 40 minutes, but ``/api/stocks`` calls this
+    on every request, and it was measured at 51 SECONDS against a fully warm
+    Render instance (health check 0.22s immediately before, so not a cold
+    start). The dashboard's stock-detail page calls that endpoint first and
+    halts until it returns, which is the entire reason the app felt slow to
+    open.
+
+    The screen itself is unchanged: the same row counts, the same 20-most-
+    recent-sessions median traded value, the same thresholds, the same
+    decisions. Only the number of round trips changed. The median stays in
+    pandas rather than becoming SQL because SQLite has no percentile function
+    and the two dialects must not disagree about who is in the universe.
     """
     as_of = as_of or date.today().isoformat()
     members = get_index_members(as_of, rule.index_name)
@@ -340,25 +356,52 @@ def get_universe(
     window_start = (date.fromisoformat(as_of)
                     - timedelta(days=rule.liquidity_window * 2)).isoformat()
 
+    def over_members(sql: str):
+        """`sql` must contain the `:tickers` placeholder for the IN list."""
+        return text(sql).bindparams(bindparam("tickers", expanding=True))
+
+    # How much history each member has, as of the cutoff. One row per ticker;
+    # tickers absent from ohlcv entirely are simply absent here, which is the
+    # "never ingested" case the reporting below distinguishes.
+    history = pd.read_sql(
+        over_members("""
+            SELECT ticker, COUNT(*) AS n FROM ohlcv
+            WHERE ticker IN :tickers AND date <= :d
+            GROUP BY ticker
+        """),
+        engine, params={"tickers": list(members), "d": as_of},
+    )
+    row_counts: dict[str, int] = (
+        {} if history.empty
+        else dict(zip(history["ticker"], history["n"].astype(int)))
+    )
+
+    # The liquidity window for every member at once. Bounded by window_start,
+    # so this is ~20-30 rows per ticker, not the full price history.
+    window = pd.read_sql(
+        over_members("""
+            SELECT ticker, date, close, volume FROM ohlcv
+            WHERE ticker IN :tickers AND date <= :d AND date >= :w
+        """),
+        engine,
+        params={"tickers": list(members), "d": as_of, "w": window_start},
+    )
+    if window.empty:
+        window_by_ticker: dict[str, pd.DataFrame] = {}
+    else:
+        # date DESC per ticker, matching the old per-ticker ORDER BY, so that
+        # head(liquidity_window) still means "the most recent N sessions".
+        window = window.sort_values(["ticker", "date"], ascending=[True, False])
+        window_by_ticker = dict(tuple(window.groupby("ticker", sort=False)))
+
     keep: list[str] = []
     no_data: list[str] = []
     too_short: list[str] = []
     illiquid: list[str] = []
 
     for ticker in members:
-        stats = pd.read_sql(
-            text("""
-                SELECT close, volume FROM ohlcv
-                WHERE ticker = :t AND date <= :d AND date >= :w
-                ORDER BY date DESC
-            """),
-            engine, params={"t": ticker, "d": as_of, "w": window_start},
-        )
-        history = pd.read_sql(
-            text("SELECT COUNT(*) AS n FROM ohlcv WHERE ticker = :t AND date <= :d"),
-            engine, params={"t": ticker, "d": as_of},
-        )
-        n_rows = int(history["n"].iloc[0]) if not history.empty else 0
+        n_rows = row_counts.get(ticker, 0)
+        stats = window_by_ticker.get(ticker)
 
         if n_rows == 0:
             no_data.append(ticker)
@@ -366,7 +409,7 @@ def get_universe(
         if n_rows < rule.min_listing_days:
             too_short.append(ticker)
             continue
-        if stats.empty:
+        if stats is None or stats.empty:
             no_data.append(ticker)
             continue
 
