@@ -48,16 +48,32 @@ def _score_parts(
 
     signal      (0-60)  predicted excess return, saturating at +10% over 30
                         sessions so one extreme forecast cannot dominate.
-    conviction  (0-40)  distance of P(outperform) from a coin flip.
+    conviction  (0-40)  distance of P(outperform) from a coin flip, but ONLY
+                        when the point forecast agrees that the move is up.
 
     Both floor at zero, which is what makes the composite a LONG-ONLY ranking:
     a confidently predicted underperformer scores exactly the same as a
     confidently predicted flat one. classify_score_basis() exists to keep that
     fact visible rather than buried in a 0.0.
+
+    Conviction used to be computed independently of the point forecast, and
+    that was not long-only at all. PNB.NS ranked THIRD on the live leaderboard
+    on 2026-08-17 while forecasting a 1.69% UNDERPERFORMANCE: signal floored to
+    0.00 as intended, but conviction still collected 10.75 points from a
+    prob_outperform of 0.567, and 0.38 survived the flag deduction. The two
+    inputs disagreed and the score quietly sided with the one that scored
+    higher.
+
+    They disagree for a real reason — prob_positive(-0.0169) is the fraction of
+    calibration residuals above +0.0169, so a value over 0.5 means the model is
+    biased LOW for that ticker — but "the point forecast says down, the
+    calibrated probability says up" is not a ranking signal. It is a statement
+    that the model contradicts itself, and the honest response is to rank it
+    nowhere rather than to pick the cheerier half.
     """
     signal = min(max(pred_excess_return, 0.0) / 0.10, 1.0) * 60.0
 
-    if prob_outperform is None:
+    if pred_excess_return <= 0.0 or prob_outperform is None:
         conviction = 0.0
     else:
         conviction = min(max(prob_outperform - 0.5, 0.0) / 0.25, 1.0) * 40.0

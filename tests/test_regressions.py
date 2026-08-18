@@ -1055,3 +1055,90 @@ def test_weekly_job_aborts_if_recomputing_signals_destroys_labels():
     assert source.index("compute_and_store(tickers=") < source.index(
         "labelled_after < labelled_before"
     ) < source.index("evaluate_and_persist_universe(")
+
+
+# ── Conviction must not outvote the point forecast ────────────────────────────
+
+def test_conviction_requires_the_point_forecast_to_agree():
+    """
+    The composite claimed to rank long candidates only, and did not. PNB.NS
+    ranked THIRD on the live leaderboard on 2026-08-17 while forecasting a
+    1.69% underperformance: signal floored to 0.00 as designed, but conviction
+    independently collected 10.75 points from prob_outperform=0.567 and 0.38
+    survived the flag deduction.
+
+    The disagreement is real — prob_positive(-0.0169) is the share of
+    calibration residuals above +0.0169, so >0.5 means the model is biased low
+    — but a row whose point forecast and calibrated probability point opposite
+    ways is not a ranking signal, and the score must not quietly side with
+    whichever half scores higher.
+    """
+    from agents.graph import _score_parts, classify_score_basis, compute_composite_score
+
+    # PNB.NS, exactly as served.
+    signal, conviction = _score_parts(-0.0169213, 0.567196)
+    assert signal == 0.0
+    assert conviction == 0.0, "a predicted decline must earn no conviction points"
+    assert compute_composite_score(-0.0169213, "WEAK", 0.567196, 1) == 0.0
+    assert classify_score_basis(-0.0169213, "WEAK", 0.567196, 1) == "NOT_LONG"
+
+    # A genuine long candidate is untouched (CANBK.NS).
+    signal, conviction = _score_parts(0.0295344, 0.753968)
+    assert signal > 0 and conviction == 40.0
+    assert compute_composite_score(0.0295344, "WEAK", 0.753968, 1) == 23.86
+
+    # The narrative gate and the score must now agree on what "rankable" means:
+    # neither admits a non-positive predicted excess return.
+    from agents.forecasting_agent import _deserves_a_written_narrative
+
+    for pred in (-0.02, 0.0):
+        assert compute_composite_score(pred, "STRONG", 0.99) == 0.0
+        assert _deserves_a_written_narrative(
+            {"eval_evaluated_at": "2026-08-16", "pred_excess_return": pred}) is False
+
+
+# ── Rank must not invent an ordering the score cannot support ─────────────────
+
+def test_tied_rows_share_a_rank():
+    """
+    93 of 95 rows share composite_score 0.0 under the 2-of-3 gate, and
+    positional numbering handed them ranks 3 through 95 from whatever order
+    pandas left them in — publishing "rank 47" as a fact about a stock the
+    score cannot separate from 92 others.
+    """
+    from sqlalchemy import create_engine, text
+
+    import api.routers.leaderboard as lb
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE leaderboard (ticker TEXT, company TEXT, sector TEXT, "
+            "composite_score REAL, score_basis TEXT, upside_pct REAL, "
+            "critic_verdict TEXT, forecast_confidence TEXT, last_updated TEXT)"))
+        rows = [("CANBK.NS", 23.86, "RANKED"), ("ADANIPOWER.NS", 13.64, "RANKED")]
+        rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE") for i in range(6)]
+        for ticker, score, basis in rows:
+            conn.execute(
+                text("INSERT INTO leaderboard VALUES (:t, :t, 'S', :s, :b, 1.0, "
+                     "'REJECTED', 'INSUFFICIENT', '2026-08-17')"),
+                {"t": ticker, "s": score, "b": basis})
+        conn.commit()
+
+    original = lb.get_engine
+    lb.get_engine = lambda: engine
+    try:
+        # Every argument is passed explicitly: calling the endpoint outside a
+        # request leaves FastAPI's Query() defaults unresolved.
+        response = lb.get_leaderboard(sector=None, verdict=None, evidence=None,
+                                      sort_by="composite_score", limit=50)
+    finally:
+        lb.get_engine = original
+
+    ranks = [e.rank for e in response.entries]
+    assert response.total == 8
+    assert ranks[:2] == [1, 2], "the two scoring rows rank normally"
+    assert ranks[2:] == [3] * 6, (
+        f"tied rows must share a rank, got {ranks[2:]}"
+    )
+    assert max(ranks) == 3, "no row may be numbered past the last real ordering"

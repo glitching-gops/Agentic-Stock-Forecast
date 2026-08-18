@@ -76,8 +76,22 @@ def get_leaderboard(
     # from "the page is capped".
     total_matching = len(df)
 
+    # Competition ranking on the sort key, computed BEFORE the page is sliced.
+    #
+    # Positional numbering asserted an ordering that does not exist. Under the
+    # 2-of-3 evidence gate, 93 of 95 rows share composite_score 0.0, and
+    # `range(1, len+1)` handed them ranks 3 through 95 purely from the order
+    # pandas happened to leave them in — so the API published "rank 47" as a
+    # fact about a stock the score cannot separate from 92 others. Tied rows
+    # now share a rank (1, 2, 3, 3, 3, ...), which says what is true: the
+    # ordering ran out. A row with no value for the sort key gets no rank.
+    if key in df.columns:
+        df["rank"] = (df[key].rank(method="min", ascending=SORTABLE[key])
+                             .astype("Int64"))
+    else:
+        df["rank"] = pd.array(range(1, len(df) + 1), dtype="Int64")
+
     df = df.head(limit).reset_index(drop=True)
-    df["rank"] = range(1, len(df) + 1)
 
     def _bool(value):
         return None if value is None or pd.isna(value) else bool(value)

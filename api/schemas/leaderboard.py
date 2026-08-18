@@ -4,7 +4,11 @@ from pydantic import BaseModel, Field
 
 
 class LeaderboardEntry(BaseModel):
-    rank: int
+    rank: Optional[int] = Field(
+        None, description="Competition rank on the applied sort key. Tied rows "
+                          "SHARE a rank (1, 2, 3, 3, 3, ...) rather than being "
+                          "numbered off arbitrarily — most rows tie at "
+                          "composite_score 0.0. Null when the sort key is null.")
     ticker: str
     company: Optional[str] = None
     sector: Optional[str] = None
@@ -60,8 +64,11 @@ class LeaderboardResponse(BaseModel):
             "evaluation with a 30-session embargo. Metrics are out-of-sample. "
             "The composite score is a ranking heuristic, not an expected return, "
             "and is reported before transaction costs. It ranks LONG candidates "
-            "only: a predicted underperformer floors at zero rather than ranking "
-            "below one, so read score_basis before reading a 0.0 as 'no signal'."
+            "only: conviction counts only where the point forecast also predicts "
+            "outperformance, so a predicted underperformer floors at zero rather "
+            "than ranking below one. Read score_basis before reading a 0.0 as "
+            "'no signal', and note that tied rows SHARE a rank rather than being "
+            "numbered off in an order the score does not support."
         ),
         description="How to read these numbers.",
     )
