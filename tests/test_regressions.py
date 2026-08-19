@@ -1636,14 +1636,29 @@ def test_compute_signals_frame_skips_a_benchmark_that_does_not_align():
 # dashboard two days later.
 
 def _stub_daily(monkeypatch, **overrides):
-    """Neutralises the daily job's dependencies, then applies overrides."""
+    """
+    Neutralises the daily job's dependencies, then applies overrides.
+
+    Everything the job touches is stubbed, including the network (yfinance,
+    Groq) and the database. A scheduler test that reaches either is not testing
+    control flow, it is testing the internet.
+    """
     import agents.graph
     import data.tickers
     import data.universe
+    import pipeline.corporate_actions
     import pipeline.fetch
     import pipeline.macro
+    import pipeline.outcomes
     import pipeline.sentiment
     import pipeline.signals
+    import pipeline.tracking
+    import pipeline.validation
+
+    passing_gate = pipeline.validation.GateReport(
+        pipeline.validation.PASS,
+        [pipeline.validation.Check("stub", pipeline.validation.PASS, "stubbed")],
+    )
 
     defaults = {
         (data.universe, "sync_current_membership"): lambda: None,
@@ -1651,9 +1666,16 @@ def _stub_daily(monkeypatch, **overrides):
         (data.universe, "get_ingest_universe"): lambda: ["A.NS"],
         (data.universe, "get_universe"): lambda: ["A.NS"],
         (pipeline.fetch, "fetch_and_store"): lambda **k: None,
+        (pipeline.corporate_actions, "fetch_and_store"):
+            lambda **k: pipeline.corporate_actions.ActionsReport(1, 0, 0, []),
         (pipeline.signals, "compute_and_store"):
             lambda **k: pipeline.signals.SignalsReport(10, ["A.NS"], [], []),
         (pipeline.signals, "count_labelled_rows"): lambda *a: 100,
+        (pipeline.validation, "run_gate"): lambda *a, **k: passing_gate,
+        (pipeline.tracking, "start_run"): lambda *a, **k: "test-run",
+        (pipeline.tracking, "finish_run"): lambda *a, **k: None,
+        (pipeline.outcomes, "resolve_due_forecasts"):
+            lambda *a, **k: pipeline.outcomes.OutcomeReport(0, 0, 0, 0),
         (pipeline.sentiment, "fetch_and_score"): lambda **k: None,
         (pipeline.macro, "fetch_and_store"): lambda: None,
         (agents.graph, "run_graph"): lambda t: {"forecast_available": True},
@@ -1662,6 +1684,93 @@ def _stub_daily(monkeypatch, **overrides):
     for (module, name), value in defaults.items():
         monkeypatch.setattr(module, name, overrides.pop(name, value))
     assert not overrides, f"unknown override: {list(overrides)}"
+
+
+def test_daily_job_aborts_when_the_validation_gate_fails(monkeypatch):
+    """
+    The gate sits after every write and before anything is published, so a FAIL
+    must stop the run rather than annotate it. Nothing downstream may execute.
+    """
+    import pipeline.validation
+    import scheduler
+
+    failing = pipeline.validation.GateReport(
+        pipeline.validation.FAIL,
+        [pipeline.validation.Check("duplicates", pipeline.validation.FAIL,
+                                   "412 duplicate (ticker, date) pairs")],
+    )
+    _stub_daily(monkeypatch,
+                run_gate=lambda *a, **k: failing,
+                run_graph=lambda t: pytest.fail("must not forecast after a gate FAIL"))
+
+    with pytest.raises(scheduler.PipelineAbort, match="gate FAILED"):
+        scheduler.run_pipeline_job()
+
+
+def test_daily_job_continues_when_the_gate_only_warns(monkeypatch):
+    """
+    A WARN is a degraded run, not a broken one. Failing on warnings is how a
+    gate gets switched off.
+    """
+    import pipeline.validation
+    import scheduler
+
+    warning = pipeline.validation.GateReport(
+        pipeline.validation.WARN,
+        [pipeline.validation.Check("price_breaks", pipeline.validation.WARN,
+                                   "corporate_actions is empty")],
+    )
+    _stub_daily(monkeypatch, run_gate=lambda *a, **k: warning)
+    scheduler.run_pipeline_job()          # must not raise
+
+
+def test_daily_job_records_the_run_even_when_it_aborts(monkeypatch):
+    """
+    An experiment_runs row left at RUNNING is indistinguishable from a process
+    that was killed. Every exit path that opened a row must close it.
+    """
+    import pipeline.validation
+    import scheduler
+
+    closed = {}
+    failing = pipeline.validation.GateReport(
+        pipeline.validation.FAIL,
+        [pipeline.validation.Check("x", pipeline.validation.FAIL, "boom")],
+    )
+    _stub_daily(
+        monkeypatch,
+        run_gate=lambda *a, **k: failing,
+        finish_run=lambda run_id, status, **k: closed.update(
+            run_id=run_id, status=status, gate=k.get("gate")),
+    )
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_pipeline_job()
+
+    assert closed.get("status") == "ABORTED"
+    assert closed.get("run_id") == "test-run"
+    assert closed.get("gate") is failing, (
+        "the gate report must reach the run record, or the reason for the "
+        "abort is only in the logs"
+    )
+
+
+def test_daily_job_resolves_matured_forecasts(monkeypatch):
+    """
+    forecast_outcomes had no writer at all. Nothing measured whether a
+    published forecast came true, so every accuracy figure the system reported
+    was a backtest number.
+    """
+    import scheduler
+
+    called = {}
+    _stub_daily(monkeypatch,
+                resolve_due_forecasts=lambda *a, **k: called.setdefault(
+                    "report", __import__("pipeline.outcomes", fromlist=["x"])
+                    .OutcomeReport(4, 1, 90, 0)))
+    scheduler.run_pipeline_job()
+
+    assert called, "the daily job must resolve matured forecasts"
 
 
 def test_daily_job_raises_when_the_universe_is_empty(monkeypatch):
@@ -1786,3 +1895,460 @@ def test_weekly_job_raises_when_labels_would_regress(monkeypatch):
 
     with pytest.raises(scheduler.PipelineAbort):
         scheduler.run_weekly_evaluation_job()
+
+# ── Phase 1: forecast_outcomes must actually be written ───────────────────────
+#
+# The table has existed since Phase 0 and nothing wrote to it, so every accuracy
+# figure the system reported was a BACKTEST figure — measured on held-out folds
+# by the process that fitted the model. Whether a forecast published on a given
+# date to a given reader turned out to be right had never been measured at all.
+
+def _outcomes_fixture(pred=0.05, realised=0.04, realised_total=0.06,
+                      low=95.0, high=125.0, price=100.0,
+                      forecast_benchmark="^CNXIT", label_benchmark="^CNXIT"):
+    """One published forecast and the matured label that resolves it."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")          # single shared connection
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE forecasts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT,
+                pred_excess_return REAL, interval_low REAL, interval_high REAL,
+                current_price REAL, benchmark_ticker TEXT, last_updated TEXT)
+        """))
+        conn.execute(text("""
+            CREATE TABLE signals (
+                ticker TEXT, date TEXT, close REAL, target_return REAL,
+                target_excess_return REAL, benchmark_return REAL,
+                benchmark_ticker TEXT)
+        """))
+        conn.execute(text("""
+            CREATE TABLE forecast_outcomes (
+                forecast_id INTEGER, ticker TEXT NOT NULL,
+                forecast_date TEXT NOT NULL, resolution_date TEXT,
+                pred_excess_return REAL, realised_excess_return REAL,
+                realised_return REAL, benchmark_return REAL,
+                direction_correct INTEGER, inside_interval INTEGER,
+                PRIMARY KEY (ticker, forecast_date))
+        """))
+
+        conn.execute(
+            text("INSERT INTO forecasts (ticker, pred_excess_return, interval_low, "
+                 "interval_high, current_price, benchmark_ticker, last_updated) "
+                 "VALUES ('TEST.NS', :p, :lo, :hi, :px, :b, '2026-06-01 18:30:00')"),
+            {"p": pred, "lo": low, "hi": high, "px": price, "b": forecast_benchmark},
+        )
+
+        # 40 sessions from the forecast date, so the 30-session horizon closes.
+        sessions = pd.bdate_range("2026-06-01", periods=40).strftime("%Y-%m-%d")
+        for i, day in enumerate(sessions):
+            conn.execute(
+                text("INSERT INTO signals VALUES (:t, :d, :c, :tr, :te, :br, :b)"),
+                {"t": "TEST.NS", "d": day, "c": price + i,
+                 "tr": realised_total if i == 0 else None,
+                 "te": realised if i == 0 else None,
+                 "br": (realised_total - realised) if (i == 0 and realised is not None) else None,
+                 "b": label_benchmark},
+            )
+        conn.commit()
+    return engine
+
+
+def _outcome_rows(engine):
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        return [dict(r._mapping) for r in
+                conn.execute(text("SELECT * FROM forecast_outcomes"))]
+
+
+def test_matured_forecasts_are_resolved_into_outcomes():
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture()
+    report = resolve_due_forecasts(engine=engine)
+
+    assert report.resolved == 1, f"nothing resolved: {report.summary()}"
+    row = _outcome_rows(engine)[0]
+    assert row["ticker"] == "TEST.NS"
+    assert row["forecast_date"] == "2026-06-01"
+    assert row["realised_excess_return"] == pytest.approx(0.04)
+    assert row["direction_correct"] == 1, (
+        "predicted +5% excess, realised +4% — same direction"
+    )
+
+
+def test_a_wrong_direction_is_recorded_as_wrong():
+    """The point of the table is that it can say no."""
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture(pred=0.05, realised=-0.03)
+    resolve_due_forecasts(engine=engine)
+
+    assert _outcome_rows(engine)[0]["direction_correct"] == 0
+
+
+def test_interval_coverage_is_scored_against_the_realised_price():
+    """
+    The published interval is a PRICE band, and the realised price follows from
+    the realised TOTAL return, not the excess one. Scoring it against the excess
+    return would flatter the interval whenever the benchmark moved.
+    """
+    from pipeline.outcomes import resolve_due_forecasts
+
+    # +6% total on 100.0 lands at ~106.2, inside [95, 125].
+    inside = _outcomes_fixture(realised_total=0.06, low=95.0, high=125.0)
+    resolve_due_forecasts(engine=inside)
+    assert _outcome_rows(inside)[0]["inside_interval"] == 1
+
+    # +60% total lands at ~182, outside the same band.
+    outside = _outcomes_fixture(realised_total=0.60, low=95.0, high=125.0)
+    resolve_due_forecasts(engine=outside)
+    assert _outcome_rows(outside)[0]["inside_interval"] == 0
+
+
+def test_resolution_is_idempotent():
+    """
+    A resolved outcome is a record, not a running total. Re-running the job must
+    not rewrite history — the table exists precisely so that a published claim
+    cannot be quietly improved after the fact.
+    """
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture()
+    first = resolve_due_forecasts(engine=engine)
+    second = resolve_due_forecasts(engine=engine)
+
+    assert first.resolved == 1
+    assert second.resolved == 0 and second.already_resolved == 1
+    assert len(_outcome_rows(engine)) == 1
+
+
+def test_a_forecast_is_not_resolved_under_a_different_benchmark():
+    """
+    The realised excess return depends on which index the ticker was measured
+    against. A forecast published against NIFTY IT and resolved against NIFTY 50
+    is not a test of that forecast — it is a test of the remapping.
+    """
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture(forecast_benchmark="^CNXIT",
+                               label_benchmark="^NSEI")
+    report = resolve_due_forecasts(engine=engine)
+
+    assert report.resolved == 0
+    assert report.benchmark_changed == 1
+    assert _outcome_rows(engine) == []
+
+
+def test_an_open_forecast_is_not_resolved():
+    """A null label means the horizon has not closed, not that the forecast failed."""
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture(realised=None)
+    report = resolve_due_forecasts(engine=engine)
+
+    assert report.resolved == 0 and report.not_due == 1
+
+
+def test_realised_accuracy_distinguishes_zero_from_unmeasured():
+    """
+    A hit rate of 0.0 and "nothing has matured yet" are different statements.
+    composite_score already collapses several meanings into one value; the
+    realised metrics must not repeat that.
+    """
+    from pipeline.outcomes import realised_accuracy, resolve_due_forecasts
+
+    engine = _outcomes_fixture()
+    assert realised_accuracy(engine=engine)["hit_rate"] is None
+
+    resolve_due_forecasts(engine=engine)
+    assert realised_accuracy(engine=engine)["hit_rate"] == 1.0
+
+
+# ── Phase 1: the validation gate ──────────────────────────────────────────────
+
+def _gate_fixture(rows=600, duplicate=False, future=False, infinite=False):
+    from sqlalchemy import create_engine, text
+    from pipeline.signals import FEATURE_COLS
+
+    engine = create_engine("sqlite://")
+    cols = ", ".join(f"{c} REAL" for c in FEATURE_COLS)
+    with engine.connect() as conn:
+        conn.execute(text(
+            f"CREATE TABLE signals (ticker TEXT, date TEXT, close REAL, "
+            f"target_return REAL, target_excess_return REAL, "
+            f"benchmark_return REAL, {cols})"))
+        conn.execute(text("CREATE TABLE ohlcv (ticker TEXT, date TEXT, close REAL)"))
+        conn.execute(text(
+            "CREATE TABLE corporate_actions (ticker TEXT, date TEXT, "
+            "action_type TEXT, ratio REAL, amount REAL, implausible INTEGER)"))
+
+        today = pd.Timestamp.now('UTC').normalize()
+        sessions = pd.bdate_range(end=today, periods=rows).strftime("%Y-%m-%d")
+        feature_binds = ", ".join(f":{c}" for c in FEATURE_COLS)
+        for i, day in enumerate(sessions):
+            values = {c: 1.0 for c in FEATURE_COLS}
+            if infinite and i == len(sessions) - 1:
+                values[FEATURE_COLS[0]] = float("inf")
+            conn.execute(
+                text(f"INSERT INTO signals VALUES (:t, :d, :c, :tr, :te, :br, "
+                     f"{feature_binds})"),
+                {"t": "TEST.NS", "d": day, "c": 100.0 + i * 0.01, "tr": 0.01,
+                 "te": 0.01 if i < rows - 30 else None, "br": 0.0, **values},
+            )
+            conn.execute(text("INSERT INTO ohlcv VALUES ('TEST.NS', :d, 100.0)"),
+                         {"d": day})
+
+        if duplicate:
+            values = {c: 1.0 for c in FEATURE_COLS}
+            conn.execute(
+                text(f"INSERT INTO signals VALUES (:t, :d, 100.0, 0.01, 0.01, "
+                     f"0.0, {feature_binds})"),
+                {"t": "TEST.NS", "d": sessions[5], **values},
+            )
+        if future:
+            values = {c: 1.0 for c in FEATURE_COLS}
+            ahead = (today + pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+            conn.execute(
+                text(f"INSERT INTO signals VALUES (:t, :d, 100.0, 0.01, 0.01, "
+                     f"0.0, {feature_binds})"),
+                {"t": "TEST.NS", "d": ahead, **values},
+            )
+        conn.commit()
+    return engine
+
+
+def _named(report, name):
+    return next(c for c in report.checks if c.name == name)
+
+
+def test_gate_passes_on_a_healthy_database():
+    from pipeline.validation import FAIL, run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture())
+    assert report.status != FAIL, [str(c) for c in report.failures]
+
+
+def test_gate_fails_on_duplicate_training_rows():
+    """
+    A repeated (ticker, date) reweights the fit toward whatever was duplicated
+    and inflates any row-averaged metric, invisibly.
+    """
+    from pipeline.validation import FAIL, run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture(duplicate=True))
+    assert report.status == FAIL
+    assert _named(report, "no_duplicate_signal_rows").status == FAIL
+
+
+def test_gate_fails_on_rows_dated_in_the_future():
+    from pipeline.validation import FAIL, run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture(future=True))
+    assert _named(report, "no_future_dates").status == FAIL
+    assert report.status == FAIL
+
+
+def test_gate_fails_on_non_finite_features():
+    """XGBoost tolerates NaN by design and infinity not at all."""
+    from pipeline.validation import FAIL, run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture(infinite=True))
+    assert _named(report, "features_are_finite").status == FAIL
+
+
+def test_gate_fails_when_a_ticker_has_no_benchmark_return():
+    """The 2026-08-16 label-destruction incident, expressed as a check."""
+    from sqlalchemy import text
+
+    from pipeline.validation import FAIL, run_gate
+
+    engine = _gate_fixture()
+    with engine.connect() as conn:
+        conn.execute(text("UPDATE signals SET benchmark_return = NULL"))
+        conn.commit()
+
+    report = run_gate(universe=["TEST.NS"], engine=engine)
+    assert _named(report, "benchmark_coverage").status == FAIL
+
+
+def test_gate_only_warns_when_corporate_actions_are_missing():
+    """
+    A gate that fails on everything gets switched off. An empty
+    corporate_actions table degrades attribution; it does not corrupt output.
+    """
+    from pipeline.validation import FAIL, WARN, run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture())
+    assert _named(report, "price_breaks_are_explained").status == WARN
+    assert report.status != FAIL
+
+
+def test_gate_report_serialises_for_the_run_record():
+    import json
+
+    from pipeline.validation import run_gate
+
+    report = run_gate(universe=["TEST.NS"], engine=_gate_fixture())
+    parsed = json.loads(report.to_json())
+    assert {c["name"] for c in parsed} == {c.name for c in report.checks}
+
+
+# ── Phase 1: experiment tracking ──────────────────────────────────────────────
+
+def test_config_hash_changes_when_the_benchmark_mapping_changes():
+    """
+    The benchmark is half the label: target_excess_return is the stock's return
+    MINUS the benchmark's. Remapping a sector silently redefines every
+    historical target for its members, so it has to move the config hash or two
+    incomparable runs will look identical in the run log.
+    """
+    import data.tickers
+    from pipeline.tracking import config_hash
+
+    before, _ = config_hash()
+    original = dict(data.tickers.SECTOR_INDICES)
+    try:
+        data.tickers.SECTOR_INDICES["Information Technology"] = "^NSEI"
+        after, _ = config_hash()
+    finally:
+        data.tickers.SECTOR_INDICES.clear()
+        data.tickers.SECTOR_INDICES.update(original)
+
+    assert before != after, (
+        "a benchmark remap must change config_hash, or a run before and after "
+        "one is indistinguishable in the experiment log"
+    )
+
+
+def test_config_hash_is_stable_across_calls():
+    from pipeline.tracking import config_hash
+
+    assert config_hash()[0] == config_hash()[0]
+
+
+def test_config_and_data_hashes_are_independent():
+    """
+    Kept apart on purpose: a metric that moves while config_hash is constant is
+    a data effect, one that moves while data_hash is constant is a code effect.
+    Hashing them together destroys the only distinction worth having.
+    """
+    from pipeline.tracking import config_hash, data_hash
+
+    engine = _gate_fixture()
+    cfg = config_hash()[0]
+    one = data_hash(universe=["TEST.NS"], engine=engine)[0]
+    two = data_hash(universe=[], engine=engine)[0]
+
+    assert one != two, "data_hash must track what the database held"
+    assert config_hash()[0] == cfg, "changing the data must not move config_hash"
+
+
+# ── Phase 1: corporate actions ────────────────────────────────────────────────
+
+def test_recorded_actions_explain_a_price_break():
+    """
+    F11 fixed the SYMPTOM of a spliced adjustment basis by rewriting the whole
+    OHLCV series each run. Without a record of the actions themselves, a 50%
+    overnight fall from a 1:2 split is indistinguishable from a real 50% fall.
+    """
+    from sqlalchemy import create_engine, text
+
+    from pipeline.corporate_actions import actions_for, explained_by_action
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE corporate_actions (ticker TEXT, date TEXT, "
+            "action_type TEXT, ratio REAL, amount REAL, implausible INTEGER)"))
+        conn.execute(text(
+            "INSERT INTO corporate_actions VALUES "
+            "('TEST.NS', '2026-03-10', 'SPLIT', 2.0, NULL, 0)"))
+        conn.commit()
+
+    assert explained_by_action("TEST.NS", "2026-03-10", engine=engine)
+    assert explained_by_action("TEST.NS", "2026-03-11", engine=engine), (
+        "the ex-date and the session the gap appears on can differ by a day"
+    )
+    assert not explained_by_action("TEST.NS", "2026-07-01", engine=engine)
+    assert len(actions_for("TEST.NS", engine=engine)) == 1
+
+
+# ── Phase 1: the audited benchmark mapping ────────────────────────────────────
+
+def test_every_mapped_benchmark_is_an_industry_index():
+    """
+    tools/audit_benchmarks.py measures style indices (^CNX100, ^CNXPSE,
+    ^CNXMNC) and refuses to select them: ^CNX100 contains every member of this
+    universe by construction, so an excess return against it partly subtracts
+    the stock from itself.
+    """
+    from data.tickers import SECTOR_INDICES
+
+    forbidden = {"^CNX100", "^CNXPSE", "^CNXMNC", "^CNXPSUBANK",
+                 "NIFTY_PVT_BANK.NS", "^CNX500", "^NSEMDCP50"}
+    offenders = {s: i for s, i in SECTOR_INDICES.items() if i in forbidden}
+    assert not offenders, (
+        f"style indices are not sector benchmarks: {offenders}"
+    )
+
+
+def test_sectors_without_a_justified_index_fall_back_to_the_broad_market():
+    """
+    Financial Services is the largest sector in the universe (22 of 100) and
+    was benchmarked against ^NSEBANK. Measured, NIFTY Bank scored 0.352 and
+    NIFTY Financial Services 0.350 against NIFTY 50's 0.360 — both BELOW the
+    broad market, with the bootstrap interval straddling zero. NIFTY 50 is
+    already a financials index by weight.
+    """
+    from data.tickers import SECTOR_INDICES, get_benchmark
+
+    assert "Financial Services" not in SECTOR_INDICES
+    index, sector_specific = get_benchmark("HDFCBANK.NS", sector="Financial Services")
+    assert index == "^NSEI"
+    assert sector_specific is False, (
+        "a broad-market fallback must report itself as one; the UI says "
+        "'excess return vs sector' and that would otherwise be false"
+    )
+
+
+def test_an_evaluation_from_another_model_version_is_not_used_as_evidence():
+    """
+    eval_* are measured against target_excess_return, which is defined relative
+    to the ticker's benchmark. Remapping a sector redefines the label, so
+    metrics measured under the old definition describe a quantity the model no
+    longer predicts. Serving them beside a new-version forecast would be the
+    same quiet mislabelling the audit removed elsewhere.
+    """
+    from sqlalchemy import create_engine, text
+
+    import pipeline.model as model
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE model_metadata (ticker TEXT PRIMARY KEY, "
+            "eval_rank_ic REAL, eval_hit_rate REAL, eval_baseline_hit_rate REAL, "
+            "eval_mae REAL, eval_mae_naive REAL, model_version TEXT, "
+            "evaluated_at TEXT)"))
+        conn.execute(text(
+            "INSERT INTO model_metadata VALUES ('OLD.NS', 0.08, 55.0, 51.0, "
+            "0.09, 0.10, 'phase0-excess-return-v1', '2026-08-15')"))
+        conn.execute(text(
+            "INSERT INTO model_metadata (ticker, eval_rank_ic, eval_hit_rate, "
+            "eval_baseline_hit_rate, eval_mae, eval_mae_naive, model_version) "
+            "VALUES ('NEW.NS', 0.08, 55.0, 51.0, 0.09, 0.10, :v)"),
+            {"v": model.MODEL_VERSION})
+        conn.commit()
+
+    original = model.get_engine
+    model.get_engine = lambda: engine
+    try:
+        assert model._load_persisted_evaluation("OLD.NS") is None, (
+            "a v1 evaluation must not back a v2 forecast")
+        assert model._load_persisted_evaluation("NEW.NS") is not None, (
+            "a current-version evaluation must still be used")
+    finally:
+        model.get_engine = original

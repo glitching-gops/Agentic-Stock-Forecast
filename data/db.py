@@ -313,6 +313,47 @@ def init_db():
             )
         """))
 
+        # Splits and dividends. F11 fixed the SYMPTOM of a spliced adjustment
+        # basis by rewriting the whole OHLCV series each run; this records the
+        # CAUSE, so a price break is either explained by a row here or it is a
+        # data-quality finding. See pipeline/corporate_actions.py.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS corporate_actions (
+                ticker       TEXT NOT NULL,
+                date         TEXT NOT NULL,
+                action_type  TEXT NOT NULL,      -- SPLIT | DIVIDEND
+                ratio        REAL,               -- SPLIT only, e.g. 2.0 for 1:2
+                amount       REAL,               -- DIVIDEND only, per share
+                implausible  INTEGER DEFAULT 0,  -- outside a believable range
+                PRIMARY KEY (ticker, date, action_type)
+            )
+        """))
+
+        # One row per pipeline run: what code, what configuration, what data.
+        # Without it, "the metrics moved" has no answer — the model, the
+        # feature list, the universe rule and the labelled set can all change
+        # between two runs and nothing recorded which of them did.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS experiment_runs (
+                run_id         TEXT PRIMARY KEY,
+                job            TEXT NOT NULL,     -- daily | weekly | manual
+                started_at     TEXT NOT NULL,
+                finished_at    TEXT,
+                status         TEXT,              -- RUNNING | OK | ABORTED | FAILED
+                git_sha        TEXT,
+                model_version  TEXT,
+                config_hash    TEXT,              -- features, target, horizon, eval params
+                data_hash      TEXT,              -- universe x coverage x label counts
+                universe_rule  TEXT,
+                n_tickers      INTEGER,
+                labelled_rows  INTEGER,
+                gate_status    TEXT,              -- PASS | WARN | FAIL
+                gate_report    TEXT,              -- JSON, one entry per check
+                metrics        TEXT,              -- JSON
+                notes          TEXT
+            )
+        """))
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS model_metadata (
                 ticker              TEXT PRIMARY KEY,

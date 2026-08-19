@@ -81,41 +81,63 @@ def run_pipeline_job():
     old; that staleness is surfaced via `evaluated_at`, not hidden.
     """
     logger.info("Starting daily pipeline run...")
+    run_id, gate = None, None
     try:
         from data.universe import (
             get_ingest_universe, get_universe, sync_current_membership,
         )
         from data.tickers import refresh_metadata
+        from pipeline.corporate_actions import fetch_and_store as fetch_actions
         from pipeline.fetch import fetch_and_store
+        from pipeline.outcomes import resolve_due_forecasts
         from pipeline.signals import compute_and_store, count_labelled_rows
         from pipeline.sentiment import fetch_and_score
         from pipeline.macro import fetch_and_store as fetch_macro
+        from pipeline.tracking import finish_run, start_run
+        from pipeline.validation import FAIL, run_gate
         from agents.graph import prune_leaderboard, run_graph
 
-        logger.info("[0/5] Syncing point-in-time universe...")
+        logger.info("[1/8] Syncing point-in-time universe...")
         sync_current_membership()
         refresh_metadata()
 
         # Ingest over raw index membership; the liquidity screen runs afterwards
         # because it reads the very table this step populates.
         ingest_list = get_ingest_universe()
-        logger.info(f"[0/5] Index members to ingest: {len(ingest_list)}")
+        logger.info(f"[1/8] Index members to ingest: {len(ingest_list)}")
 
         if not ingest_list:
             raise PipelineAbort("Index membership is empty — aborting run.")
 
         labelled_before = count_labelled_rows()
 
-        logger.info("[1/5] Fetching OHLCV data...")
+        logger.info("[2/8] Fetching OHLCV data...")
         fetch_and_store(tickers=ingest_list)
 
         universe = get_universe()
-        logger.info(f"[1/5] Tradable universe after screening: {len(universe)}")
+        logger.info(f"[2/8] Tradable universe after screening: {len(universe)}")
         if not universe:
             raise PipelineAbort(
                 "Universe is empty after screening — aborting run.")
 
-        logger.info("[2/5] Computing signals...")
+        # Opened here rather than at the top of the function because the run's
+        # identity includes its universe and its data hash, and neither exists
+        # until the screen has run. Everything that can go wrong after this
+        # point is recorded against this row; the two aborts above are loud and
+        # immediate by comparison.
+        run_id = start_run("daily", universe)
+
+        # Splits and dividends, before the gate that uses them to tell a
+        # corporate action apart from a broken adjustment basis (F11).
+        logger.info("[3/8] Refreshing corporate actions...")
+        try:
+            fetch_actions(tickers=universe)
+        except Exception as exc:                                # noqa: BLE001
+            # Degraded, not fatal: the gate downgrades the price-break check to
+            # a warning when this table is stale, and no other step reads it.
+            logger.warning(f"[3/8] corporate actions refresh failed: {exc}")
+
+        logger.info("[4/8] Computing signals...")
         signals_report = compute_and_store(tickers=universe)
 
         # A skip or a refusal preserves that ticker's labels and leaves its
@@ -126,7 +148,7 @@ def run_pipeline_job():
         # compounds every day it goes unreported.
         if signals_report.skipped or signals_report.refused:
             logger.error(
-                f"[2/5] Signals degraded: {len(signals_report.skipped)} skipped "
+                f"[4/8] Signals degraded: {len(signals_report.skipped)} skipped "
                 f"{signals_report.skipped}, {len(signals_report.refused)} "
                 f"refused {signals_report.refused}. Labels for these tickers "
                 f"are intact but their signals are stale; the usual cause is a "
@@ -148,15 +170,29 @@ def run_pipeline_job():
                 f"Target backfill is broken (regression of F6) — aborting before "
                 f"any forecast is written."
             )
-        logger.info(f"[2/5] Labelled rows: {labelled_before} -> {labelled_after}")
+        logger.info(f"[4/8] Labelled rows: {labelled_before} -> {labelled_after}")
 
-        logger.info("[3/5] Fetching news sentiment...")
+        # THE GATE. Everything above has written to the database; nothing below
+        # has published yet. This is the only point at which a data defect can
+        # still be caught before it reaches a reader, which is why it sits here
+        # and not at the end.
+        logger.info("[5/8] Running the validation gate...")
+        gate = run_gate(universe)
+        for check in gate.checks:
+            (logger.error if check.status == FAIL else logger.info)(
+                f"[5/8] {check}")
+        logger.info(f"[5/8] Gate: {gate.summary()}")
+        if gate.status == FAIL:
+            raise PipelineAbort(
+                f"Validation gate FAILED before publishing: "
+                f"{'; '.join(c.detail for c in gate.failures)}"
+            )
+
+        logger.info("[6/8] Fetching news sentiment and macro data...")
         fetch_and_score(tickers=universe)
-
-        logger.info("[4/5] Fetching macro data...")
         fetch_macro()
 
-        logger.info(f"[5/5] Forecasting {len(universe)} tickers "
+        logger.info(f"[7/8] Forecasting {len(universe)} tickers "
                    f"(cached hyperparameters, no search)...")
         succeeded, failed = 0, 0
         for ticker in universe:
@@ -166,11 +202,11 @@ def run_pipeline_job():
                     succeeded += 1
                 else:
                     failed += 1
-                    logger.warning(f"[5/5] {ticker}: {state.get('forecast_error')}")
+                    logger.warning(f"[7/8] {ticker}: {state.get('forecast_error')}")
             except Exception as exc:                                # noqa: BLE001
                 failed += 1
-                logger.error(f"[5/5] {ticker}: run_graph failed — {exc}")
-        logger.info(f"[5/5] Forecasting complete: {succeeded} succeeded, {failed} failed")
+                logger.error(f"[7/8] {ticker}: run_graph failed — {exc}")
+        logger.info(f"[7/8] Forecasting complete: {succeeded} succeeded, {failed} failed")
 
         # Every ticker failing is the same outcome as aborting — nothing was
         # published — and used to report the same way aborting did: green.
@@ -186,15 +222,37 @@ def run_pipeline_job():
         # agents.graph.prune_leaderboard.
         removed = prune_leaderboard(universe)
         if removed:
-            logger.info(f"[5/5] Pruned {removed} leaderboard row(s) for tickers "
+            logger.info(f"[7/8] Pruned {removed} leaderboard row(s) for tickers "
                        f"no longer in the universe")
 
+        # Score the forecasts whose 30 sessions have now elapsed. This is the
+        # only measurement in the system taken on PUBLISHED output rather than
+        # on held-out folds, and `forecast_outcomes` had no writer at all until
+        # now — so nothing had ever checked whether a forecast came true.
+        logger.info("[8/8] Resolving matured forecasts...")
+        outcomes = resolve_due_forecasts()
+        logger.info(f"[8/8] Outcomes: {outcomes.summary()}")
+
+        finish_run(run_id, "OK", gate=gate, metrics={
+            "forecasts_succeeded": succeeded,
+            "forecasts_failed": failed,
+            "signals_skipped": signals_report.skipped,
+            "signals_refused": signals_report.refused,
+            "labelled_rows": labelled_after,
+            "outcomes_resolved": outcomes.resolved,
+            "leaderboard_pruned": removed,
+        })
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
         # Log first so the traceback lands in scheduler.log, then re-raise so
         # the process exits non-zero. Swallowing here is what let two days of
         # no-op runs report success.
         logger.error(f"Error during daily pipeline run: {e}", exc_info=True)
+        if run_id:
+            from pipeline.tracking import finish_run as _finish
+            _finish(run_id,
+                    "ABORTED" if isinstance(e, PipelineAbort) else "FAILED",
+                    gate=gate, notes=str(e)[:500])
         raise
 
 
@@ -232,6 +290,8 @@ def run_weekly_evaluation_job():
     from pipeline.fetch import fetch_and_store
     from pipeline.signals import compute_and_store, count_labelled_rows
     from pipeline.model import evaluate_and_persist_universe
+    from pipeline.tracking import finish_run, start_run
+    from pipeline.validation import FAIL, run_gate
 
     # Idempotent and cheap even if the daily job already did this today —
     # the weekly workflow runs in its own environment (Lever 4) and should
@@ -266,6 +326,8 @@ def run_weekly_evaluation_job():
     # without the same guard is what let it through.
     labelled_before = count_labelled_rows()
 
+    run_id = start_run("weekly", universe)
+
     logger.info(f"[Scheduler] Recomputing signals for {len(universe)} tickers...")
     signals_report = compute_and_store(tickers=universe)
 
@@ -277,6 +339,7 @@ def run_weekly_evaluation_job():
             f"existing labels and will be evaluated on slightly stale signals."
         )
     if not signals_report.processed:
+        finish_run(run_id, "ABORTED", notes="no ticker had signals written")
         raise PipelineAbort(
             f"Signals were written for 0 of {len(universe)} tickers — aborting "
             f"before any evaluation is persisted."
@@ -284,6 +347,7 @@ def run_weekly_evaluation_job():
 
     labelled_after = count_labelled_rows()
     if labelled_after < labelled_before:
+        finish_run(run_id, "ABORTED", notes="labelled rows regressed (F6)")
         raise PipelineAbort(
             f"Labelled rows fell from {labelled_before} to {labelled_after} "
             f"after recomputing signals — aborting before any evaluation is "
@@ -293,10 +357,40 @@ def run_weekly_evaluation_job():
         )
     logger.info(f"[Scheduler] Labelled rows: {labelled_before} -> {labelled_after}")
 
+    # The gate belongs here for the same reason it belongs in the daily job:
+    # everything above has written to the database and nothing below has
+    # published. The weekly job is the one that persists the evidence the
+    # leaderboard gates on, so a data defect reaching it is worse, not better —
+    # a corrupted evaluation stays on the board for a week.
+    gate = run_gate(universe)
+    for check in gate.checks:
+        (logger.error if check.status == FAIL else logger.info)(
+            f"[Scheduler] {check}")
+    logger.info(f"[Scheduler] Gate: {gate.summary()}")
+    if gate.status == FAIL:
+        finish_run(run_id, "ABORTED", gate=gate,
+                   notes="validation gate failed before evaluation")
+        raise PipelineAbort(
+            f"Validation gate FAILED before evaluating: "
+            f"{'; '.join(c.detail for c in gate.failures)}"
+        )
+
     logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")
-    results = evaluate_and_persist_universe(tickers=universe)
+    try:
+        results = evaluate_and_persist_universe(tickers=universe)
+    except Exception as exc:                                        # noqa: BLE001
+        finish_run(run_id, "FAILED", gate=gate, notes=str(exc)[:500])
+        raise
     logger.info(f"[Scheduler] Weekly evaluation complete: "
                f"{len(results)}/{len(universe)} tickers evaluated")
+
+    finish_run(run_id, "OK", gate=gate, metrics={
+        "tickers_evaluated": len(results),
+        "tickers_in_universe": len(universe),
+        "labelled_rows": labelled_after,
+        "signals_skipped": signals_report.skipped,
+        "signals_refused": signals_report.refused,
+    })
 
 
 def start_scheduler():

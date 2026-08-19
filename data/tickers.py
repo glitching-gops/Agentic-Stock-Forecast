@@ -32,27 +32,70 @@ BROAD_MARKET_INDEX = "^NSEI"          # NIFTY 50 — fallback benchmark
 BROAD_MARKET_NAME  = "NIFTY 50"
 
 # NSE industry classification -> benchmark index.
-# Every entry verified to return >1,200 daily rows over 5 years on yfinance.
+#
+# AUDITED, NOT ASSERTED. The previous comment here read "every entry verified to
+# return >1,200 daily rows on yfinance" — a liveness check. Whether an index
+# actually described the stocks pointed at it had never been tested, and the
+# benchmark is half the label: target_excess_return is the stock's forward
+# return MINUS this index's, so a wrong entry subtracts another sector's
+# rotation from every row and calls the residual alpha.
+#
+# tools/audit_benchmarks.py measures it. For each stock, the share of its daily
+# log-return variance explained by each candidate index; a sector's score is the
+# median across its members; a moving-block bootstrap (400 draws, 21-day blocks,
+# 90% interval) decides whether a difference is real. An index is used only when
+# it beats ^NSEI on both the point estimate and the interval. Re-run it after any
+# index reconstitution:
+#
+#     python tools/audit_benchmarks.py --apply-check
+#
+# THE BROAD MARKET IS NOT A FAILURE STATE. NIFTY 50 is roughly a third financials
+# by weight, so for several sectors it is already the best available description
+# — and with fifty constituents it dilutes any one stock's influence over its own
+# benchmark far better than a twelve-name sector index does. A sector mapped to
+# ^NSEI records is_sector_specific=False and the UI says so.
+#
+# Measured 2026-08-19 over 5y, stable across three bootstrap seeds. The number
+# after each entry is the median R² over the broad market's.
 SECTOR_INDICES: dict[str, str] = {
-    "Financial Services":             "^NSEBANK",
-    "Capital Goods":                  "^CNXINFRA",
-    "Automobile and Auto Components": "^CNXAUTO",
-    "Healthcare":                     "^CNXPHARMA",
-    "Fast Moving Consumer Goods":     "^CNXFMCG",
-    "Metals & Mining":                "^CNXMETAL",
-    "Power":                          "^CNXENERGY",
-    "Oil Gas & Consumable Fuels":     "^CNXENERGY",
-    "Information Technology":         "^CNXIT",
-    "Consumer Services":              "^CNXSERVICE",
-    "Construction Materials":         "^CNXINFRA",
-    "Construction":                   "^CNXINFRA",
-    "Services":                       "^CNXSERVICE",
-    "Realty":                         "^CNXREALTY",
-    "Consumer Durables":              "^CNXCONSUM",
-    "Media Entertainment & Publication": "^CNXMEDIA",
-    # Deliberately absent, benchmarked against the broad market instead:
-    #   "Chemicals"          - no representative NSE index
-    #   "Telecommunication"  - no NSE telecom index with usable history
+    "Information Technology":         "^CNXIT",        # +0.50
+    "Metals & Mining":                "^CNXMETAL",     # +0.42
+    "Realty":                         "^CNXREALTY",    # +0.29
+    "Automobile and Auto Components": "^CNXAUTO",      # +0.26
+    "Fast Moving Consumer Goods":     "^CNXFMCG",      # +0.24
+    "Healthcare":                     "^CNXPHARMA",    # +0.23
+    "Oil Gas & Consumable Fuels":     "^CNXENERGY",    # +0.17
+    "Power":                          "^CNXENERGY",    # +0.20  NIFTY Energy is
+                                                       # petroleum, gas AND power
+    "Capital Goods":                  "^CNXENERGY",    # +0.12  see note below
+    "Consumer Durables":              "^CNXCONSUM",    # +0.10
+    "Construction":                   "^CNXINFRA",     # +0.08
+    "Consumer Services":              "^CNXCONSUM",    # +0.08
+    "Construction Materials":         "^CNXINFRA",     # +0.05
+    "Media Entertainment & Publication": "^CNXMEDIA",  # not in the current
+                                                       # universe; kept for
+                                                       # historical rows
+    # Benchmarked against the broad market instead. Each was measured; none
+    # produced an industry index that beat ^NSEI by MIN_EDGE with an interval
+    # clear of zero.
+    #
+    #   "Financial Services"  22 tickers, the largest sector. ^NSEBANK scored
+    #                         0.352 and NIFTY_FIN_SERVICE.NS 0.350 against
+    #                         ^NSEI's 0.360 — both BELOW the broad market, and
+    #                         the interval straddles zero. NIFTY 50 is already
+    #                         a financials index by weight.
+    #   "Services"            ^CNXSERVICE scored 0.292 against ^NSEI's 0.319.
+    #   "Chemicals"           no representative NSE index exists.
+    #   "Telecommunication"   ^CNXINFRA leads by 0.043, short of the bar a
+    #                         one-stock sector has to clear.
+    #
+    # Capital Goods -> ^CNXENERGY is the one entry that is measured rather than
+    # obvious (0.328 vs ^CNXINFRA's 0.281, interval [+0.013, +0.117]). The link
+    # is the power-capex cycle: ABB, CGPOWER and SIEMENS sell transmission and
+    # generation equipment, and NIFTY Energy carries the utilities that buy it.
+    # ^CNXPSE scored marginally higher still (0.329) but is a state-ownership
+    # index, not an industry one, and is ineligible for the reasons in the
+    # audit tool's docstring.
 }
 
 # Legacy sector labels from the pre-Phase-0 universe, kept so that historical
@@ -158,6 +201,12 @@ def get_benchmark_name(index_ticker: str) -> str:
         "^CNXCONSUM":  "NIFTY India Consumption",
         "^CNXSERVICE": "NIFTY Services Sector",
         "^CNXMEDIA":   "NIFTY Media",
+        # Resolvable on yfinance and measured by tools/audit_benchmarks.py,
+        # though not currently selected for any sector.
+        "NIFTY_FIN_SERVICE.NS": "NIFTY Financial Services",
+        "^CNX100":     "NIFTY 100",
+        "^CNXPSE":     "NIFTY PSE",
+        "^CNXMNC":     "NIFTY MNC",
     }
     return names.get(index_ticker, index_ticker)
 

@@ -50,7 +50,13 @@ from pipeline.evaluation import (
 from pipeline.signals import FEATURE_COLS, HORIZON_SESSIONS
 from pipeline.tuning import tune, tune_and_cache
 
-MODEL_VERSION = "phase0-excess-return-v1"
+# Bumped 2026-08-19: tools/audit_benchmarks.py moved four sectors (36 of 100
+# tickers) onto different benchmark indices. target_excess_return is the stock's
+# return MINUS its benchmark's, so those tickers' labels now mean something
+# different from every label written under v1, and an evaluation produced under
+# one is not comparable with one produced under the other. The version string is
+# what makes that visible on the leaderboard instead of silent.
+MODEL_VERSION = "phase1-benchmark-audited-v2"
 
 FEATURES = FEATURE_COLS + [
     # Macro. `fii_net_flow` / `dii_net_flow` were scraped and stored by
@@ -295,6 +301,25 @@ def _load_persisted_evaluation(ticker: str) -> dict | None:
         return None
 
     r = row.iloc[0]
+
+    # AN EVALUATION OF A DIFFERENT TARGET IS NOT EVIDENCE ABOUT THIS ONE.
+    # eval_* are measured against target_excess_return, which is defined
+    # relative to the ticker's benchmark index. When the benchmark mapping
+    # changes (tools/audit_benchmarks.py moved 36 of 100 tickers on
+    # 2026-08-19) the label changes meaning, and metrics computed under the old
+    # definition describe a quantity the model is no longer predicting.
+    #
+    # Returning None puts the ticker back to INSUFFICIENT until the weekly job
+    # re-measures it, which is the honest state: the evidence gate then refuses
+    # to rank it rather than ranking it on a stale basis. The alternative --
+    # serving the old numbers next to a v2 forecast -- is precisely the class
+    # of quiet mislabelling the Phase 0 audit was about.
+    stored_version = r.get("model_version")
+    if stored_version and str(stored_version) != MODEL_VERSION:
+        print(f"[Model] {ticker}: discarding evaluation from "
+              f"{stored_version} (current {MODEL_VERSION}) — the target has "
+              f"been redefined since it was measured.")
+        return None
 
     residuals = None
     if r.get("conformal_residuals"):
