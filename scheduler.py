@@ -42,6 +42,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class PipelineAbort(RuntimeError):
+    """
+    A precondition failed and the job stopped without writing its output.
+
+    Every abort path in this module used to `logger.error(...)` and then
+    `return`, and the module has never contained a `sys.exit`, a `raise`, or a
+    non-zero return anywhere -- so the interpreter exited 0 and GitHub Actions
+    marked the run green. On 2026-08-17 and 2026-08-18 two scheduled daily runs
+    aborted on the F6 monotonicity guard, wrote no forecast at all, finished in
+    a third of the normal time, and both reported success. The staleness was
+    eventually noticed on the dashboard, not in CI, two days later.
+
+    A job that produced nothing must fail loudly enough for the runner to see
+    it. Both workflows invoke these functions through `python -c`, so an
+    exception is exactly what turns the step red.
+    """
+
+
 def run_pipeline_job():
     """
     Daily pipeline: universe sync, fresh data, cheap per-ticker forecast.
@@ -84,8 +102,7 @@ def run_pipeline_job():
         logger.info(f"[0/5] Index members to ingest: {len(ingest_list)}")
 
         if not ingest_list:
-            logger.error("Index membership is empty — aborting run.")
-            return
+            raise PipelineAbort("Index membership is empty — aborting run.")
 
         labelled_before = count_labelled_rows()
 
@@ -95,20 +112,42 @@ def run_pipeline_job():
         universe = get_universe()
         logger.info(f"[1/5] Tradable universe after screening: {len(universe)}")
         if not universe:
-            logger.error("Universe is empty after screening — aborting run.")
-            return
+            raise PipelineAbort(
+                "Universe is empty after screening — aborting run.")
 
         logger.info("[2/5] Computing signals...")
-        compute_and_store(tickers=universe)
+        signals_report = compute_and_store(tickers=universe)
+
+        # A skip or a refusal preserves that ticker's labels and leaves its
+        # signals stale for the day. That is a degradation, not a failure, and
+        # aborting the whole run over it would cost the other ninety tickers
+        # their forecast for no benefit — but it must not pass silently, since
+        # a benchmark index that stays down is a data-quality problem that
+        # compounds every day it goes unreported.
+        if signals_report.skipped or signals_report.refused:
+            logger.error(
+                f"[2/5] Signals degraded: {len(signals_report.skipped)} skipped "
+                f"{signals_report.skipped}, {len(signals_report.refused)} "
+                f"refused {signals_report.refused}. Labels for these tickers "
+                f"are intact but their signals are stale; the usual cause is a "
+                f"benchmark index that failed to download."
+            )
+        if not signals_report.processed:
+            raise PipelineAbort(
+                f"Signals were written for 0 of {len(universe)} tickers — "
+                f"aborting before any forecast is made."
+            )
 
         labelled_after = count_labelled_rows()
         if labelled_after < labelled_before:
-            logger.error(
+            # With the write-boundary guard in pipeline.signals this should now
+            # be unreachable. It stays as the backstop it always was: if it
+            # ever fires again, a destructive write got past that guard.
+            raise PipelineAbort(
                 f"Labelled rows fell from {labelled_before} to {labelled_after}. "
                 f"Target backfill is broken (regression of F6) — aborting before "
                 f"any forecast is written."
             )
-            return
         logger.info(f"[2/5] Labelled rows: {labelled_before} -> {labelled_after}")
 
         logger.info("[3/5] Fetching news sentiment...")
@@ -133,6 +172,14 @@ def run_pipeline_job():
                 logger.error(f"[5/5] {ticker}: run_graph failed — {exc}")
         logger.info(f"[5/5] Forecasting complete: {succeeded} succeeded, {failed} failed")
 
+        # Every ticker failing is the same outcome as aborting — nothing was
+        # published — and used to report the same way aborting did: green.
+        if succeeded == 0:
+            raise PipelineAbort(
+                f"All {failed} tickers failed to forecast; no leaderboard row "
+                f"was written. Not reporting this run as successful."
+            )
+
         # Names that have left the index keep their last leaderboard row
         # otherwise, and those rows carry pre-Phase-0 composite scores that
         # outrank every evidence-gated score written today. See
@@ -144,7 +191,11 @@ def run_pipeline_job():
 
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
+        # Log first so the traceback lands in scheduler.log, then re-raise so
+        # the process exits non-zero. Swallowing here is what let two days of
+        # no-op runs report success.
         logger.error(f"Error during daily pipeline run: {e}", exc_info=True)
+        raise
 
 
 def run_weekly_evaluation_job():
@@ -194,18 +245,16 @@ def run_weekly_evaluation_job():
 
     ingest_list = get_ingest_universe()
     if not ingest_list:
-        logger.error("[Scheduler] Index membership is empty — aborting weekly "
-                     "evaluation.")
-        return
+        raise PipelineAbort("Index membership is empty — aborting weekly "
+                            "evaluation.")
 
     logger.info(f"[Scheduler] Refreshing OHLCV for {len(ingest_list)} index members...")
     fetch_and_store(tickers=ingest_list)
 
     universe = get_universe()
     if not universe:
-        logger.error("[Scheduler] Universe is empty after screening — aborting "
-                     "weekly evaluation.")
-        return
+        raise PipelineAbort("Universe is empty after screening — aborting "
+                            "weekly evaluation.")
 
     # Same F6 monotonicity check the daily job runs. It belongs here for the
     # same reason it belongs there, and its absence cost real data: the first
@@ -218,18 +267,30 @@ def run_weekly_evaluation_job():
     labelled_before = count_labelled_rows()
 
     logger.info(f"[Scheduler] Recomputing signals for {len(universe)} tickers...")
-    compute_and_store(tickers=universe)
+    signals_report = compute_and_store(tickers=universe)
+
+    if signals_report.skipped or signals_report.refused:
+        logger.error(
+            f"[Scheduler] Signals degraded: {len(signals_report.skipped)} "
+            f"skipped {signals_report.skipped}, {len(signals_report.refused)} "
+            f"refused {signals_report.refused}. Those tickers keep their "
+            f"existing labels and will be evaluated on slightly stale signals."
+        )
+    if not signals_report.processed:
+        raise PipelineAbort(
+            f"Signals were written for 0 of {len(universe)} tickers — aborting "
+            f"before any evaluation is persisted."
+        )
 
     labelled_after = count_labelled_rows()
     if labelled_after < labelled_before:
-        logger.error(
+        raise PipelineAbort(
             f"Labelled rows fell from {labelled_before} to {labelled_after} "
             f"after recomputing signals — aborting before any evaluation is "
             f"persisted. The most likely cause is a benchmark index that "
             f"failed to download, which NULLs the excess-return target for "
             f"every stock mapped to it (regression of F6)."
         )
-        return
     logger.info(f"[Scheduler] Labelled rows: {labelled_before} -> {labelled_after}")
 
     logger.info(f"[Scheduler] Weekly evaluation started for {len(universe)} stocks")

@@ -28,6 +28,7 @@ Three Phase 0 changes:
 from __future__ import annotations
 
 import time
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -58,6 +59,41 @@ FEATURE_COLS = [
 TARGET_COLS = ["target_return", "target_excess_return", "benchmark_return"]
 
 _benchmark_cache: dict[str, pd.DataFrame] = {}
+
+
+class LabelLossRefused(RuntimeError):
+    """
+    Raised instead of committing a write that would leave a ticker with fewer
+    labelled rows than it already had.
+
+    _upsert_signals is DELETE-range-then-reinsert, so it is not additive: the
+    frame handed to it wholly REPLACES the range it covers. When that frame's
+    targets are null — the standard consequence of a benchmark index that
+    failed to download, since the target is `stock return - benchmark return`
+    — the write erases every label in the range and returns a healthy row
+    count. On 2026-08-16 that cost ~2,390 labels each across 22 tickers.
+
+    The F6 monotonicity guard in scheduler.py catches this after the fact, at
+    the whole-table level, and by then can only abort the run: the labels are
+    already gone, and only a later clean recompute restores them. This is the
+    same check moved to the write boundary, which is the last point at which
+    refusing is still an option.
+    """
+
+
+class SignalsReport(NamedTuple):
+    """
+    Outcome of a compute_and_store run.
+
+    `refused` is deliberately separate from `skipped`. A skip means the frame
+    was never built; a refusal means it was built, looked writable, and would
+    have destroyed labels. The second is the more alarming of the two and used
+    to be indistinguishable from success.
+    """
+    rows_written: int
+    processed: list[str]
+    skipped: list[str]
+    refused: list[str]
 
 
 # ── Regime estimate ───────────────────────────────────────────────────────────
@@ -368,12 +404,20 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     log_close = np.log(df["close"])
     df["target_return"] = log_close.shift(-h) - log_close
 
-    if df["benchmark_close"].notna().any():
-        log_bench = np.log(df["benchmark_close"])
-        df["benchmark_return"] = log_bench.shift(-h) - log_bench
-    else:
-        df["benchmark_return"] = np.nan
+    # An index that downloads but does not ALIGN is the same failure wearing a
+    # different hat: a truncated history, or dates that fail to merge, leaves
+    # benchmark_close entirely null after the ffill, and the `benchmark.empty`
+    # check above cannot see it. The old code took that branch quietly and set
+    # benchmark_return to NaN, which is how a non-empty benchmark still
+    # produced a frame with a null target on every row.
+    if not df["benchmark_close"].notna().any():
+        print(f"[Signals] {ticker}: SKIPPED - benchmark {index_ticker} "
+              f"returned {len(benchmark)} rows, none aligned to this ticker's "
+              f"sessions; refusing to compute a null target.")
+        return None
 
+    log_bench = np.log(df["benchmark_close"])
+    df["benchmark_return"] = log_bench.shift(-h) - log_bench
     df["target_excess_return"] = df["target_return"] - df["benchmark_return"]
 
     df["benchmark_ticker"] = index_ticker
@@ -388,6 +432,16 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     return df[keep].reset_index(drop=True)
 
 
+def _labelled_rows_from(conn, ticker: str, start: str) -> int:
+    """Labelled rows this ticker already holds in the range about to be replaced."""
+    n = conn.execute(
+        text("SELECT COUNT(*) FROM signals WHERE ticker = :t AND date >= :start "
+             "AND target_excess_return IS NOT NULL"),
+        {"t": ticker, "start": start},
+    ).scalar()
+    return int(n or 0)
+
+
 def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
     """
     Writes signal rows, refreshing rows that already exist.
@@ -396,20 +450,59 @@ def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
     rows in the recomputed date range and reinserting is the portable way to
     upsert across SQLite and PostgreSQL, and it also picks up any indicator
     correction, not just the target.
+
+    THE DELETE IS THE DANGEROUS HALF. Because the range is cleared before the
+    reinsert, this call is a replacement and not a merge, so a frame carrying
+    fewer labels than the rows it displaces is a net loss of training data
+    dressed up as a successful write. The counts are therefore compared BEFORE
+    the delete and the write refused outright -- the last moment at which the
+    existing labels still exist. See LabelLossRefused.
+
+    The comparison is a decrease check rather than a null-frame check on
+    purpose. A null-frame check catches only total destruction, and would also
+    wrongly block a genuinely new listing whose forward labels are all still in
+    the future. Comparing counts over the same date range catches the partial
+    case too -- an index that aligns to only part of the history, or a feature
+    that turns NaN and drops labelled rows out through dropna -- while letting
+    the new-listing case through, because 0 is not less than 0.
     """
     if df.empty:
         return 0
+
+    start = df["date"].min()
+    existing = _labelled_rows_from(conn, ticker, start)
+    incoming = int(df["target_excess_return"].notna().sum())
+
+    if incoming < existing:
+        raise LabelLossRefused(
+            f"{ticker}: this frame would drop labelled rows from {existing} to "
+            f"{incoming} over dates >= {start}. Refusing the write; the ticker "
+            f"keeps its existing labels and its signals go stale until the next "
+            f"clean run. The usual cause is a benchmark index that failed to "
+            f"download or failed to align, which NULLs the excess-return target "
+            f"for every stock mapped to it."
+        )
+
     conn.execute(
         text("DELETE FROM signals WHERE ticker = :t AND date >= :start"),
-        {"t": ticker, "start": df["date"].min()},
+        {"t": ticker, "start": start},
     )
     df.to_sql("signals", con=conn, if_exists="append", index=False)
     return len(df)
 
 
 def compute_and_store(single_ticker: str | None = None,
-                      tickers: list[str] | None = None) -> int:
-    """Computes signals for the given tickers and upserts them."""
+                      tickers: list[str] | None = None) -> SignalsReport:
+    """
+    Computes signals for the given tickers and upserts them.
+
+    A ticker that is skipped or refused keeps whatever it already had, so this
+    degrades per ticker rather than per run: one dead benchmark index costs the
+    stocks mapped to it a day of freshness, not the other ninety their
+    forecast. Both outcomes are returned rather than only printed, because the
+    callers in scheduler.py have to decide whether the run is still worth
+    continuing and previously could not see either.
+    """
     engine = get_engine()
 
     if single_ticker:
@@ -421,7 +514,10 @@ def compute_and_store(single_ticker: str | None = None,
         to_process = get_universe()
 
     total = 0
+    processed: list[str] = []
     skipped: list[str] = []
+    refused: list[str] = []
+
     for ticker in to_process:
         ohlcv = pd.read_sql(
             text("SELECT * FROM ohlcv WHERE ticker = :t ORDER BY date ASC"),
@@ -432,18 +528,32 @@ def compute_and_store(single_ticker: str | None = None,
             skipped.append(ticker)          # reason already printed by the callee
             continue
 
-        with engine.connect() as conn:
-            written = _upsert_signals(conn, ticker, frame)
-            conn.commit()
+        try:
+            with engine.connect() as conn:
+                written = _upsert_signals(conn, ticker, frame)
+                conn.commit()
+        except LabelLossRefused as exc:
+            # Not fatal to the run, but never quiet: this is the exact failure
+            # mode that erased 22 tickers' labels while reporting success.
+            refused.append(ticker)
+            print(f"[Signals] REFUSED {exc}")
+            continue
 
         labelled = int(frame["target_excess_return"].notna().sum())
         total += written
+        processed.append(ticker)
         print(f"[Signals] {ticker}: {written} rows ({labelled} labelled)")
 
-    print(f"[Signals] Complete. {total} rows written, {len(skipped)} skipped.")
+    print(f"[Signals] Complete. {total} rows written across {len(processed)} "
+          f"tickers, {len(skipped)} skipped, {len(refused)} refused.")
     if skipped:
         print(f"[Signals] Skipped: {', '.join(skipped)}")
-    return total
+    if refused:
+        print(f"[Signals] REFUSED (labels preserved, signals now stale): "
+              f"{', '.join(refused)}")
+
+    return SignalsReport(rows_written=total, processed=processed,
+                         skipped=skipped, refused=refused)
 
 
 def count_labelled_rows(ticker: str | None = None) -> int:

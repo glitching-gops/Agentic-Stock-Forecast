@@ -1451,3 +1451,338 @@ def test_signals_router_has_no_interpolated_sql_fallback():
     assert getattr(caught.value, "status_code", None) == 404, (
         f"an injection payload must match no ticker, got {caught.value!r}"
     )
+
+
+# ── F6, second layer: labels must survive a bad benchmark ─────────────────────
+#
+# The write path had a documented three-layer defence: retry the download,
+# treat "cleans to nothing" as a failure, and refuse to write a null-target
+# frame. Only the first two were ever implemented. _upsert_signals guarded
+# `if df.empty` and nothing else, so a frame whose targets were all null was
+# written like any other -- DELETE the range, reinsert the nulls -- and the row
+# count came back healthy. These tests assert behaviour at the write boundary,
+# not the presence of a line of source.
+
+def _written_signals_table(labelled: int, rows: int = 10):
+    """A signals table holding one ticker with `labelled` of `rows` labelled."""
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")          # single shared connection
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE signals (ticker TEXT, date TEXT, close REAL, "
+            "target_return REAL, target_excess_return REAL, "
+            "benchmark_return REAL)"))
+        for i in range(rows):
+            conn.execute(
+                text("INSERT INTO signals VALUES (:t, :d, :c, :tr, :te, :br)"),
+                {"t": "TEST.NS", "d": f"2026-08-{i + 1:02d}", "c": 100.0 + i,
+                 "tr": 0.01, "te": 0.01 if i < labelled else None, "br": 0.0},
+            )
+        conn.commit()
+    return engine
+
+
+def _incoming_frame(labelled: int, rows: int = 10):
+    """A recomputed frame covering the same dates, with `labelled` labels."""
+    return pd.DataFrame({
+        "ticker": ["TEST.NS"] * rows,
+        "date": [f"2026-08-{i + 1:02d}" for i in range(rows)],
+        "close": [100.0 + i for i in range(rows)],
+        "target_return": [0.01] * rows,
+        "target_excess_return": [0.01 if i < labelled else None
+                                 for i in range(rows)],
+        "benchmark_return": [0.0] * rows,
+    })
+
+
+def _labelled_in(engine) -> int:
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        return int(conn.execute(text(
+            "SELECT COUNT(*) FROM signals "
+            "WHERE target_excess_return IS NOT NULL")).scalar())
+
+
+def _attempt_write(engine, frame):
+    from pipeline.signals import _upsert_signals
+
+    with engine.connect() as conn:
+        written = _upsert_signals(conn, "TEST.NS", frame)
+        conn.commit()
+    return written
+
+
+def test_upsert_refuses_a_write_that_would_erase_every_label():
+    """
+    The 2026-08-16 incident, reduced: a benchmark index fails, every target
+    comes back null, and the DELETE-then-reinsert wipes ~2,390 labels per
+    ticker while reporting a successful write.
+    """
+    from pipeline.signals import LabelLossRefused
+
+    engine = _written_signals_table(labelled=8)
+    assert _labelled_in(engine) == 8
+
+    with pytest.raises(LabelLossRefused):
+        _attempt_write(engine, _incoming_frame(labelled=0))
+
+    assert _labelled_in(engine) == 8, (
+        "the refusal must leave the existing labels in place -- refusing after "
+        "the DELETE would be no better than not refusing at all"
+    )
+
+
+def test_upsert_refuses_partial_label_loss_too():
+    """
+    A benchmark that aligns to only part of the history nulls only part of the
+    target column. That is the same defect at lower amplitude, and a guard that
+    only checked for an all-null frame would wave it straight through.
+    """
+    from pipeline.signals import LabelLossRefused
+
+    engine = _written_signals_table(labelled=8)
+
+    with pytest.raises(LabelLossRefused):
+        _attempt_write(engine, _incoming_frame(labelled=3))
+
+    assert _labelled_in(engine) == 8
+
+
+def test_upsert_accepts_a_write_that_adds_labels():
+    """
+    The guard must not block the backfill it sits next to. F6 exists because
+    labels were NOT being refreshed; a guard that refused every rewrite would
+    reintroduce it.
+    """
+    engine = _written_signals_table(labelled=8)
+
+    written = _attempt_write(engine, _incoming_frame(labelled=9))
+
+    assert written == 10
+    assert _labelled_in(engine) == 9
+
+
+def test_upsert_allows_a_first_write_with_no_labels_yet():
+    """
+    A newly listed ticker has no computable forward label anywhere in its
+    history -- every target is legitimately null. Refusing all-null frames as a
+    rule would lock such a ticker out of the signals table permanently, so the
+    guard compares counts rather than testing for nulls.
+    """
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text(
+            "CREATE TABLE signals (ticker TEXT, date TEXT, close REAL, "
+            "target_return REAL, target_excess_return REAL, "
+            "benchmark_return REAL)"))
+        conn.commit()
+
+    assert _attempt_write(engine, _incoming_frame(labelled=0)) == 10
+
+
+def test_compute_signals_frame_skips_a_benchmark_that_does_not_align():
+    """
+    `benchmark.empty` catches a download that returned nothing. It does not
+    catch one that returned rows for the wrong dates -- a truncated history, or
+    a merge that misses -- which leaves benchmark_close entirely null after the
+    ffill and produces a frame with a null target on every row. The old code
+    took that branch silently via `else: benchmark_return = np.nan`.
+    """
+    from pipeline import signals
+
+    sessions = pd.bdate_range("2024-01-01", periods=400).strftime("%Y-%m-%d")
+    prices = np.linspace(100.0, 180.0, len(sessions))
+    ohlcv = pd.DataFrame({
+        "ticker": "TEST.NS", "date": sessions, "open": prices,
+        "high": prices * 1.01, "low": prices * 0.99, "close": prices,
+        "adj_close": prices, "volume": 1_000_000.0,
+    })
+
+    # Non-empty, and every date outside the ticker's sessions.
+    misaligned = pd.DataFrame({
+        "date": pd.bdate_range("2019-01-01", periods=300).strftime("%Y-%m-%d"),
+        "benchmark_close": np.linspace(20000.0, 24000.0, 300),
+    })
+
+    original_bench = signals.get_benchmark_series
+    original_map = signals.get_benchmark
+    original_earnings = signals.compute_earnings_surprise
+    signals.get_benchmark_series = lambda *a, **k: misaligned
+    signals.get_benchmark = lambda t: ("^CNXENERGY", True)
+    signals.compute_earnings_surprise = lambda t, df: df.assign(earnings_surprise=0.0)
+    try:
+        frame = signals.compute_signals_frame("TEST.NS", ohlcv)
+    finally:
+        signals.get_benchmark_series = original_bench
+        signals.get_benchmark = original_map
+        signals.compute_earnings_surprise = original_earnings
+
+    assert frame is None, (
+        "a benchmark that does not align must be skipped, not written as a "
+        "frame whose every target is null"
+    )
+
+
+# ── An abort must fail the run, not report success ────────────────────────────
+#
+# scheduler.py contained no sys.exit, no raise and no non-zero return, so every
+# abort path exited 0 and GitHub Actions marked the run green. Two scheduled
+# daily runs (2026-08-17, 2026-08-18) aborted on the F6 guard, published
+# nothing, and both showed as successful; the staleness was noticed from the
+# dashboard two days later.
+
+def _stub_daily(monkeypatch, **overrides):
+    """Neutralises the daily job's dependencies, then applies overrides."""
+    import agents.graph
+    import data.tickers
+    import data.universe
+    import pipeline.fetch
+    import pipeline.macro
+    import pipeline.sentiment
+    import pipeline.signals
+
+    defaults = {
+        (data.universe, "sync_current_membership"): lambda: None,
+        (data.tickers, "refresh_metadata"): lambda: None,
+        (data.universe, "get_ingest_universe"): lambda: ["A.NS"],
+        (data.universe, "get_universe"): lambda: ["A.NS"],
+        (pipeline.fetch, "fetch_and_store"): lambda **k: None,
+        (pipeline.signals, "compute_and_store"):
+            lambda **k: pipeline.signals.SignalsReport(10, ["A.NS"], [], []),
+        (pipeline.signals, "count_labelled_rows"): lambda *a: 100,
+        (pipeline.sentiment, "fetch_and_score"): lambda **k: None,
+        (pipeline.macro, "fetch_and_store"): lambda: None,
+        (agents.graph, "run_graph"): lambda t: {"forecast_available": True},
+        (agents.graph, "prune_leaderboard"): lambda u: 0,
+    }
+    for (module, name), value in defaults.items():
+        monkeypatch.setattr(module, name, overrides.pop(name, value))
+    assert not overrides, f"unknown override: {list(overrides)}"
+
+
+def test_daily_job_raises_when_the_universe_is_empty(monkeypatch):
+    import scheduler
+
+    _stub_daily(monkeypatch, get_universe=lambda: [])
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_pipeline_job()
+
+
+def test_daily_job_raises_when_labels_would_regress(monkeypatch):
+    """The F6 backstop. It used to log and return, which exited 0."""
+    import scheduler
+
+    counts = iter([100, 40, 40])
+    _stub_daily(monkeypatch, count_labelled_rows=lambda *a: next(counts))
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_pipeline_job()
+
+
+def test_daily_job_raises_when_no_ticker_produced_a_forecast(monkeypatch):
+    """
+    Every ticker failing publishes exactly as much as aborting does -- nothing
+    -- and used to report exactly the same way: success.
+    """
+    import scheduler
+
+    _stub_daily(monkeypatch,
+                run_graph=lambda t: {"forecast_available": False,
+                                     "forecast_error": "no model"})
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_pipeline_job()
+
+
+def test_daily_job_reraises_unexpected_errors(monkeypatch):
+    """
+    The catch-all `except Exception` logged the traceback and swallowed it, so
+    an outright crash mid-run also exited 0.
+    """
+    import scheduler
+
+    def boom():
+        raise ValueError("supabase unreachable")
+
+    _stub_daily(monkeypatch, sync_current_membership=boom)
+
+    with pytest.raises(ValueError, match="supabase unreachable"):
+        scheduler.run_pipeline_job()
+
+
+def test_daily_job_still_succeeds_on_a_healthy_run(monkeypatch):
+    """The guards must not turn a normal run red."""
+    import scheduler
+
+    _stub_daily(monkeypatch)
+    scheduler.run_pipeline_job()          # must not raise
+
+
+def test_daily_job_continues_when_only_some_tickers_are_refused(monkeypatch):
+    """
+    A dead benchmark index costs the tickers mapped to it a day of freshness.
+    It must not cost the other ninety their forecast -- the run degrades per
+    ticker, and only a total loss aborts.
+    """
+    import pipeline.signals
+    import scheduler
+
+    _stub_daily(
+        monkeypatch,
+        get_universe=lambda: ["A.NS", "B.NS"],
+        compute_and_store=lambda **k: pipeline.signals.SignalsReport(
+            10, ["A.NS"], [], ["B.NS"]),
+    )
+    scheduler.run_pipeline_job()          # must not raise
+
+
+def test_daily_job_raises_when_every_ticker_was_skipped_or_refused(monkeypatch):
+    """
+    Total loss is not degradation. If no ticker's signals could be written, the
+    whole universe would be forecast on yesterday's features -- and the F6 count
+    guard below cannot see it, because refusing to write is exactly what keeps
+    the labelled count flat.
+    """
+    import pipeline.signals
+    import scheduler
+
+    _stub_daily(
+        monkeypatch,
+        get_universe=lambda: ["A.NS", "B.NS"],
+        compute_and_store=lambda **k: pipeline.signals.SignalsReport(
+            0, [], ["A.NS"], ["B.NS"]),
+        run_graph=lambda t: pytest.fail("must abort before forecasting"),
+    )
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_pipeline_job()
+
+
+def test_weekly_job_raises_when_labels_would_regress(monkeypatch):
+    import data.tickers
+    import data.universe
+    import pipeline.fetch
+    import pipeline.model
+    import pipeline.signals
+    import scheduler
+
+    counts = iter([100, 40])
+    monkeypatch.setattr(data.universe, "sync_current_membership", lambda: None)
+    monkeypatch.setattr(data.tickers, "refresh_metadata", lambda: None)
+    monkeypatch.setattr(data.universe, "get_ingest_universe", lambda: ["A.NS"])
+    monkeypatch.setattr(data.universe, "get_universe", lambda: ["A.NS"])
+    monkeypatch.setattr(pipeline.fetch, "fetch_and_store", lambda **k: None)
+    monkeypatch.setattr(pipeline.signals, "compute_and_store",
+                        lambda **k: pipeline.signals.SignalsReport(10, ["A.NS"], [], []))
+    monkeypatch.setattr(pipeline.signals, "count_labelled_rows",
+                        lambda *a: next(counts))
+    monkeypatch.setattr(pipeline.model, "evaluate_and_persist_universe",
+                        lambda **k: pytest.fail("must abort before evaluating"))
+
+    with pytest.raises(scheduler.PipelineAbort):
+        scheduler.run_weekly_evaluation_job()
