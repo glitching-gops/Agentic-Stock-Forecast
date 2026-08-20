@@ -99,6 +99,86 @@ class PurgedWalkForward:
         }
 
 
+@dataclass(frozen=True)
+class PurgedPanelWalkForward:
+    """
+    Rolling-origin splitter for a PANEL, indexed on the shared date grid.
+
+    ``PurgedWalkForward`` splits on row positions, which is correct for one
+    ticker's series and wrong for a panel: row 500 of a long frame holding 46
+    tickers is somewhere in the first fortnight, not two years in, and tickers
+    join the panel at different dates so a positional boundary falls on a
+    different calendar date for each of them. Splitting on the date grid keeps
+    one boundary for the whole cross-section, which is the only way a fold's
+    training set can be said to precede its test set.
+
+    The purge arithmetic is identical to the per-ticker case, just measured in
+    dates: a training row on grid date ``i`` carries a label spanning
+    ``[i, i + horizon]``, so it overlaps a test window opening at ``t``
+    whenever ``i + horizon >= t``. Training therefore ends at
+    ``t - horizon - embargo``.
+
+    Args:
+        n_folds:   number of successive test windows.
+        horizon:   label length in sessions. Must match the target's horizon.
+        embargo:   extra dates dropped from the end of training. Defaults to
+                   the horizon.
+        min_train: grid position at which the FIRST test window opens, counted
+                   in DATES, not rows.
+    """
+
+    n_folds: int = 5
+    horizon: int = 30
+    embargo: int | None = None
+    min_train: int = 500
+
+    @property
+    def effective_embargo(self) -> int:
+        return self.horizon if self.embargo is None else self.embargo
+
+    def split(self, dates: Sequence[str]) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """
+        Yields (train_row_idx, test_row_idx) into a frame whose ``date`` column
+        is `dates`. Repeated dates are expected — that is what makes it a panel.
+        """
+        dates = np.asarray(dates)
+        grid = np.unique(dates)                      # unique() sorts
+        n = len(grid)
+
+        usable = n - self.min_train
+        if usable <= 0:
+            return
+
+        step = max(1, usable // self.n_folds)
+        position = np.searchsorted(grid, dates)      # grid index of every row
+
+        for fold in range(self.n_folds):
+            test_start = self.min_train + fold * step
+            test_end = min(test_start + step, n)
+            if test_end <= test_start:
+                continue
+
+            train_end = test_start - self.horizon - self.effective_embargo
+            if train_end < self.min_train // 2:
+                continue
+
+            train_idx = np.flatnonzero(position < train_end)
+            test_idx = np.flatnonzero((position >= test_start) & (position < test_end))
+            if len(train_idx) == 0 or len(test_idx) == 0:
+                continue
+
+            yield train_idx, test_idx
+
+    def describe(self) -> dict:
+        return {
+            "splitter": "PurgedPanelWalkForward",
+            "n_folds": self.n_folds,
+            "horizon": self.horizon,
+            "embargo": self.effective_embargo,
+            "min_train_dates": self.min_train,
+        }
+
+
 def assert_no_leakage(
     train_dates: Sequence[str],
     test_dates: Sequence[str],
@@ -367,6 +447,134 @@ def walk_forward(
     )
 
 
+# ── Panel evaluation ──────────────────────────────────────────────────────────
+
+
+@dataclass
+class PanelResult:
+    """Out-of-sample panel predictions from one pooled model or baseline."""
+
+    name: str
+    n_folds_run: int
+    n_predictions: int
+    predictions: pd.DataFrame = field(repr=False)   # date, ticker, y_true, y_pred, fold
+    metrics: dict = field(default_factory=dict)
+    cross_sectional: dict = field(default_factory=dict)
+    protocol: dict = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        payload = {k: v for k, v in asdict(self).items() if k != "predictions"}
+        return json.dumps(payload, indent=2, default=str)
+
+
+def panel_walk_forward(
+    panel: pd.DataFrame,
+    feature_cols: Sequence[str],
+    model_factory: Callable[[], object],
+    splitter: PurgedPanelWalkForward | None = None,
+    name: str = "",
+    target: str = "target_excess_return",
+    rebalance_every: int = 30,
+) -> PanelResult:
+    """
+    Runs a pooled model across the whole cross-section under purged folds.
+
+    Every model and every baseline goes through this one function, on the same
+    folds, over the same rows. That is the point: the reason the Phase 0 headline
+    survived as long as it did is that nothing was ever scored beside a
+    comparator on identical windows, so there was no arithmetic that could
+    contradict it.
+
+    Rows whose label is not yet knowable are dropped from BOTH sides. Keeping
+    them in the test set would score a prediction against a NaN; keeping them in
+    training would ask the model to fit one.
+    """
+    splitter = splitter or PurgedPanelWalkForward()
+    required = {"date", "ticker", target}
+    missing = required - set(panel.columns)
+    if missing:
+        raise ValueError(f"panel_walk_forward needs columns {missing}")
+
+    panel = panel.sort_values(["date", "ticker"]).reset_index(drop=True)
+    features = [c for c in feature_cols if c in panel.columns]
+    y_all = pd.to_numeric(panel[target], errors="coerce")
+    dates = panel["date"].to_numpy()
+
+    rows: list[pd.DataFrame] = []
+    folds_run = 0
+
+    for fold, (train_idx, test_idx) in enumerate(splitter.split(dates)):
+        train_labelled = train_idx[np.isfinite(y_all.to_numpy()[train_idx])]
+        test_labelled = test_idx[np.isfinite(y_all.to_numpy()[test_idx])]
+        if len(train_labelled) < 100 or len(test_labelled) == 0:
+            continue
+
+        X_train = panel.iloc[train_labelled][features]
+        y_train = y_all.iloc[train_labelled]
+        X_test = panel.iloc[test_labelled][features]
+
+        model = model_factory()
+        model.fit(X_train, y_train)
+        y_pred = np.asarray(model.predict(X_test), dtype=float)
+
+        rows.append(pd.DataFrame({
+            "date": panel.iloc[test_labelled]["date"].to_numpy(),
+            "ticker": panel.iloc[test_labelled]["ticker"].to_numpy(),
+            "y_true": y_all.iloc[test_labelled].to_numpy(dtype=float),
+            "y_pred": y_pred,
+            "fold": fold,
+        }))
+        folds_run += 1
+
+    if not rows:
+        return PanelResult(name, 0, 0, pd.DataFrame(
+            columns=["date", "ticker", "y_true", "y_pred", "fold"]),
+            protocol=splitter.describe())
+
+    preds = pd.concat(rows, ignore_index=True)
+
+    metrics = compute_metrics(preds["y_true"].to_numpy(),
+                              preds["y_pred"].to_numpy(),
+                              horizon=splitter.horizon)
+    metrics["daily_rank_ic"] = _mean_daily_rank_ic(preds)
+
+    return PanelResult(
+        name=name,
+        n_folds_run=folds_run,
+        n_predictions=len(preds),
+        predictions=preds,
+        metrics=metrics,
+        cross_sectional=cross_sectional_report(preds, rebalance_every=rebalance_every),
+        protocol=splitter.describe(),
+    )
+
+
+def _mean_daily_rank_ic(preds: pd.DataFrame) -> float:
+    """
+    Mean of the per-date rank IC.
+
+    Distinct from the pooled ``rank_ic`` in ``metrics``, and the more honest of
+    the two for a ranking product. Pooling every (date, ticker) row into one
+    correlation lets a model score well by knowing which MONTHS were good for
+    the market rather than which STOCKS were good on a given day — a
+    time-series effect masquerading as cross-sectional skill. Ranking within
+    each date and then averaging removes it.
+
+    The gap is not hypothetical. ``TrainMeanForecast`` predicts one constant
+    per fold and therefore has no ranking information whatsoever, yet on the
+    first panel run it scored a pooled rank IC of -0.105: the constant differs
+    BETWEEN folds, so pooling let the correlation pick up which fold a row came
+    from. Its daily IC is correctly undefined. Any comparator whose pooled IC
+    is large while its daily IC is NaN is reporting fold identity, not skill.
+    """
+    per_date = preds.groupby("date").apply(
+        lambda d: rank_ic(d["y_true"].to_numpy(), d["y_pred"].to_numpy()),
+        include_groups=False,
+    )
+    per_date = per_date[np.isfinite(per_date)]
+    return float(per_date.mean()) if len(per_date) else float("nan")
+
+
 # ── Cross-sectional evaluation ────────────────────────────────────────────────
 
 
@@ -396,14 +604,40 @@ def cross_sectional_report(
     if panel.empty:
         return {"n_rebalances": 0, "note": "no out-of-sample panel rows"}
 
+    # A DETERMINISTIC, NON-ALPHABETICAL TIEBREAK.
+    #
+    # This sorts by prediction to form quantiles, and pandas' sort is stable, so
+    # tied predictions keep their incoming order — which is (date, ticker), i.e.
+    # alphabetical. On the first panel run that turned every constant baseline
+    # into a real-looking portfolio: `zero`, `train_mean` and `majority` each
+    # reported alpha +0.00914 at t = +1.19 and a long-short spread of +0.01744,
+    # all of it the return of holding the alphabetically-first fifth of the
+    # universe. A predictor with no ordering must produce no ranking result.
+    #
+    # Two changes follow. Dates whose predictions are entirely tied are skipped
+    # outright — there is nothing to rank, and a skip reports that honestly as a
+    # lower `n_rebalances` rather than as a number. Partial ties, which are rare
+    # for a continuous prediction but routine for a clipped or rounded one, are
+    # broken by a hash of the ticker instead of its spelling.
+    tie = pd.util.hash_pandas_object(panel["ticker"], index=False).to_numpy()
+    panel = panel.assign(_tiebreak=tie)
+
     dates = sorted(panel["date"].unique())[::rebalance_every]
     records = []
+    degenerate = 0
 
     for dt in dates:
         day = panel[panel["date"] == dt]
         if len(day) < max(10, quantiles * 2):
             continue
-        day = day.sort_values("y_pred", ascending=False)
+
+        pred = day["y_pred"].to_numpy(dtype=float)
+        finite = np.isfinite(pred)
+        if finite.sum() < max(10, quantiles * 2) or np.ptp(pred[finite]) == 0:
+            degenerate += 1
+            continue
+
+        day = day.sort_values(["y_pred", "_tiebreak"], ascending=[False, True])
         k = max(2, len(day) // quantiles)
         records.append({
             "date": dt,
@@ -415,7 +649,10 @@ def cross_sectional_report(
         })
 
     if not records:
-        return {"n_rebalances": 0, "note": "not enough breadth per date to rank"}
+        note = ("every rebalance date carried a constant prediction, so there "
+                "was no ordering to evaluate"
+                if degenerate else "not enough breadth per date to rank")
+        return {"n_rebalances": 0, "n_dates_no_ordering": degenerate, "note": note}
 
     R = pd.DataFrame(records)
     alpha = R["top"] - R["all"]
@@ -434,6 +671,7 @@ def cross_sectional_report(
 
     return {
         "n_rebalances": len(R),
+        "n_dates_no_ordering": degenerate,
         "mean_rank_ic": float(R["ic"].mean()),
         "rank_ic_t": ic_t,
         "rank_ic_p": ic_p,

@@ -1,0 +1,601 @@
+"""
+tests/test_phase2_baselines.py — Guards for the Phase 2 comparator harness.
+
+Phase 2 exists to attack a null result, which makes it the phase most likely to
+manufacture a positive one. Every test here pins a specific way that could
+happen:
+
+  - a pooled model reading ticker identity out of a price-denominated column
+  - a z-score computed over a whole history rather than within a date
+  - a panel split on row position, so the fold boundary lands on a different
+    calendar date for every ticker
+  - a constant prediction being credited with a portfolio it never chose
+
+The last of those was not hypothetical. It was found by running the harness:
+`zero`, `train_mean` and `majority` each reported alpha +0.00914 at t = +1.19,
+which was the return of holding the alphabetically-first fifth of the universe.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from pipeline import baselines as B
+from pipeline import panel as P
+from pipeline.evaluation import (
+    PurgedPanelWalkForward,
+    cross_sectional_report,
+    panel_walk_forward,
+)
+
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
+
+
+def make_panel(n_dates: int = 800, n_tickers: int = 20, seed: int = 0,
+               with_signal: bool = False) -> pd.DataFrame:
+    """A synthetic panel with the same columns the real loader produces."""
+    rng = np.random.default_rng(seed)
+    dates = [f"{2015 + i // 252}-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}-{i:04d}"
+             for i in range(n_dates)]
+    tickers = [f"T{i:02d}.NS" for i in range(n_tickers)]
+
+    rows = []
+    for d in dates:
+        for t in tickers:
+            row = {"date": d, "ticker": t, "close": 100.0,
+                   "benchmark_ticker": "^NSEI"}
+            for col in P.FEATURES:
+                row[col] = float(rng.normal())
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if with_signal:
+        # A genuine, recoverable cross-sectional signal, so a test can tell
+        # "the harness found nothing" apart from "the harness cannot find
+        # anything".
+        df[P.TARGET] = 0.05 * df["roc_10"] + 0.01 * np.random.default_rng(seed + 1
+                                                                          ).normal(size=len(df))
+    else:
+        df[P.TARGET] = rng.normal(size=len(df)) * 0.05
+
+    # The most recent horizon of dates has no knowable label yet, as in production.
+    df.loc[df["date"].isin(dates[-30:]), P.TARGET] = np.nan
+    return df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+# ── Feature taxonomy ──────────────────────────────────────────────────────────
+
+
+def test_panel_features_match_the_production_model():
+    """
+    panel.FEATURES is maintained separately from model.FEATURES so the panel
+    does not import XGBoost. Separately maintained lists drift; this is the
+    only thing stopping them.
+    """
+    from pipeline.model import FEATURES as MODEL_FEATURES
+    assert P.FEATURES == MODEL_FEATURES
+
+
+def test_scale_free_and_price_scaled_partition_the_features():
+    from pipeline.signals import FEATURE_COLS
+    assert set(P.SCALE_FREE) | set(P.PRICE_SCALED) == set(FEATURE_COLS)
+    assert not (set(P.SCALE_FREE) & set(P.PRICE_SCALED))
+
+
+def test_obv_is_treated_as_price_scaled():
+    """
+    OBV is a cumulative sum from the first row of a ticker's history, so its
+    level encodes how long that history is and how heavily the name trades.
+    Pooled, it is a ticker label. Naming it explicitly because it is the one
+    most likely to be waved through as "just another indicator".
+    """
+    assert "obv" in P.PRICE_SCALED
+    assert "obv" not in B.FACTORS
+
+
+def test_linear_factor_set_contains_no_price_denominated_column():
+    for col in B.FACTORS:
+        assert col in P.SCALE_FREE, f"{col} is denominated in price or volume"
+
+
+def test_macro_columns_are_excluded_from_the_factor_set():
+    """
+    Every ticker sees the same USDINR on a given date, so after cross-sectional
+    standardisation a macro column is identically zero and carries no ranking
+    information. Including one would be harmless but misleading — it would
+    appear in the loadings table with a coefficient that cannot mean anything.
+    """
+    for col in P.MACRO_COLS:
+        assert col not in B.FACTORS
+
+
+# ── Cross-sectional standardisation ───────────────────────────────────────────
+
+
+def test_zscore_is_computed_within_a_date_not_across_time():
+    """
+    THE leakage test for this module. A z-score taken over a column's whole
+    history uses a mean and standard deviation drawn partly from the future;
+    one taken within a date does not.
+
+    Appending later dates must therefore leave every earlier date's z-score
+    bit-for-bit unchanged. If it does not, the transform is reading forward.
+    """
+    full = make_panel(n_dates=300, n_tickers=15, seed=3)
+    early_dates = sorted(full["date"].unique())[:150]
+    early = full[full["date"].isin(early_dates)].reset_index(drop=True)
+
+    z_full = P.cross_sectional_zscore(full, ["roc_10"])
+    z_early = P.cross_sectional_zscore(early, ["roc_10"])
+
+    a = z_full[z_full["date"].isin(early_dates)].sort_values(["date", "ticker"])
+    b = z_early.sort_values(["date", "ticker"])
+
+    np.testing.assert_allclose(a["roc_10"].to_numpy(), b["roc_10"].to_numpy())
+
+
+def test_zscore_removes_a_pure_level_difference_between_tickers():
+    """A constant offset per ticker is exactly what a pooled model must not see."""
+    df = make_panel(n_dates=60, n_tickers=20, seed=5)
+    offset = {t: 1000.0 * i for i, t in enumerate(sorted(df["ticker"].unique()))}
+    df["roc_10"] = df["roc_10"] + df["ticker"].map(offset)
+
+    z = P.cross_sectional_zscore(df, ["roc_10"])
+    per_date_std = z.groupby("date")["roc_10"].std()
+    # Ordering survives; the 1000x level differences do not.
+    assert z["roc_10"].abs().max() <= P.ZSCORE_CLIP + 1e-9
+    assert per_date_std.between(0.5, 1.5).all()
+
+
+def test_zscore_zeroes_a_date_too_thin_to_standardise():
+    df = make_panel(n_dates=20, n_tickers=4, seed=7)
+    z = P.cross_sectional_zscore(df, ["roc_10"], min_names=10)
+    assert (z["roc_10"] == 0.0).all()
+
+
+def test_zscore_clips_outliers():
+    df = make_panel(n_dates=10, n_tickers=30, seed=9)
+    df.loc[0, "roc_10"] = 1e6
+    z = P.cross_sectional_zscore(df, ["roc_10"])
+    assert z["roc_10"].max() <= P.ZSCORE_CLIP + 1e-9
+    assert z["roc_10"].min() >= -P.ZSCORE_CLIP - 1e-9
+
+
+# ── The panel splitter ────────────────────────────────────────────────────────
+
+
+def test_panel_split_leaves_a_purge_gap_measured_in_dates():
+    df = make_panel(n_dates=900, n_tickers=10, seed=11)
+    grid = sorted(df["date"].unique())
+    pos = {d: i for i, d in enumerate(grid)}
+    splitter = PurgedPanelWalkForward(n_folds=4, horizon=30, embargo=30,
+                                      min_train=500)
+
+    folds = list(splitter.split(df["date"].to_numpy()))
+    assert folds, "splitter produced no folds"
+
+    for train_idx, test_idx in folds:
+        last_train = max(pos[d] for d in df.iloc[train_idx]["date"])
+        first_test = min(pos[d] for d in df.iloc[test_idx]["date"])
+        assert first_test - last_train > 30 + 30, (
+            f"purge gap is {first_test - last_train} dates, needs > 60"
+        )
+
+
+def test_panel_split_never_puts_a_training_date_after_a_test_date():
+    df = make_panel(n_dates=800, n_tickers=8, seed=13)
+    splitter = PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500)
+    for train_idx, test_idx in splitter.split(df["date"].to_numpy()):
+        assert df.iloc[train_idx]["date"].max() < df.iloc[test_idx]["date"].min()
+
+
+def test_panel_split_uses_one_date_boundary_for_every_ticker():
+    """
+    The reason this splitter exists rather than PurgedWalkForward. Tickers join
+    the panel at different dates, so a boundary at row position 500 falls on a
+    different calendar date for each of them; a date boundary does not.
+    """
+    df = make_panel(n_dates=800, n_tickers=6, seed=17)
+    # Give one ticker a much shorter history, as a recent listing would have.
+    late = sorted(df["date"].unique())[400]
+    df = df[(df["ticker"] != "T00.NS") | (df["date"] >= late)].reset_index(drop=True)
+
+    splitter = PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500)
+    for _, test_idx in splitter.split(df["date"].to_numpy()):
+        block = df.iloc[test_idx]
+        # Every ticker present in the fold spans the identical date range.
+        spans = block.groupby("ticker")["date"].agg(["min", "max"])
+        assert spans["min"].nunique() == 1 or len(spans) == 1
+        assert spans["max"].nunique() == 1 or len(spans) == 1
+
+
+def test_panel_split_yields_nothing_when_min_train_exceeds_the_grid():
+    df = make_panel(n_dates=100, n_tickers=5, seed=19)
+    splitter = PurgedPanelWalkForward(n_folds=5, horizon=30, min_train=500)
+    assert list(splitter.split(df["date"].to_numpy())) == []
+
+
+# ── The panel harness ─────────────────────────────────────────────────────────
+
+
+class _Spy:
+    """Records the rows and labels it was fitted on, so a test can inspect them."""
+
+    seen: list[pd.DataFrame] = []
+    labels: list[pd.Series] = []
+
+    def fit(self, X, y):
+        _Spy.seen.append(X.copy())
+        _Spy.labels.append(pd.Series(y).copy())
+        return self
+
+    def predict(self, X):
+        return np.zeros(len(X), dtype=float)
+
+
+def _spy_run(df, n_folds=3):
+    _Spy.seen = []
+    _Spy.labels = []
+    res = panel_walk_forward(
+        panel=df, feature_cols=["_row"], model_factory=_Spy,
+        splitter=PurgedPanelWalkForward(n_folds=n_folds, horizon=30,
+                                        min_train=500),
+        name="spy",
+    )
+    return res, list(_Spy.seen)
+
+
+def test_harness_never_fits_a_model_on_a_row_it_will_score():
+    """
+    Checked PER FOLD, which is the property that actually matters and is easy
+    to get wrong in the other direction: fold 3 legitimately trains on rows
+    fold 1 was scored on, because by fold 3's turn those rows are in the past.
+    A test that forbade all reuse across folds would be forbidding the
+    expanding window itself.
+    """
+    df = make_panel(n_dates=900, n_tickers=10, seed=23)
+    df["_row"] = np.arange(len(df), dtype=float)
+
+    res, blocks = _spy_run(df)
+    assert res.n_folds_run > 0
+    folds = sorted(res.predictions["fold"].unique())
+    assert len(blocks) == len(folds)
+
+    for block, fold in zip(blocks, folds):
+        keys = res.predictions[res.predictions["fold"] == fold][["date", "ticker"]]
+        scored = set(df.merge(keys, on=["date", "ticker"])["_row"].tolist())
+        fitted = set(block["_row"].tolist())
+        assert not (fitted & scored), f"fold {fold} scored a row it was fitted on"
+        assert max(fitted) < min(scored), (
+            f"fold {fold} trained on a row positioned after its own test window"
+        )
+
+
+def test_harness_uses_an_expanding_window():
+    """
+    Each fold trains on everything available up to its purge boundary, so the
+    training set grows monotonically. Pinned because the alternative — a
+    fixed-width rolling window — is a different experiment, and switching
+    between them silently would move every metric with no visible cause.
+    """
+    df = make_panel(n_dates=900, n_tickers=10, seed=23)
+    df["_row"] = np.arange(len(df), dtype=float)
+
+    _, blocks = _spy_run(df)
+    sizes = [len(b) for b in blocks]
+    assert sizes == sorted(sizes) and len(set(sizes)) == len(sizes), sizes
+    for earlier, later in zip(blocks, blocks[1:]):
+        assert set(earlier["_row"]).issubset(set(later["_row"]))
+
+
+def test_harness_never_hands_a_model_an_unknowable_label():
+    """
+    The training half of the same rule. Scoring against a NaN is obviously
+    wrong and is caught elsewhere; ASKING A MODEL TO FIT ONE is quieter,
+    because several estimators here coerce NaN to zero on the way in and carry
+    on. A model fitted on a fabricated zero label has been taught that the most
+    recent 30 sessions were all flat.
+    """
+    df = make_panel(n_dates=900, n_tickers=10, seed=23)
+
+    # A ticker whose history ENDS mid-panel — a delisting or a suspension. Its
+    # own trailing 30 sessions are unlabelled like any other, but they sit in
+    # the MIDDLE of the date grid rather than at the end, so they fall inside
+    # the training window of every later fold. Without the interior case this
+    # test cannot fail: the unlabelled tail of a live ticker is always beyond
+    # the last training boundary anyway.
+    grid = sorted(df["date"].unique())
+    gone = df["ticker"] == "T00.NS"
+    df = df[~(gone & df["date"].isin(grid[600:]))].reset_index(drop=True)
+    df.loc[(df["ticker"] == "T00.NS") & df["date"].isin(grid[570:600]),
+           P.TARGET] = np.nan
+    df["_row"] = np.arange(len(df), dtype=float)
+    assert df[P.TARGET].isna().sum() > 30, "fixture did not create interior gaps"
+
+    res, _ = _spy_run(df)
+    assert res.n_folds_run > 0
+    assert _Spy.labels, "the spy was never fitted"
+    for y in _Spy.labels:
+        assert np.isfinite(y.to_numpy(dtype=float)).all(), (
+            "a model was fitted on a row whose label is not yet knowable"
+        )
+
+
+def test_harness_drops_rows_whose_label_is_not_yet_knowable():
+    df = make_panel(n_dates=900, n_tickers=10, seed=29)
+    res = panel_walk_forward(
+        panel=df, feature_cols=B.FACTORS, model_factory=B.ZeroForecast,
+        splitter=PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500),
+        name="zero",
+    )
+    assert res.n_predictions > 0
+    assert res.predictions["y_true"].notna().all()
+
+
+def test_harness_recovers_a_signal_that_is_really_there():
+    """
+    A null-result harness that reports null on everything is not measuring, it
+    is broken. This plants a linear cross-sectional signal and requires the
+    linear comparator to find it.
+    """
+    df = make_panel(n_dates=900, n_tickers=25, seed=31, with_signal=True)
+    df = P.cross_sectional_zscore(df, P.SCALE_FREE)
+    res = panel_walk_forward(
+        panel=df, feature_cols=B.FACTORS, model_factory=B.LinearFactorModel,
+        splitter=PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500),
+        name="linear_factor",
+    )
+    assert res.metrics["daily_rank_ic"] > 0.20, res.metrics
+
+
+def test_harness_reports_no_folds_rather_than_guessing():
+    df = make_panel(n_dates=100, n_tickers=5, seed=37)
+    res = panel_walk_forward(
+        panel=df, feature_cols=B.FACTORS, model_factory=B.ZeroForecast,
+        splitter=PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500),
+        name="zero",
+    )
+    assert res.n_folds_run == 0 and res.n_predictions == 0
+
+
+def test_harness_rejects_a_frame_without_the_panel_columns():
+    with pytest.raises(ValueError):
+        panel_walk_forward(panel=pd.DataFrame({"date": ["2020-01-01"]}),
+                           feature_cols=[], model_factory=B.ZeroForecast)
+
+
+# ── Baselines ─────────────────────────────────────────────────────────────────
+
+
+def test_zero_forecast_predicts_zero():
+    X = pd.DataFrame({"a": [1.0, 2.0, 3.0]})
+    assert (B.ZeroForecast().fit(X, pd.Series([1.0, 2.0, 3.0])).predict(X) == 0).all()
+
+
+def test_majority_direction_is_fitted_on_training_data_only():
+    """
+    The difference between this and evaluation.majority_hit_rate, which reads
+    the majority off the test set. A baseline that consults the answer is not a
+    baseline.
+    """
+    y_train = pd.Series([-1.0] * 80 + [1.0] * 20)
+    X = pd.DataFrame({"a": np.zeros(100)})
+    model = B.MajorityDirection().fit(X, y_train)
+    assert model.sign_ == -1.0
+    assert (model.predict(pd.DataFrame({"a": np.zeros(5)})) == -1.0).all()
+
+
+def test_train_mean_predicts_the_training_mean():
+    y = pd.Series([0.02, 0.04, 0.06])
+    model = B.TrainMeanForecast().fit(pd.DataFrame({"a": [0, 0, 0]}), y)
+    assert model.mu_ == pytest.approx(0.04)
+
+
+def test_single_factor_recovers_a_known_slope():
+    rng = np.random.default_rng(41)
+    x = rng.normal(size=500)
+    X = pd.DataFrame({"sector_rel_20d": x})
+    y = pd.Series(0.7 * x + 0.001)
+    model = B.SingleFactor("sector_rel_20d").fit(X, y)
+    assert model.slope_ == pytest.approx(0.7, abs=0.01)
+
+
+def test_single_factor_preserves_a_negative_slope():
+    """A reversal is a finding, not something to clamp away."""
+    rng = np.random.default_rng(43)
+    x = rng.normal(size=500)
+    model = B.SingleFactor("lag5_ret").fit(pd.DataFrame({"lag5_ret": x}),
+                                           pd.Series(-0.5 * x))
+    assert model.slope_ < 0
+
+
+def test_linear_factor_model_is_readable_after_fitting():
+    df = make_panel(n_dates=50, n_tickers=25, seed=47, with_signal=True)
+    df = P.cross_sectional_zscore(df, P.SCALE_FREE)
+    model = B.LinearFactorModel().fit(df[B.FACTORS], df[P.TARGET].fillna(0.0))
+    coefs = model.coefficients()
+    assert set(coefs) == set(B.FACTORS)
+    assert abs(coefs["roc_10"]) == max(abs(v) for v in coefs.values())
+
+
+def test_every_registered_baseline_runs_through_the_harness():
+    df = make_panel(n_dates=800, n_tickers=20, seed=53)
+    df = P.cross_sectional_zscore(df, P.SCALE_FREE)
+    splitter = PurgedPanelWalkForward(n_folds=2, horizon=30, min_train=500)
+    for name, factory in B.BASELINES.items():
+        res = panel_walk_forward(panel=df, feature_cols=B.FACTORS,
+                                 model_factory=factory, splitter=splitter,
+                                 name=name)
+        assert res.n_predictions > 0, f"{name} produced nothing"
+
+
+def test_a_constant_per_fold_predictor_has_no_daily_rank_ic():
+    """
+    Pins the difference between the two IC columns. TrainMeanForecast emits one
+    constant per fold, so it holds no ranking information at all — yet on the
+    first real panel run its POOLED rank IC came out at -0.007 because the
+    constant differs between folds and the correlation picked up which fold a
+    row belonged to. The daily IC, computed within each date, is correctly
+    undefined. If this ever starts returning a number, the daily statistic has
+    silently become the pooled one.
+    """
+    df = make_panel(n_dates=900, n_tickers=20, seed=67)
+    df = P.cross_sectional_zscore(df, P.SCALE_FREE)
+    res = panel_walk_forward(
+        panel=df, feature_cols=B.FACTORS, model_factory=B.TrainMeanForecast,
+        splitter=PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500),
+        name="train_mean",
+    )
+    assert res.n_folds_run > 1
+    assert res.predictions.groupby("fold")["y_pred"].nunique().eq(1).all()
+    assert np.isnan(res.metrics["daily_rank_ic"]), res.metrics["daily_rank_ic"]
+
+
+def test_zero_forecast_mae_equals_the_naive_benchmark():
+    """
+    A self-consistency check on the harness rather than on a model. The naive
+    MAE reported beside every result is mean(|y_true|), which IS the error of
+    predicting zero excess return. If the `zero` row ever disagrees with its own
+    naive column, one of the two is being computed over different rows.
+    """
+    df = make_panel(n_dates=900, n_tickers=20, seed=71)
+    res = panel_walk_forward(
+        panel=df, feature_cols=B.FACTORS, model_factory=B.ZeroForecast,
+        splitter=PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=500),
+        name="zero",
+    )
+    assert res.metrics["mae"] == pytest.approx(res.metrics["mae_naive_zero"])
+
+
+# ── The degenerate-ranking defect ─────────────────────────────────────────────
+
+
+def _constant_prediction_panel(n_dates: int = 200, n_tickers: int = 20,
+                               alphabetical_alpha: float = 0.05) -> pd.DataFrame:
+    """
+    A panel where the alphabetically-first tickers really do outperform, and
+    the prediction is a single constant. Any ranking result reported on this is
+    an artifact of the sort, because there is nothing to sort by.
+    """
+    rows = []
+    tickers = [f"T{i:02d}.NS" for i in range(n_tickers)]
+    rng = np.random.default_rng(59)
+    for d in range(n_dates):
+        for i, t in enumerate(tickers):
+            edge = alphabetical_alpha if i < n_tickers // 5 else 0.0
+            rows.append({"date": f"D{d:04d}", "ticker": t,
+                         "y_pred": 0.123, "y_true": edge + rng.normal() * 0.001})
+    return pd.DataFrame(rows)
+
+
+def test_a_constant_prediction_earns_no_alpha():
+    """
+    The defect this harness found on its first real run. `zero`, `train_mean`
+    and `majority` each reported alpha +0.00914 at t = +1.19 with a long-short
+    spread of +0.01744 — the return of the alphabetically-first fifth of the
+    universe, credited to a predictor that expressed no preference at all.
+    """
+    report = cross_sectional_report(_constant_prediction_panel(), rebalance_every=1)
+    assert report["n_rebalances"] == 0
+    assert report["n_dates_no_ordering"] > 0
+    assert "alpha_vs_equal_weight" not in report
+
+
+def test_ranking_ties_are_not_broken_alphabetically():
+    """
+    Partial ties are rare for a continuous prediction and routine for a clipped
+    or rounded one. When they happen the tiebreak must not correlate with the
+    ticker's spelling, or a spurious edge reappears in a subtler form.
+    """
+    panel = _constant_prediction_panel(n_dates=400)
+    # Two prediction levels, so there IS an ordering; ties fill each level and
+    # straddle the quintile boundary.
+    half = panel["ticker"] < "T10.NS"
+    panel.loc[half, "y_pred"] = 0.2
+    panel.loc[~half, "y_pred"] = 0.1
+
+    report = cross_sectional_report(panel, rebalance_every=1)
+    assert report["n_rebalances"] > 0
+    # The top quintile is drawn from the tied 0.2 block. If the tiebreak were
+    # alphabetical it would be exactly T00-T03, which carry the planted edge.
+    assert report["alpha_vs_equal_weight"] < 0.04, report
+
+
+def test_a_real_ordering_is_still_scored():
+    """The tie guard must not suppress a genuine ranking."""
+    rng = np.random.default_rng(61)
+    rows = []
+    for d in range(200):
+        for i in range(20):
+            pred = rng.normal()
+            rows.append({"date": f"D{d:04d}", "ticker": f"T{i:02d}.NS",
+                         "y_pred": pred, "y_true": pred * 0.05 + rng.normal() * 0.001})
+    report = cross_sectional_report(pd.DataFrame(rows), rebalance_every=1)
+    assert report["n_rebalances"] == 200
+    assert report["mean_rank_ic"] > 0.5
+    assert report["alpha_vs_equal_weight"] > 0
+
+
+# ── Macro alignment ───────────────────────────────────────────────────────────
+
+
+def test_macro_forward_fill_does_not_bleed_between_tickers():
+    """
+    The panel is a long frame, so a forward fill applied AFTER the merge would
+    carry one ticker's value into the next ticker's row rather than forward in
+    time. _attach_macro fills on the date-indexed macro frame instead.
+    """
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE macro (date TEXT, usdinr REAL, india_vix REAL, "
+            "nifty_5d_return REAL, nifty_20d_return REAL, "
+            "fii_net_flow REAL, dii_net_flow REAL)")
+        # A value on day 2 only. Day 1 precedes every observation, so it must
+        # stay empty for BOTH tickers however the frame happens to be ordered.
+        conn.exec_driver_sql(
+            "INSERT INTO macro VALUES ('2020-01-02', 75.0, 20.0, 0.0, 0.0, 0.0, 0.0)")
+
+    # Ordered by TICKER, not by date. Nothing guarantees _attach_macro receives
+    # a date-sorted frame, and this ordering is what separates a fill down the
+    # date axis from a fill down the rows: a row-wise ffill reaching B.NS's
+    # first row finds A.NS's LAST row above it, which is a later date.
+    panel = pd.DataFrame({
+        "date": ["2020-01-01", "2020-01-02", "2020-01-01", "2020-01-02"],
+        "ticker": ["A.NS", "A.NS", "B.NS", "B.NS"],
+    })
+    out = P._attach_macro(panel, engine).set_index(["ticker", "date"])
+
+    assert out.loc[("A.NS", "2020-01-02"), "usdinr"] == 75.0
+    assert out.loc[("B.NS", "2020-01-02"), "usdinr"] == 75.0
+    # Neither ticker may carry a value on the day before the macro observation.
+    assert pd.isna(out.loc[("A.NS", "2020-01-01"), "usdinr"])
+    assert pd.isna(out.loc[("B.NS", "2020-01-01"), "usdinr"]), (
+        "B.NS inherited a value from A.NS's later row: the fill ran down the "
+        "long frame instead of down the date axis"
+    )
+
+
+def test_macro_gap_before_the_first_observation_is_not_backfilled():
+    """Backfilling a leading gap imports the future (audit finding F12)."""
+    from sqlalchemy import create_engine
+
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE TABLE macro (date TEXT, usdinr REAL, india_vix REAL, "
+            "nifty_5d_return REAL, nifty_20d_return REAL, "
+            "fii_net_flow REAL, dii_net_flow REAL)")
+        conn.exec_driver_sql(
+            "INSERT INTO macro VALUES ('2020-06-01', 75.0, 20.0, 0.0, 0.0, 0.0, 0.0)")
+
+    panel = pd.DataFrame({"date": ["2020-01-01", "2020-06-01"],
+                          "ticker": ["A.NS", "A.NS"]})
+    out = P._attach_macro(panel, engine)
+    assert pd.isna(out.loc[out["date"] == "2020-01-01", "usdinr"]).all()
+    assert out.loc[out["date"] == "2020-06-01", "usdinr"].iloc[0] == 75.0
