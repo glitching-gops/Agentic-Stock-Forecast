@@ -153,6 +153,15 @@ def init_db():
             "target_return",          # forward log return of the stock
             "target_excess_return",   # forward log return minus benchmark
             "benchmark_return",       # forward log return of the benchmark
+            # Phase 2: the benchmark's LEVEL, not just its forward return.
+            # benchmark_return is a label - it looks 30 sessions ahead - so
+            # nothing may read it as an input. Without the level there is no way
+            # to construct the relative price series close/benchmark_close,
+            # whose forward log return IS target_excess_return by construction.
+            # That series is what lets a time-series model predict the excess
+            # return directly instead of forecasting the stock and the index
+            # separately and differencing two independent errors.
+            "benchmark_close",
         ]
         for col in new_columns:
             try:

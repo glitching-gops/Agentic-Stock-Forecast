@@ -365,7 +365,29 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
         high=df["high"], low=df["low"], close=df["close"], lbp=14
     ).williams_r()
     df["roc_10"] = ROCIndicator(close=df["close"], window=10).roc()
-    df["vroc_10"] = df["volume"].pct_change(10).replace([np.inf, -np.inf], np.nan)
+    # A ZERO-VOLUME SESSION MUST NOT DELETE A DIFFERENT SESSION.
+    #
+    # pct_change(10) divides by the volume ten rows back, so a single
+    # zero-volume day produces inf ten rows LATER, which becomes NaN and then
+    # loses that row to dropna(subset=FEATURE_COLS) below. RELIANCE.NS carries
+    # five zero-volume sessions and was missing exactly five interior rows
+    # because of it -- healthy rows, with normal OHLC, deleted by a defect in a
+    # neighbour a fortnight earlier, and silently.
+    #
+    # The lost rows are the smaller half of the problem. The larger half is
+    # that the stored session grid ends up with invisible interior gaps, while
+    # target_excess_return is computed on the FULL ohlcv sequence above, before
+    # the drop. Anything that steps by stored rows -- a series model asked to
+    # forecast 30 steps ahead -- then measures a different horizon from the one
+    # the label describes, for every window spanning a gap.
+    #
+    # Volume ten sessions ago being zero makes the rate of change undefined,
+    # not infinite. 0.0 is the honest reading ("no measurable change") and it
+    # keeps the row, which is what matters.
+    prev_volume = df["volume"].shift(10)
+    df["vroc_10"] = np.where(prev_volume > 0,
+                             df["volume"] / prev_volume.where(prev_volume > 0) - 1.0,
+                             0.0)
 
     rolling_high = df["high"].rolling(252, min_periods=50).max()
     rolling_low = df["low"].rolling(252, min_periods=50).min()
@@ -427,8 +449,12 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=FEATURE_COLS)
 
+    # benchmark_close is persisted alongside the targets, not as one of them.
+    # It is an observation at date t, so unlike benchmark_return it is safe to
+    # read as an input - see the note in data/db.py.
     keep = (["date", "ticker", "close"] + FEATURE_COLS + TARGET_COLS
-            + ["benchmark_ticker", "benchmark_sector_specific"])
+            + ["benchmark_close", "benchmark_ticker",
+               "benchmark_sector_specific"])
     return df[keep].reset_index(drop=True)
 
 

@@ -107,8 +107,19 @@ def load_panel(
     """
     engine = engine or get_engine()
 
+    # benchmark_close arrives via the safe-migration list in data/db.py, which
+    # runs at the start of both workflows. Selecting it unconditionally would
+    # turn "the migration has not run here yet" into a hard failure of the whole
+    # comparison, when the correct behaviour is a panel with no relative-price
+    # series and a note saying so. Both jobs call init_db() first, so this is a
+    # transitional gap rather than a permanent one — but a read path should not
+    # depend on a write path having run.
+    available = set(_table_columns(engine, "signals"))
+    optional = [c for c in ("benchmark_close", "benchmark_ticker")
+                if c in available]
+
     cols = ", ".join(["date", "ticker", "close", *FEATURE_COLS, TARGET,
-                      "benchmark_ticker"])
+                      *optional])
     where, params = [], {}
     if start:
         where.append("date >= :start")
@@ -127,6 +138,10 @@ def load_panel(
     if panel.empty:
         return panel
 
+    for col in ("benchmark_close", "benchmark_ticker"):
+        if col not in panel.columns:
+            panel[col] = np.nan
+
     panel = _attach_macro(panel, engine)
 
     for col in FEATURES:
@@ -135,6 +150,16 @@ def load_panel(
 
     panel[TARGET] = pd.to_numeric(panel[TARGET], errors="coerce")
     return panel.sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+def _table_columns(engine, table: str) -> list[str]:
+    """Column names on `table`, or an empty list if it cannot be inspected."""
+    try:
+        from sqlalchemy import inspect
+
+        return [c["name"] for c in inspect(engine).get_columns(table)]
+    except Exception:                                          # noqa: BLE001
+        return []
 
 
 def _attach_macro(panel: pd.DataFrame, engine) -> pd.DataFrame:
@@ -211,6 +236,41 @@ def cross_sectional_zscore(
     return out
 
 
+def relative_price_frame(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    The log relative-price series per ticker: ``log(close / benchmark_close)``.
+
+    THE POINT OF THIS FUNCTION IS AN EXACT IDENTITY. For a horizon h,
+
+        log(rel[t+h]) - log(rel[t])
+            = (log S[t+h] - log S[t]) - (log B[t+h] - log B[t])
+            = target_return - benchmark_return
+            = target_excess_return
+
+    so the h-session forward log return of this series **is** the label, with no
+    approximation. A time-series model handed this series predicts the excess
+    return directly. The alternative — forecast the stock, forecast the index,
+    subtract — compounds two independent errors into a quantity smaller than
+    either of them, and is the main reason a univariate foundation model looks
+    unsuited to a benchmark-relative target. It is not, given the right series.
+
+    Returned wide: index of dates, one column per ticker, sorted. A ticker whose
+    benchmark_close has not been backfilled yet is all-NaN rather than absent,
+    so a caller sees a gap instead of silently ranking a smaller universe.
+    """
+    if panel.empty or "benchmark_close" not in panel.columns:
+        return pd.DataFrame()
+
+    close = pd.to_numeric(panel["close"], errors="coerce")
+    bench = pd.to_numeric(panel["benchmark_close"], errors="coerce")
+    ratio = (close / bench).replace([np.inf, -np.inf], np.nan)
+
+    frame = panel[["date", "ticker"]].assign(_rel=np.log(ratio.where(ratio > 0)))
+    wide = frame.pivot_table(index="date", columns="ticker", values="_rel",
+                             aggfunc="last")
+    return wide.sort_index()
+
+
 def usable_dates(panel: pd.DataFrame, min_names: int = MIN_NAMES_PER_DATE) -> list[str]:
     """Dates carrying enough labelled names to be ranked."""
     labelled = panel[panel[TARGET].notna()]
@@ -250,4 +310,11 @@ def panel_coverage(panel: pd.DataFrame) -> dict:
         "dates_with_enough_breadth": int((per_date >= MIN_NAMES_PER_DATE).sum()),
         "benchmarks": sorted(panel["benchmark_ticker"].dropna().unique().tolist())
         if "benchmark_ticker" in panel.columns else [],
+        # Rows carrying a benchmark LEVEL, which is what the relative-price
+        # series needs. Distinct from label coverage: a row written before
+        # benchmark_close was persisted has a perfectly good target and no way
+        # to reconstruct the series it came from.
+        "rows_with_benchmark_close": (
+            int(pd.to_numeric(panel["benchmark_close"], errors="coerce").notna().sum())
+            if "benchmark_close" in panel.columns else 0),
     }

@@ -636,6 +636,47 @@ def test_compare_baselines_scores_a_panel_with_enough_breadth(monkeypatch):
     assert comparison.best() is not None
 
 
+def test_series_comparators_are_skipped_without_a_benchmark_level(monkeypatch):
+    """
+    A SeriesAdapter handed an all-NaN series does not fail. It declines every
+    ticker and predicts 0.0 — the correct default for an abstention — which
+    would appear in the table as three extra rows indistinguishable from
+    `zero`. Rows written before benchmark_close was persisted have perfectly
+    good targets and no reconstructible series, so the comparison must skip
+    those comparators and say why rather than report them as measured.
+    """
+    import pipeline.baselines
+
+    wide = make_panel(n_dates=800, n_tickers=20, seed=83)
+    wide["close"] = 100.0
+    wide["benchmark_close"] = np.nan
+    monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: wide)
+
+    comparison = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
+    names = {r["name"] for r in comparison.results}
+    assert names == set(B.BASELINES)
+    assert not names & set(__import__("pipeline.series", fromlist=["x"]).SERIES_BASELINES)
+    assert "benchmark_close" in comparison.note
+
+
+def test_series_comparators_are_scored_when_the_level_is_present(monkeypatch):
+    """The guard must not be so eager that the series row never appears."""
+    import pipeline.baselines
+    from pipeline.series import SERIES_BASELINES
+
+    n = 800
+    panel = make_panel(n_dates=n, n_tickers=20, seed=89)
+    rng = np.random.default_rng(89)
+    panel["close"] = 100.0 * np.exp(rng.normal(0, 0.01, len(panel)).cumsum())
+    panel["benchmark_close"] = 20000.0
+    monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: panel)
+
+    comparison = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
+    names = {r["name"] for r in comparison.results}
+    assert set(SERIES_BASELINES).issubset(names), names
+    assert comparison.note == ""
+
+
 # ── The weekly job regenerates the comparison ─────────────────────────────────
 
 

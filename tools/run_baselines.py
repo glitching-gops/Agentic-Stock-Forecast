@@ -112,6 +112,11 @@ def main() -> int:
         print(f"\n  REFUSED: {comparison.note}", file=sys.stderr)
         return 1
 
+    if comparison.note:
+        # A comparator that was skipped must say so. Its absence from the table
+        # is otherwise indistinguishable from it never having existed.
+        print(f"\n  NOTE: {comparison.note}")
+
     print(f"\n{render(comparison.results)}")
     print("\n  daily_IC - mean of the per-date rank IC. The leaderboard number.")
     print(f"  IC_t     - t-statistic of that IC over {HORIZON_SESSIONS}-session "

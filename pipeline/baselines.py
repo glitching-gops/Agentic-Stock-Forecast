@@ -49,7 +49,9 @@ from pipeline.panel import (
     cross_sectional_zscore,
     load_panel,
     panel_coverage,
+    relative_price_frame,
 )
+from pipeline.series import SERIES_BASELINES, adapter_factory
 from pipeline.signals import HORIZON_SESSIONS
 
 # ── Factor set for the linear comparator ──────────────────────────────────────
@@ -357,6 +359,12 @@ class BaselineComparison:
         )
 
 
+# Fraction of labelled rows that must carry benchmark_close before the series
+# comparators are scored at all. Below this the relative-price series has holes
+# large enough that an abstention, not a forecast, is what would be measured.
+MIN_BENCHMARK_LEVEL_COVERAGE = 0.90
+
+
 def _pooled_xgb_factory():
     """
     An untuned pooled gradient-boosted tree.
@@ -400,6 +408,7 @@ def compare_baselines(
     n_folds: int = 5,
     min_train: int = 500,
     with_pooled_xgb: bool = True,
+    with_series: bool = True,
     max_tickers: int | None = None,
     allow_thin: bool = False,
 ) -> BaselineComparison:
@@ -435,15 +444,46 @@ def compare_baselines(
         embargo=HORIZON_SESSIONS, min_train=min_train,
     )
 
-    runs = list(BASELINES.items())
+    runs: list[tuple[str, object, list[str]]] = [
+        (name, factory, FACTORS) for name, factory in BASELINES.items()
+    ]
     if with_pooled_xgb:
-        runs.append(("pooled_xgb", _pooled_xgb_factory))
+        runs.append(("pooled_xgb", _pooled_xgb_factory, FACTORS))
+
+    # Series comparators read the relative-price series, not the feature
+    # matrix. They are added only when that series actually exists.
+    #
+    # A SeriesAdapter handed an all-NaN series does not fail — it declines every
+    # ticker and predicts 0.0, which is the correct default for an abstention
+    # and which would appear in this table as a row indistinguishable from
+    # `zero`. Rows written before benchmark_close was persisted have perfectly
+    # good targets and no reconstructible series, so a run against them would
+    # report three extra comparators that all silently measured nothing.
+    series_note = ""
+    labelled = max(coverage.get("labelled_rows", 0), 1)
+    level_coverage = coverage.get("rows_with_benchmark_close", 0) / labelled
+
+    if not with_series:
+        series_note = "series comparators disabled by the caller"
+    elif level_coverage < MIN_BENCHMARK_LEVEL_COVERAGE:
+        series_note = (
+            f"series comparators skipped: benchmark_close is present on "
+            f"{level_coverage:.1%} of labelled rows, below the "
+            f"{MIN_BENCHMARK_LEVEL_COVERAGE:.0%} needed. Without the benchmark "
+            f"LEVEL there is no relative-price series, and every series "
+            f"forecaster would abstain and report as `zero`. Recompute signals."
+        )
+    else:
+        series = relative_price_frame(panel)
+        for name, cls in SERIES_BASELINES.items():
+            runs.append((name, adapter_factory(cls, series, horizon=HORIZON_SESSIONS),
+                         ["date", "ticker"]))
 
     results = []
-    for name, factory in runs:
+    for name, factory, feature_cols in runs:
         started = time.time()
         res = panel_walk_forward(
-            panel=panel, feature_cols=FACTORS, model_factory=factory,
+            panel=panel, feature_cols=feature_cols, model_factory=factory,
             splitter=splitter, name=name, target=TARGET,
             rebalance_every=HORIZON_SESSIONS,
         )
@@ -482,4 +522,5 @@ def compare_baselines(
         coverage=coverage,
         results=results,
         loadings=fit_factor_loadings(panel, min_train),
+        note=series_note,
     )

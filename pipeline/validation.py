@@ -287,6 +287,70 @@ def check_target_distribution(engine, universe) -> Check:
                  PASS if extreme == 0 else WARN, detail)
 
 
+def check_sessions_are_contiguous(engine, universe) -> Check:
+    """
+    A ticker's stored signal rows must cover every session ohlcv holds for it,
+    with no interior gaps.
+
+    target_excess_return is computed on the FULL ohlcv sequence and only then
+    is the frame passed through dropna(subset=FEATURE_COLS), so a row lost at
+    that step leaves a hole in the stored grid while the labels around it still
+    describe 30 TRUE sessions. Anything that steps by stored rows — a series
+    model asked to forecast 30 steps ahead — then measures a different horizon
+    from the one it is scored against, for every window spanning the hole.
+
+    This is not hypothetical. vroc_10 = volume.pct_change(10) divided by the
+    volume ten rows back, so each of RELIANCE.NS's five zero-volume sessions
+    produced an inf ten rows later and deleted that row: five healthy sessions
+    with normal OHLC, removed by a defect in a neighbour a fortnight earlier,
+    with nothing in any log. It broke the relative-price identity by up to
+    0.075 against a target that ranges ±0.3.
+
+    Warns rather than fails. Nothing currently published steps by stored rows —
+    the per-ticker models read features, not sequences — so a gap degrades a
+    Phase 2 comparison rather than corrupting a live forecast. It becomes a
+    FAIL the day a series model reaches production.
+    """
+    if not universe:
+        return Check("sessions_are_contiguous", WARN, "empty universe")
+
+    counts = pd.read_sql(
+        text("""
+            SELECT s.ticker                AS ticker,
+                   COUNT(*)                AS stored,
+                   MIN(s.date)             AS lo,
+                   MAX(s.date)             AS hi
+              FROM signals s
+             GROUP BY s.ticker
+        """),
+        engine,
+    )
+    if counts.empty:
+        return Check("sessions_are_contiguous", WARN, "no signal rows")
+
+    gapped: list[str] = []
+    for row in counts.itertuples(index=False):
+        if row.ticker not in universe:
+            continue
+        sessions = _scalar(
+            engine,
+            "SELECT COUNT(*) FROM ohlcv WHERE ticker = :t "
+            "AND date >= :lo AND date <= :hi",
+            {"t": row.ticker, "lo": row.lo, "hi": row.hi},
+        )
+        missing = int(sessions or 0) - int(row.stored)
+        if missing > 0:
+            gapped.append(f"{row.ticker}(-{missing})")
+
+    if not gapped:
+        return Check("sessions_are_contiguous", PASS,
+                     f"all {len(universe)} tickers cover every session in range")
+    return Check("sessions_are_contiguous", WARN,
+                 f"{len(gapped)} tickers have interior session gaps, so a "
+                 f"row-stepped horizon disagrees with the label: "
+                 f"{', '.join(gapped[:8])}")
+
+
 CHECKS = [
     check_no_duplicate_signal_rows,
     check_no_future_dates,
@@ -296,6 +360,7 @@ CHECKS = [
     check_benchmark_coverage,
     check_price_breaks_are_explained,
     check_target_distribution,
+    check_sessions_are_contiguous,
 ]
 
 
