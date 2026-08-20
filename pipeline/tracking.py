@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import uuid
@@ -42,6 +43,32 @@ import pandas as pd
 from sqlalchemy import text
 
 from data.db import get_engine, to_native_params
+
+
+def json_safe(value):
+    """
+    Replaces non-finite floats with None, recursively.
+
+    ``json.dumps`` serialises ``float('nan')`` as a bare ``NaN`` token. Python's
+    own ``json.loads`` accepts that as an extension, so it round-trips locally
+    and looks correct; every strict parser rejects it — JavaScript's
+    ``JSON.parse``, ``jq``, and a Postgres ``::jsonb`` cast alike. The
+    ``metrics`` column is TEXT, so nothing raises at write time and the damage
+    only surfaces wherever the value is eventually read.
+
+    NaN is not rare in what gets recorded here: a comparator with no ordering
+    has an undefined rank IC by design, so a baseline table containing `zero`
+    and `majority` produces one on every run. None is the right translation —
+    JSON null means "not measured", which is exactly what an undefined
+    statistic is.
+    """
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _sha(payload) -> str:
@@ -206,7 +233,8 @@ def finish_run(run_id: str, status: str, gate=None, metrics: dict | None = None,
                     "status": status,
                     "gate_status": gate.status if gate else None,
                     "gate_report": gate.to_json() if gate else None,
-                    "metrics": json.dumps(metrics or {}, default=str),
+                    "metrics": json.dumps(json_safe(metrics or {}),
+                                          default=str, allow_nan=False),
                     "notes": notes,
                 }),
             )

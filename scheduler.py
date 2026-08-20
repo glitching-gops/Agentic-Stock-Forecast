@@ -384,12 +384,47 @@ def run_weekly_evaluation_job():
     logger.info(f"[Scheduler] Weekly evaluation complete: "
                f"{len(results)}/{len(universe)} tickers evaluated")
 
+    # ── Baseline comparison ──────────────────────────────────────────────────
+    #
+    # Regenerated here rather than left to a manual tool run, for the same
+    # reason report_performance.py exists: a number that is not regenerated
+    # goes stale and then stays wrong. The per-ticker evaluation above says how
+    # each model did against ITS OWN baselines; this says how the whole panel
+    # does against a common set of comparators on one set of folds, which is
+    # the only form in which a Phase 2 addition can be shown to have improved
+    # anything.
+    #
+    # NOT FATAL, and deliberately so. It reads; it never writes to signals,
+    # forecasts or model_metadata. The "a job that writes nothing must raise"
+    # rule exists to stop a run PUBLISHING nothing while reporting success —
+    # this step publishes nothing by design, so failing the week's evaluation
+    # over it would trade a real result for a measurement. It is recorded
+    # either way, so a silent failure is still a visible one: `baselines.note`
+    # carries the reason into experiment_runs.
+    #
+    # It runs LAST because it is the cheapest thing here (~20s against an
+    # evaluation measured in tens of minutes) and because running it after the
+    # persist means a defect in it cannot cost the expensive work.
+    baseline_metrics: dict = {}
+    try:
+        from pipeline.baselines import compare_baselines
+
+        comparison = compare_baselines(tickers=universe)
+        baseline_metrics = comparison.to_metrics()
+        (logger.info if comparison.ranked else logger.error)(
+            f"[Scheduler] {comparison.summary()}")
+    except Exception as exc:                                        # noqa: BLE001
+        logger.error(f"[Scheduler] Baseline comparison failed: {exc}")
+        baseline_metrics = {"note": f"comparison raised: {str(exc)[:300]}",
+                            "comparators": []}
+
     finish_run(run_id, "OK", gate=gate, metrics={
         "tickers_evaluated": len(results),
         "tickers_in_universe": len(universe),
         "labelled_rows": labelled_after,
         "signals_skipped": signals_report.skipped,
         "signals_refused": signals_report.refused,
+        "baselines": baseline_metrics,
     })
 
 

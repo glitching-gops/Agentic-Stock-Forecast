@@ -34,11 +34,23 @@ drifts between train and test.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
+
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 
-from pipeline.panel import SCALE_FREE
+from pipeline.evaluation import PurgedPanelWalkForward, panel_walk_forward
+from pipeline.panel import (
+    MIN_NAMES_PER_DATE,
+    SCALE_FREE,
+    TARGET,
+    cross_sectional_zscore,
+    load_panel,
+    panel_coverage,
+)
+from pipeline.signals import HORIZON_SESSIONS
 
 # ── Factor set for the linear comparator ──────────────────────────────────────
 
@@ -273,3 +285,201 @@ def baseline_feature_columns(name: str) -> list[str]:
     if name.startswith("reversal"):
         return ["lag5_ret"]
     return []
+
+
+# ── The comparison ────────────────────────────────────────────────────────────
+
+
+@dataclass
+class BaselineComparison:
+    """
+    Every comparator scored on one set of folds over one set of rows.
+
+    `note` is not decoration. A comparison run on a panel too thin to rank
+    returns an empty `results` and an explanation, rather than a table of zeros
+    in the shape of a result — the same refusal the CLI makes, moved here so
+    that the weekly job inherits it instead of reimplementing it.
+    """
+
+    coverage: dict = field(default_factory=dict)
+    results: list[dict] = field(default_factory=list)
+    loadings: dict[str, float] = field(default_factory=dict)
+    note: str = ""
+
+    @property
+    def ranked(self) -> bool:
+        return bool(self.results)
+
+    def best(self, metric: str = "daily_rank_ic") -> dict | None:
+        """The strongest comparator on `metric`, ignoring the degenerate ones."""
+        scored = [r for r in self.results
+                  if np.isfinite(r.get(metric, np.nan))]
+        return max(scored, key=lambda r: r[metric]) if scored else None
+
+    def to_metrics(self) -> dict:
+        """
+        The compact form written into ``experiment_runs.metrics``.
+
+        Deliberately not a new table. ``experiment_runs`` already carries
+        ``config_hash`` and ``data_hash`` beside every row, which is the whole
+        mechanism for telling whether a metric moved because the code changed
+        or because the data did. A separate baseline table would either
+        duplicate those hashes or lose that attribution, and would need its own
+        writer, its own migration and its own entry in the landmines list.
+        """
+        keep = ("name", "n_oos", "folds", "daily_rank_ic", "rebalance_ic_t",
+                "hit_rate", "majority_hit_rate", "mae", "mae_naive_zero",
+                "beats_naive_mae", "alpha_vs_equal_weight", "alpha_t",
+                "n_rebalances")
+        return {
+            "panel_tickers": self.coverage.get("tickers", 0),
+            "panel_dates": self.coverage.get("dates", 0),
+            "panel_labelled_rows": self.coverage.get("labelled_rows", 0),
+            "median_names_per_date": self.coverage.get("median_names_per_date", 0.0),
+            "note": self.note,
+            "comparators": [{k: r.get(k) for k in keep} for r in self.results],
+            "loadings": self.loadings,
+        }
+
+    def summary(self) -> str:
+        if not self.ranked:
+            return f"baselines: not scored - {self.note}"
+        best = self.best()
+        floor = next((r for r in self.results if r["name"] == "zero"), {})
+        beat_floor = [r["name"] for r in self.results if r.get("beats_naive_mae")]
+        return (
+            f"baselines: {len(self.results)} comparators over "
+            f"{self.coverage.get('tickers', 0)} tickers; best daily IC "
+            f"{best['name']} {best['daily_rank_ic']:+.4f} "
+            f"(t {best.get('rebalance_ic_t', float('nan')):+.2f}); "
+            f"MAE floor {floor.get('mae', float('nan')):.5f}; "
+            f"beat the floor on MAE: {beat_floor or 'none'}"
+        )
+
+
+def _pooled_xgb_factory():
+    """
+    An untuned pooled gradient-boosted tree.
+
+    Untuned on purpose. This row answers "does the extra capacity beat a ridge
+    on the same columns", and a searched tree could not be read beside an
+    unsearched linear model without deflating its result for the search first
+    (see ``evaluation.deflated_sharpe_note``).
+    """
+    from xgboost import XGBRegressor
+
+    return XGBRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=42, verbosity=0, tree_method="hist",
+    )
+
+
+def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500) -> dict[str, float]:
+    """
+    Fits the linear comparator once on the earliest training window, to read.
+
+    Inputs are already standardised within each date, so the coefficients are
+    directly comparable to one another — which is the only reason printing them
+    beside each other means anything.
+    """
+    grid = sorted(panel["date"].unique())
+    cut_at = min_train - HORIZON_SESSIONS * 2
+    if cut_at <= 0 or len(grid) <= min_train:
+        return {}
+    train = panel[(panel["date"] < grid[cut_at]) & panel[TARGET].notna()]
+    if len(train) < 100:
+        return {}
+    return LinearFactorModel().fit(train[FACTORS], train[TARGET]).coefficients()
+
+
+def compare_baselines(
+    tickers: list[str] | None = None,
+    engine=None,
+    start: str | None = None,
+    n_folds: int = 5,
+    min_train: int = 500,
+    with_pooled_xgb: bool = True,
+    max_tickers: int | None = None,
+    allow_thin: bool = False,
+) -> BaselineComparison:
+    """
+    Loads the panel and scores every comparator on identical purged folds.
+
+    Read only. Nothing here writes to the database — the caller decides what to
+    record — which is what makes it safe to run inside a job whose expensive
+    work has already been persisted.
+    """
+    panel = load_panel(tickers=tickers, engine=engine, start=start)
+    if panel.empty:
+        return BaselineComparison(note="no signals rows in the database")
+
+    if max_tickers:
+        counts = panel.groupby("ticker")["date"].count().sort_values(ascending=False)
+        panel = panel[panel["ticker"].isin(counts.head(max_tickers).index)]
+
+    panel = cross_sectional_zscore(panel, SCALE_FREE)
+    coverage = panel_coverage(panel)
+
+    if coverage["median_names_per_date"] < MIN_NAMES_PER_DATE and not allow_thin:
+        return BaselineComparison(
+            coverage=coverage,
+            note=(f"panel too thin to rank: the median date holds "
+                  f"{coverage['median_names_per_date']:.0f} names, below the "
+                  f"{MIN_NAMES_PER_DATE} needed. Every feature is zeroed at "
+                  f"that breadth, so the comparison would be between constants."),
+        )
+
+    splitter = PurgedPanelWalkForward(
+        n_folds=n_folds, horizon=HORIZON_SESSIONS,
+        embargo=HORIZON_SESSIONS, min_train=min_train,
+    )
+
+    runs = list(BASELINES.items())
+    if with_pooled_xgb:
+        runs.append(("pooled_xgb", _pooled_xgb_factory))
+
+    results = []
+    for name, factory in runs:
+        started = time.time()
+        res = panel_walk_forward(
+            panel=panel, feature_cols=FACTORS, model_factory=factory,
+            splitter=splitter, name=name, target=TARGET,
+            rebalance_every=HORIZON_SESSIONS,
+        )
+        m, xs = res.metrics, res.cross_sectional
+        results.append({
+            "name": name,
+            "n_oos": res.n_predictions,
+            "folds": res.n_folds_run,
+            "rank_ic": m.get("rank_ic", float("nan")),
+            "daily_rank_ic": m.get("daily_rank_ic", float("nan")),
+            "hit_rate": m.get("hit_rate", float("nan")),
+            "majority_hit_rate": m.get("majority_hit_rate", float("nan")),
+            "mae": m.get("mae", float("nan")),
+            "mae_naive_zero": m.get("mae_naive_zero", float("nan")),
+            "beats_naive_mae": bool(m.get("beats_naive_mae", False)),
+            "n_rebalances": xs.get("n_rebalances", 0),
+            "n_dates_no_ordering": xs.get("n_dates_no_ordering", 0),
+            "rebalance_ic": xs.get("mean_rank_ic", float("nan")),
+            "rebalance_ic_t": xs.get("rank_ic_t", float("nan")),
+            "alpha_vs_equal_weight": xs.get("alpha_vs_equal_weight", float("nan")),
+            "alpha_t": xs.get("alpha_t", float("nan")),
+            "long_short_spread": xs.get("long_short_spread", float("nan")),
+            "spread_t": xs.get("spread_t", float("nan")),
+            "seconds": round(time.time() - started, 1),
+        })
+
+    if not any(r["n_oos"] for r in results):
+        return BaselineComparison(
+            coverage=coverage, results=[],
+            note=(f"no fold produced an out-of-sample prediction: the panel "
+                  f"holds {coverage['dates']} dates against a min_train of "
+                  f"{min_train}"),
+        )
+
+    return BaselineComparison(
+        coverage=coverage,
+        results=results,
+        loadings=fit_factor_loadings(panel, min_train),
+    )
