@@ -49,7 +49,7 @@ def render(results: list[dict]) -> str:
     def f(v, spec=".4f"):
         return "     -" if v is None or not np.isfinite(v) else format(v, spec)
 
-    head = (f"{'comparator':<18s} {'daily_IC':>9s} {'IC_t':>7s} {'pooledIC':>9s} "
+    head = (f"{'comparator':<18s} {'daily_IC':>9s} {'reb_IC':>8s} {'reb_t':>7s} {'pooledIC':>9s} "
             f"{'hit%':>7s} {'maj%':>7s} {'MAE':>8s} {'<naive':>7s} "
             f"{'alpha':>9s} {'alpha_t':>8s} {'L-S':>9s} {'n_reb':>6s} {'secs':>7s}")
     lines = [head, "-" * len(head)]
@@ -58,6 +58,7 @@ def render(results: list[dict]) -> str:
         lines.append(
             f"{r['name']:<18s} "
             f"{f(r['daily_rank_ic'], '+.4f'):>9s} "
+            f"{f(r['rebalance_ic'], '+.4f'):>8s} "
             f"{f(r['rebalance_ic_t'], '+.2f'):>7s} "
             f"{f(r['rank_ic'], '+.4f'):>9s} "
             f"{f(r['hit_rate'], '.2f'):>7s} "
@@ -175,9 +176,17 @@ def main() -> int:
         print(f"\n  NOTE: {comparison.note}")
 
     print(f"\n{render(comparison.results)}")
-    print("\n  daily_IC - mean of the per-date rank IC. The leaderboard number.")
-    print(f"  IC_t     - t-statistic of that IC over {HORIZON_SESSIONS}-session "
-          f"non-overlapping rebalances.")
+    print("\n  daily_IC - mean per-date rank IC over EVERY out-of-sample date.")
+    print("             The point estimate of ordering ability. It carries no")
+    print(f"             t-statistic here: consecutive dates share "
+          f"{HORIZON_SESSIONS - 1} of their {HORIZON_SESSIONS} sessions, so")
+    print("             ~1,900 dates hold only ~60 independent windows "
+          "and a naive t is inflated ~5x.")
+    print(f"  reb_IC   - the same mean over {HORIZON_SESSIONS}-session NON-OVERLAPPING "
+          f"rebalance dates only,")
+    print("             and reb_t is its t-statistic. A DIFFERENT sample from")
+    print("             daily_IC - the two can and do carry opposite signs.")
+    print("             reb_t is the one that supports inference.")
     print("  pooledIC - correlated across every row at once. Moved by market "
           "timing AND by fold")
     print("             identity: a constant-per-fold predictor scores a "
