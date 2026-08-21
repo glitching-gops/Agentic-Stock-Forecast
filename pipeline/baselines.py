@@ -418,6 +418,8 @@ def compare_baselines(
     with_series: bool = True,
     with_chronos: bool = False,
     chronos_context: int = SERIES_CONTEXT,
+    with_timesfm: bool = False,
+    timesfm_context: int = SERIES_CONTEXT,
     max_tickers: int | None = None,
     allow_thin: bool = False,
 ) -> BaselineComparison:
@@ -428,14 +430,15 @@ def compare_baselines(
     record — which is what makes it safe to run inside a job whose expensive
     work has already been persisted.
     """
-    if with_chronos and not with_series:
+    if (with_chronos or with_timesfm) and not with_series:
         # Chronos reads the relative-price series and nothing else, so this
         # combination cannot mean anything. Raised rather than silently
         # dropped: a run that was asked for a foundation model and quietly
         # returned six linear comparators reads as "it did not help".
         raise ValueError(
-            "with_chronos=True requires with_series=True: Chronos-2 forecasts "
-            "the relative-price series, which with_series=False switches off"
+            "a foundation-model comparator requires with_series=True: both "
+            "Chronos-2 and TimesFM-2.5 forecast the relative-price series, "
+            "which with_series=False switches off"
         )
 
     panel = load_panel(tickers=tickers, engine=engine, start=start)
@@ -515,6 +518,24 @@ def compare_baselines(
                     adapter_factory(Chronos2Forecaster, series,
                                     horizon=HORIZON_SESSIONS,
                                     context=chronos_context, **kwargs),
+                    ["date", "ticker"],
+                ))
+
+        # TimesFM-2.5 is a DIFFERENT ARCHITECTURE, not a different size of the
+        # same one: 200M decoder-only from Google against 28M encoder-only from
+        # Amazon, different corpus, different objective. Two independent
+        # architectures agreeing on this panel is evidence about the target
+        # rather than about either model, which is the whole reason it is here.
+        if with_timesfm:
+            from pipeline.timesfm_forecaster import (
+                TIMESFM_VARIANTS, TimesFM25Forecaster)
+
+            for name, kwargs in TIMESFM_VARIANTS.items():
+                runs.append((
+                    name,
+                    adapter_factory(TimesFM25Forecaster, series,
+                                    horizon=HORIZON_SESSIONS,
+                                    context=timesfm_context, **kwargs),
                     ["date", "ticker"],
                 ))
 

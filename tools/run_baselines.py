@@ -6,6 +6,7 @@ tools/run_baselines.py — Score every comparator on identical purged folds.
     python tools/run_baselines.py --tickers 20 --folds 3
     python tools/run_baselines.py --json out.json
     python tools/run_baselines.py --chronos                # slow: needs torch
+    python tools/run_baselines.py --timesfm                # slower: 200M params
 
 This is the Phase 2 starting line. Everything the phase adds later — a pooled
 cross-sectional model, Chronos-2, TimesFM-2.5 — has to be reported in this
@@ -95,6 +96,13 @@ def main() -> int:
     ap.add_argument("--chronos-context", type=int, default=SERIES_CONTEXT,
                     help=f"trailing observations handed to Chronos-2 "
                          f"(default {SERIES_CONTEXT}; cost is linear in this)")
+    ap.add_argument("--timesfm", action="store_true",
+                    help="also score TimesFM-2.5 (200M decoder-only, a "
+                         "different architecture from Chronos rather than "
+                         "a different size; needs requirements-series.txt)")
+    ap.add_argument("--timesfm-context", type=int, default=SERIES_CONTEXT,
+                    help=f"trailing observations handed to TimesFM-2.5 "
+                         f"(default {SERIES_CONTEXT})")
     ap.add_argument("--record", action="store_true",
                     help="open an experiment_runs row and store the table in "
                          "it, beside the config_hash and data_hash that say "
@@ -120,8 +128,12 @@ def main() -> int:
 
     print("Loading panel and scoring comparators ...")
     if args.chronos:
-        print(f"  Chronos-2 enabled at context {args.chronos_context}. This is "
-              f"the slow path; the `secs` column reports what each cost.")
+        print(f"  Chronos-2 enabled at context {args.chronos_context}.")
+    if args.timesfm:
+        print(f"  TimesFM-2.5 enabled at context {args.timesfm_context}.")
+    if args.chronos or args.timesfm:
+        print("  These are the slow paths; the `secs` column reports what "
+              "each cost.")
     comparison = compare_baselines(
         start=args.start,
         n_folds=args.folds,
@@ -129,6 +141,8 @@ def main() -> int:
         with_pooled_xgb=not args.no_pooled_xgb,
         with_chronos=args.chronos,
         chronos_context=args.chronos_context,
+        with_timesfm=args.timesfm,
+        timesfm_context=args.timesfm_context,
         max_tickers=args.tickers,
         allow_thin=args.allow_thin,
     )
@@ -153,6 +167,8 @@ def main() -> int:
             "series_config": {
                 "chronos": bool(args.chronos),
                 "chronos_context": args.chronos_context if args.chronos else None,
+                "timesfm": bool(args.timesfm),
+                "timesfm_context": args.timesfm_context if args.timesfm else None,
                 "folds": args.folds,
                 "min_train": args.min_train,
                 "max_tickers": args.tickers,

@@ -22,8 +22,14 @@ on:
         description: "Cap the panel to the N widest histories (blank = all)"
         required: false
         default: ""
+      models:
+        description: "Which foundation models to score"
+        type: choice
+        required: false
+        default: "both"
+        options: ["both", "chronos", "timesfm"]
       context:
-        description: "Trailing observations handed to Chronos-2. Cost is LINEAR in this: 46 names x 2048 ran 1.71 s/date on 2 threads, ~54 min over 1,900 dates; 512 ran 0.43 s/date."
+        description: "Trailing observations handed to the model. Cost is LINEAR in this: 46 names x 2048 ran 1.71 s/date on 2 threads, ~54 min over 1,900 dates; 512 ran 0.43 s/date."
         required: false
         default: "2048"
       folds:
@@ -57,11 +63,12 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-series.txt
 
-      - name: Cache the Chronos-2 weights
+      - name: Cache the model weights
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-chronos-2-small-v1
+          # ~110MB for Chronos-2-small, ~800MB for TimesFM-2.5.
+          key: hf-series-models-v2
 
       - name: Confirm the CPU wheel was resolved
         # requirements-series.txt gets the CPU build via --extra-index-url,
@@ -80,18 +87,22 @@ jobs:
                        f'requirements-series.txt')
           "
 
-      - name: Fetch the checkpoint
+      - name: Fetch the checkpoints and verify their layout
         # Separate step so a Hub outage reads as a download failure rather than
-        # as a model that produced nothing. ~110MB for the 28M checkpoint.
+        # as a model that produced nothing.
+        #
+        # It does more than download. check_series_model.py pins the median
+        # index (Chronos puts it at 6 of 13, TimesFM at 5 of 9 — reading by
+        # position rather than by value returns the 60th percentile on the
+        # second one) and proves the as-of slice against the live weights,
+        # which is the only thing protecting a zero-shot model from being
+        # handed its own answer.
         env:
           CHRONOS_THREADS: "2"
         run: |
-          python -c "
-          from pipeline.chronos_forecaster import DEFAULT_MODEL_ID, load_pipeline
-          p = load_pipeline(DEFAULT_MODEL_ID)
-          print(f'{DEFAULT_MODEL_ID}: context {p.model_context_length}, '
-                f'{len(p.quantiles)} quantiles, median present: {0.5 in p.quantiles}')
-          "
+          python tools/check_series_model.py \
+            --model "${{ github.event.inputs.models }}" \
+            --context "${{ github.event.inputs.context }}"
 
       - name: Score every comparator
         env:
@@ -103,8 +114,10 @@ jobs:
           TOKENIZERS_PARALLELISM: "false"
         run: |
           python tools/run_baselines.py \
-            --chronos \
+            ${{ contains(fromJSON('["both","chronos"]'), github.event.inputs.models) && '--chronos' || '' }} \
+            ${{ contains(fromJSON('["both","timesfm"]'), github.event.inputs.models) && '--timesfm' || '' }} \
             --chronos-context "${{ github.event.inputs.context }}" \
+            --timesfm-context "${{ github.event.inputs.context }}" \
             --folds "${{ github.event.inputs.folds }}" \
             ${{ github.event.inputs.tickers && format('--tickers {0}', github.event.inputs.tickers) || '' }} \
             ${{ github.event.inputs.record == 'true' && '--record' || '' }} \

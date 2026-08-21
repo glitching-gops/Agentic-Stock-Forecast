@@ -356,7 +356,7 @@ def test_chronos_requires_the_series_comparators():
     """
     from pipeline.baselines import compare_baselines
 
-    with pytest.raises(ValueError, match="with_chronos"):
+    with pytest.raises(ValueError, match="foundation-model"):
         compare_baselines(with_chronos=True, with_series=False)
 
 

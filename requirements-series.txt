@@ -22,3 +22,13 @@ torch>=2.2,<3
 # chronos-forecasting pins transformers itself (>=4.41,<6); it also pulls
 # accelerate and einops.
 chronos-forecasting>=2.0
+
+# TimesFM-2.5 ships INSIDE transformers as TimesFm2_5ModelForPrediction, so it
+# costs no package of its own — but the class landed in 5.x, and chronos' pin
+# alone would happily resolve 4.x and leave the symbol missing. Pinned here so
+# the failure is at install time rather than an ImportError an hour into a run.
+#
+# The `timesfm` PyPI package is deliberately NOT used: it is still at 2.0.2, so
+# reaching 2.5 through it needs a git clone plus `pip install -e`, which is an
+# unpinned dependency in CI.
+transformers>=5.0,<6
