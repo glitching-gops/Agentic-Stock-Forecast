@@ -34,6 +34,7 @@ drifts between train and test.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -51,8 +52,14 @@ from pipeline.panel import (
     panel_coverage,
     relative_price_frame,
 )
-from pipeline.series import SERIES_BASELINES, adapter_factory
+from pipeline.series import (
+    DEFAULT_CONTEXT as SERIES_CONTEXT,
+    SERIES_BASELINES,
+    adapter_factory,
+)
 from pipeline.signals import HORIZON_SESSIONS
+
+logger = logging.getLogger(__name__)
 
 # ── Factor set for the linear comparator ──────────────────────────────────────
 
@@ -409,6 +416,8 @@ def compare_baselines(
     min_train: int = 500,
     with_pooled_xgb: bool = True,
     with_series: bool = True,
+    with_chronos: bool = False,
+    chronos_context: int = SERIES_CONTEXT,
     max_tickers: int | None = None,
     allow_thin: bool = False,
 ) -> BaselineComparison:
@@ -419,6 +428,16 @@ def compare_baselines(
     record — which is what makes it safe to run inside a job whose expensive
     work has already been persisted.
     """
+    if with_chronos and not with_series:
+        # Chronos reads the relative-price series and nothing else, so this
+        # combination cannot mean anything. Raised rather than silently
+        # dropped: a run that was asked for a foundation model and quietly
+        # returned six linear comparators reads as "it did not help".
+        raise ValueError(
+            "with_chronos=True requires with_series=True: Chronos-2 forecasts "
+            "the relative-price series, which with_series=False switches off"
+        )
+
     panel = load_panel(tickers=tickers, engine=engine, start=start)
     if panel.empty:
         return BaselineComparison(note="no signals rows in the database")
@@ -479,9 +498,33 @@ def compare_baselines(
             runs.append((name, adapter_factory(cls, series, horizon=HORIZON_SESSIONS),
                          ["date", "ticker"]))
 
+        # Chronos-2 rides the same series and the same folds as the three
+        # known-answer forecasters above, which is the point: `series_zero`
+        # reproducing `zero` exactly on this very panel is what licenses
+        # reading a foundation model's row as the model rather than the
+        # plumbing. Off by default because it needs torch — see
+        # requirements-series.txt — and every other caller of this function
+        # runs where torch is deliberately absent.
+        if with_chronos:
+            from pipeline.chronos_forecaster import (
+                CHRONOS_VARIANTS, Chronos2Forecaster)
+
+            for name, kwargs in CHRONOS_VARIANTS.items():
+                runs.append((
+                    name,
+                    adapter_factory(Chronos2Forecaster, series,
+                                    horizon=HORIZON_SESSIONS,
+                                    context=chronos_context, **kwargs),
+                    ["date", "ticker"],
+                ))
+
     results = []
-    for name, factory, feature_cols in runs:
+    for i, (name, factory, feature_cols) in enumerate(runs, 1):
         started = time.time()
+        # A Chronos variant runs for the better part of an hour and prints
+        # nothing while it does. On a workflow runner that is indistinguishable
+        # from a hung step, and the reflex is to cancel it at 40 minutes.
+        logger.info(f"[Baselines] {i}/{len(runs)} {name} ...")
         res = panel_walk_forward(
             panel=panel, feature_cols=feature_cols, model_factory=factory,
             splitter=splitter, name=name, target=TARGET,

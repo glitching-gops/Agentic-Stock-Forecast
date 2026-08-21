@@ -5,6 +5,7 @@ tools/run_baselines.py — Score every comparator on identical purged folds.
     python tools/run_baselines.py --no-pooled-xgb     # baselines only
     python tools/run_baselines.py --tickers 20 --folds 3
     python tools/run_baselines.py --json out.json
+    python tools/run_baselines.py --chronos                # slow: needs torch
 
 This is the Phase 2 starting line. Everything the phase adds later — a pooled
 cross-sectional model, Chronos-2, TimesFM-2.5 — has to be reported in this
@@ -30,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 
@@ -39,6 +41,7 @@ if os.getcwd() not in sys.path:
     sys.path.append(os.getcwd())
 
 from pipeline.baselines import compare_baselines          # noqa: E402
+from pipeline.series import DEFAULT_CONTEXT as SERIES_CONTEXT  # noqa: E402
 from pipeline.signals import HORIZON_SESSIONS             # noqa: E402
 
 
@@ -46,14 +49,14 @@ def render(results: list[dict]) -> str:
     def f(v, spec=".4f"):
         return "     -" if v is None or not np.isfinite(v) else format(v, spec)
 
-    head = (f"{'comparator':<16s} {'daily_IC':>9s} {'IC_t':>7s} {'pooledIC':>9s} "
+    head = (f"{'comparator':<18s} {'daily_IC':>9s} {'IC_t':>7s} {'pooledIC':>9s} "
             f"{'hit%':>7s} {'maj%':>7s} {'MAE':>8s} {'<naive':>7s} "
-            f"{'alpha':>9s} {'alpha_t':>8s} {'L-S':>9s} {'n_reb':>6s}")
+            f"{'alpha':>9s} {'alpha_t':>8s} {'L-S':>9s} {'n_reb':>6s} {'secs':>7s}")
     lines = [head, "-" * len(head)]
 
     for r in results:
         lines.append(
-            f"{r['name']:<16s} "
+            f"{r['name']:<18s} "
             f"{f(r['daily_rank_ic'], '+.4f'):>9s} "
             f"{f(r['rebalance_ic_t'], '+.2f'):>7s} "
             f"{f(r['rank_ic'], '+.4f'):>9s} "
@@ -64,7 +67,8 @@ def render(results: list[dict]) -> str:
             f"{f(r['alpha_vs_equal_weight'], '+.5f'):>9s} "
             f"{f(r['alpha_t'], '+.2f'):>8s} "
             f"{f(r['long_short_spread'], '+.5f'):>9s} "
-            f"{r['n_rebalances']:>6d}"
+            f"{r['n_rebalances']:>6d} "
+            f"{r.get('seconds', 0.0):>7.1f}"
         )
     return "\n".join(lines)
 
@@ -83,15 +87,47 @@ def main() -> int:
     ap.add_argument("--allow-thin", action="store_true",
                     help="run even when the panel is too thin to rank (harness "
                          "smoke test only; the numbers are not results)")
+    ap.add_argument("--chronos", action="store_true",
+                    help="also score Chronos-2 (needs requirements-series.txt; "
+                         "roughly 1.7 s per date per 46 tickers at context "
+                         "2048, so budget ~1 hour for a full panel)")
+    ap.add_argument("--chronos-context", type=int, default=SERIES_CONTEXT,
+                    help=f"trailing observations handed to Chronos-2 "
+                         f"(default {SERIES_CONTEXT}; cost is linear in this)")
+    ap.add_argument("--record", action="store_true",
+                    help="open an experiment_runs row and store the table in "
+                         "it, beside the config_hash and data_hash that say "
+                         "whether a movement came from code or from data")
     ap.add_argument("--json", type=str, default=None, help="write results to a file")
     args = ap.parse_args()
 
+    # Without a handler the per-comparator progress goes nowhere, and a Chronos
+    # run is ~50 minutes of total silence on a workflow runner — which is
+    # indistinguishable from a hung step at the point somebody decides to
+    # cancel it.
+    logging.basicConfig(level=logging.INFO, format="%(message)s",
+                        stream=sys.stdout, force=True)
+
+    run_id = None
+    if args.record:
+        # A measurement nobody can find later is not evidence. The weekly job
+        # records its comparison the same way; a Chronos run that only ever
+        # existed in a workflow log could not be read beside it.
+        from pipeline.tracking import finish_run, start_run
+        run_id = start_run("series_comparison")
+        print(f"  experiment_runs row {run_id}")
+
     print("Loading panel and scoring comparators ...")
+    if args.chronos:
+        print(f"  Chronos-2 enabled at context {args.chronos_context}. This is "
+              f"the slow path; the `secs` column reports what each cost.")
     comparison = compare_baselines(
         start=args.start,
         n_folds=args.folds,
         min_train=args.min_train,
         with_pooled_xgb=not args.no_pooled_xgb,
+        with_chronos=args.chronos,
+        chronos_context=args.chronos_context,
         max_tickers=args.tickers,
         allow_thin=args.allow_thin,
     )
@@ -103,6 +139,26 @@ def main() -> int:
         print(f"  labelled {cov['labelled_rows']:,}  |  median names/date "
               f"{cov['median_names_per_date']:.0f}")
 
+    def _record(status: str) -> None:
+        if run_id is None:
+            return
+        finish_run(run_id, status, metrics={
+            "baselines": comparison.to_metrics(),
+            # The Chronos settings are NOT inside config_hash, which covers
+            # features, target, horizon, eval params and the benchmark mapping.
+            # Without them two runs at different contexts would be
+            # indistinguishable in experiment_runs — precisely the confusion
+            # config_hash exists to prevent everywhere else.
+            "series_config": {
+                "chronos": bool(args.chronos),
+                "chronos_context": args.chronos_context if args.chronos else None,
+                "folds": args.folds,
+                "min_train": args.min_train,
+                "max_tickers": args.tickers,
+                "pooled_xgb": not args.no_pooled_xgb,
+            },
+        })
+
     if not comparison.ranked:
         # A refusal, not a warning. Below the breadth threshold every feature is
         # zeroed by design and no date can be ranked, so the table that would
@@ -110,6 +166,7 @@ def main() -> int:
         # result. Printing it under a caption saying it is unreliable is how a
         # screenshot of it ends up somewhere as evidence.
         print(f"\n  REFUSED: {comparison.note}", file=sys.stderr)
+        _record("REFUSED")
         return 1
 
     if comparison.note:
@@ -142,6 +199,7 @@ def main() -> int:
                        "loadings": comparison.loadings}, fh, indent=2, default=str)
         print(f"\nWrote {args.json}")
 
+    _record("OK")
     return 0
 
 

@@ -1,0 +1,119 @@
+name: Series comparison (Chronos-2)
+
+# Phase 2, the foundation-model row of the baseline table.
+#
+# SEPARATE FROM THE WEEKLY JOB ON PURPOSE. This needs torch, and torch is not
+# in requirements.txt: it was removed in Phase 0 as the largest contributor to
+# memory pressure on the free-tier Render instance that had already been
+# OOM-killed once, and that file is installed by Render, by the daily pipeline
+# and by the weekly evaluation — none of which call this code. Keeping the
+# dependency in requirements-series.txt and the run in its own workflow is what
+# stops a research comparator from reaching a production web service.
+#
+# It also PUBLISHES NOTHING. It reads signals, scores comparators and records
+# the table into experiment_runs. That is why it can be dispatched freely and
+# why a failure here cannot damage a forecast — unlike the weekly job, whose
+# aborts must raise because it writes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: "Cap the panel to the N widest histories (blank = all)"
+        required: false
+        default: ""
+      context:
+        description: "Trailing observations handed to Chronos-2. Cost is LINEAR in this: 46 names x 2048 ran 1.71 s/date on 2 threads, ~54 min over 1,900 dates; 512 ran 0.43 s/date."
+        required: false
+        default: "2048"
+      folds:
+        description: "Purged walk-forward folds"
+        required: false
+        default: "5"
+      record:
+        description: "Write the table into experiment_runs"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  series-comparison:
+    runs-on: ubuntu-latest
+    # The measured worst case is 95 tickers at context 2048, ~105 min for one
+    # comparator; two variants plus the six linear baselines fit inside this
+    # with room. A run that hits the cap is a finding, not a retry.
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.0"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-series.txt
+
+      - name: Cache the Chronos-2 weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-chronos-2-small-v1
+
+      - name: Confirm the CPU wheel was resolved
+        # requirements-series.txt gets the CPU build via --extra-index-url,
+        # which works only because PEP 440 sorts the local version 2.8.0+cpu
+        # ABOVE plain 2.8.0. The day PyPI carries a base version the CPU index
+        # has not published yet, pip silently prefers the CUDA wheel: a 2.5GB
+        # download, on a runner with no GPU, for identical results. Checked
+        # rather than assumed.
+        run: |
+          python -c "
+          import torch, sys
+          print('torch', torch.__version__)
+          if '+cpu' not in torch.__version__:
+              sys.exit(f'expected a +cpu build, resolved {torch.__version__}; '
+                       f'the CPU index is behind PyPI - pin torch in '
+                       f'requirements-series.txt')
+          "
+
+      - name: Fetch the checkpoint
+        # Separate step so a Hub outage reads as a download failure rather than
+        # as a model that produced nothing. ~110MB for the 28M checkpoint.
+        env:
+          CHRONOS_THREADS: "2"
+        run: |
+          python -c "
+          from pipeline.chronos_forecaster import DEFAULT_MODEL_ID, load_pipeline
+          p = load_pipeline(DEFAULT_MODEL_ID)
+          print(f'{DEFAULT_MODEL_ID}: context {p.model_context_length}, '
+                f'{len(p.quantiles)} quantiles, median present: {0.5 in p.quantiles}')
+          "
+
+      - name: Score every comparator
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # A GitHub-hosted runner reports more cores than it gives you, and
+          # torch sizes its thread pool from that count. Left unset it
+          # oversubscribes and runs slower than the two threads it actually has.
+          CHRONOS_THREADS: "2"
+          TOKENIZERS_PARALLELISM: "false"
+        run: |
+          python tools/run_baselines.py \
+            --chronos \
+            --chronos-context "${{ github.event.inputs.context }}" \
+            --folds "${{ github.event.inputs.folds }}" \
+            ${{ github.event.inputs.tickers && format('--tickers {0}', github.event.inputs.tickers) || '' }} \
+            ${{ github.event.inputs.record == 'true' && '--record' || '' }} \
+            --json series-comparison.json
+
+      - name: Upload the table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: series-comparison
+          path: series-comparison.json
+          if-no-files-found: warn

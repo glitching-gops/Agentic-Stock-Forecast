@@ -1,0 +1,24 @@
+# Optional dependencies for the time-series foundation-model comparators.
+#
+# DELIBERATELY NOT IN requirements.txt. That file is installed by Render, by
+# the daily pipeline and by the weekly evaluation, none of which call this
+# code. torch was removed in Phase 0 as the largest contributor to memory
+# pressure on the free-tier instance that had already been OOM-killed once;
+# putting it back into the shared file would undo that for no benefit.
+#
+# Installed only by .github/workflows/series-comparison.yml, on top of
+# requirements.txt. `pipeline/chronos_forecaster.py` imports torch lazily, so
+# nothing on the API or daily path can pull it in by accident.
+#
+# Install locally with:
+#   pip install -r requirements.txt -r requirements-series.txt
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# CPU-only. The GPU wheel is ~2.5GB against ~200MB and there is no GPU on a
+# GitHub-hosted runner, so the default index would download CUDA for nothing.
+torch>=2.2,<3
+
+# chronos-forecasting pins transformers itself (>=4.41,<6); it also pulls
+# accelerate and einops.
+chronos-forecasting>=2.0
