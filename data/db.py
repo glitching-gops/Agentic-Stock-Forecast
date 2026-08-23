@@ -358,7 +358,54 @@ def init_db():
                 book_value_per_share REAL,
                 shares               REAL,
                 source               TEXT,
+                -- Vintage. `first_seen` is when this period first entered the
+                -- table; `fetched_at` is the last sync that confirmed or
+                -- changed it. Rows written before vintage tracking existed
+                -- carry NULL, which honestly means "unknown" rather than a
+                -- backfilled guess.
+                first_seen           TEXT,
+                fetched_at           TEXT,
                 PRIMARY KEY (ticker, period_end)
+            )
+        """))
+
+        for col in ["first_seen", "fetched_at"]:
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(
+                        f"ALTER TABLE fundamentals ADD COLUMN {col} TEXT"))
+            except Exception:
+                pass  # Column already exists, skip
+
+        # Restatement log. APPEND-ONLY, and the reason the table above can stay
+        # a simple current-view upsert.
+        #
+        # yfinance serves financial statements AS RESTATED, not as originally
+        # filed. If a company restates FY2024 during FY2025 we see the restated
+        # figure and attach it to 2024 — information nobody had at the time,
+        # and the direction of that error flatters the model. The vendor cannot
+        # tell us about restatements that happened before we started looking,
+        # but it cannot hide one that happens while we are watching: a plain
+        # upsert would simply overwrite the old figure and leave no trace that
+        # anything moved.
+        #
+        # So every observed change to a figure already on file is recorded
+        # here, with both values and the date we saw it move. That converts
+        # "how bad is the restatement bias?" from unanswerable into a query,
+        # accumulating from the day this ships. Nothing ever updates or deletes
+        # a row here, for the same reason forecast_outcomes never updates one:
+        # a record that can be revised is not evidence.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fundamental_revisions (
+                ticker        TEXT NOT NULL,
+                period_end    TEXT NOT NULL,   -- fiscal period that moved
+                observed_at   TEXT NOT NULL,   -- when WE saw it move
+                field         TEXT NOT NULL,   -- eps | book_value_per_share
+                old_value     REAL,
+                new_value     REAL,
+                first_seen    TEXT,            -- when the old value was recorded
+                source        TEXT,
+                PRIMARY KEY (ticker, period_end, field, observed_at)
             )
         """))
 

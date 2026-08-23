@@ -145,37 +145,235 @@ def fetch_fundamentals(tickers: list[str]) -> pd.DataFrame:
     return frame
 
 
-def store_fundamentals(frame: pd.DataFrame, engine=None) -> int:
-    """Upsert by (ticker, period_end). Restatements overwrite; see the docstring."""
+def _material_change(old, new, rtol: float = 1e-9) -> bool:
+    """
+    Did a figure actually move, as opposed to arriving with different float noise?
+
+    ``rtol`` is deliberately tiny. The job here is to filter identical values
+    that round-tripped through the database and back, not to decide what counts
+    as a big restatement — that judgement belongs at analysis time, on the
+    recorded values, not at the write boundary where it would silently discard
+    evidence.
+    """
+    old_missing = old is None or (isinstance(old, float) and not np.isfinite(old))
+    new_missing = new is None or (isinstance(new, float) and not np.isfinite(new))
+    if old_missing and new_missing:
+        return False
+    if old_missing or new_missing:
+        return True
+    scale = max(abs(float(old)), abs(float(new)), 1e-12)
+    return abs(float(old) - float(new)) / scale > rtol
+
+
+def _existing_rows(conn, tickers: list[str]) -> dict:
+    """Current (ticker, period_end) -> figures already on file."""
+    if not tickers:
+        return {}
+    rows = conn.execute(text(
+        "SELECT ticker, period_end, eps, book_value_per_share, first_seen "
+        "FROM fundamentals"
+    )).fetchall()
+    wanted = set(tickers)
+    return {(r[0], r[1]): {"eps": r[2], "book_value_per_share": r[3],
+                           "first_seen": r[4]}
+            for r in rows if r[0] in wanted}
+
+
+def store_fundamentals(frame: pd.DataFrame, engine=None,
+                       observed_at: str | None = None) -> dict:
+    """
+    Upsert by (ticker, period_end), recording every figure that MOVED.
+
+    The upsert is a current view: one row per fiscal period, holding the latest
+    values we have. What is new here is that a change to a figure already on
+    file is written to ``fundamental_revisions`` BEFORE it is overwritten.
+
+    That matters because yfinance serves statements as restated rather than as
+    originally filed — see the module docstring. We cannot recover restatements
+    that predate our first look, but from here on a figure cannot move without
+    leaving a row saying so, which is what turns the size of that bias into
+    something measurable rather than something disclaimed.
+
+    Returns counts rather than a row total, because "300 periods stored" hides
+    the only interesting number in it: how many of them changed.
+    """
     if frame.empty:
-        return 0
+        return {"periods": 0, "new": 0, "revised": 0, "unchanged": 0,
+                "revisions": 0}
+
     engine = engine or get_engine()
+    observed_at = observed_at or datetime.now().date().isoformat()
+    tickers = sorted(set(frame["ticker"]))
+
+    new = revised = unchanged = 0
+    revisions: list[dict] = []
+
     with engine.begin() as conn:
+        existing = _existing_rows(conn, tickers)
+
         for row in frame.to_dict("records"):
+            key = (row["ticker"], row["period_end"])
+            prior = existing.get(key)
+
+            if prior is None:
+                new += 1
+            else:
+                moved = [
+                    (field, prior[field], row.get(field))
+                    for field in ("eps", "book_value_per_share")
+                    if _material_change(prior[field], row.get(field))
+                ]
+                for field, old_value, new_value in moved:
+                    revisions.append({
+                        "ticker": row["ticker"],
+                        "period_end": row["period_end"],
+                        "observed_at": observed_at,
+                        "field": field,
+                        "old_value": old_value,
+                        "new_value": new_value,
+                        "first_seen": prior["first_seen"],
+                        "source": row.get("source"),
+                    })
+                if moved:
+                    revised += 1
+                else:
+                    unchanged += 1
+
+            # The bind dict is built explicitly rather than splatted from the
+            # row: a frame missing an optional column raised a bind-parameter
+            # error naming SQLAlchemy rather than the column, and a frame
+            # carrying an extra one would have reached the statement
+            # uninspected.
             conn.execute(text("""
                 INSERT INTO fundamentals
                     (ticker, period_end, effective_date, eps,
-                     book_value_per_share, shares, source)
+                     book_value_per_share, shares, source,
+                     first_seen, fetched_at)
                 VALUES
                     (:ticker, :period_end, :effective_date, :eps,
-                     :book_value_per_share, :shares, :source)
+                     :book_value_per_share, :shares, :source,
+                     :first_seen, :fetched_at)
                 ON CONFLICT (ticker, period_end) DO UPDATE SET
                     effective_date = EXCLUDED.effective_date,
                     eps = EXCLUDED.eps,
                     book_value_per_share = EXCLUDED.book_value_per_share,
                     shares = EXCLUDED.shares,
-                    source = EXCLUDED.source
-            """), to_native_params(row))
-    return len(frame)
+                    source = EXCLUDED.source,
+                    fetched_at = EXCLUDED.fetched_at,
+                    first_seen = COALESCE(fundamentals.first_seen,
+                                          EXCLUDED.first_seen)
+            """), to_native_params({
+                "ticker": row["ticker"],
+                "period_end": row["period_end"],
+                "effective_date": row["effective_date"],
+                "eps": row.get("eps"),
+                "book_value_per_share": row.get("book_value_per_share"),
+                "shares": row.get("shares"),
+                "source": row.get("source"),
+                # Always the current date. Preserving an EARLIER first_seen is
+                # the COALESCE in the statement above, and deliberately only
+                # there: this was preserved in Python as well, and the two
+                # guards covered for each other so completely that breaking
+                # either one alone left every test green. A redundant guard is
+                # an untestable one.
+                "first_seen": observed_at,
+                "fetched_at": observed_at,
+            }))
+
+        # Written AFTER the figures they describe and in the SAME transaction:
+        # a crash between the two would otherwise leave a revision claiming a
+        # change the table does not show, or a silent overwrite with no record.
+        for rev in revisions:
+            conn.execute(text("""
+                INSERT INTO fundamental_revisions
+                    (ticker, period_end, observed_at, field,
+                     old_value, new_value, first_seen, source)
+                VALUES
+                    (:ticker, :period_end, :observed_at, :field,
+                     :old_value, :new_value, :first_seen, :source)
+                ON CONFLICT (ticker, period_end, field, observed_at)
+                DO NOTHING
+            """), to_native_params(rev))
+
+    if revisions:
+        # Loud on purpose. A restatement is the one thing in this module that
+        # can invalidate a published result, so it must not arrive as a debug
+        # line nobody reads.
+        logger.warning(
+            f"[Fundamentals] {len(revisions)} figure(s) RESTATED across "
+            f"{revised} period(s) - the vendor changed values already on "
+            f"file; see fundamental_revisions")
+
+    return {"periods": int(len(frame)), "new": new, "revised": revised,
+            "unchanged": unchanged, "revisions": len(revisions)}
+
+
+def load_revisions(engine=None) -> pd.DataFrame:
+    """Every restatement observed since vintage tracking began."""
+    engine = engine or get_engine()
+    try:
+        with engine.connect() as conn:
+            return pd.read_sql(text(
+                "SELECT ticker, period_end, observed_at, field, old_value, "
+                "new_value, first_seen FROM fundamental_revisions"), conn)
+    except Exception:                                           # noqa: BLE001
+        return pd.DataFrame()
+
+
+def restatement_summary(engine=None) -> dict:
+    """
+    How much the vendor has revised what it already told us.
+
+    This is the measurement the second hazard in the module docstring calls
+    unsolved. It stays unsolved for HISTORY — we cannot see restatements that
+    happened before we started recording — but it stops being unmeasurable
+    going forward, and a summary showing zero revisions after a year of syncs
+    is itself the evidence that the bias is small.
+    """
+    rev = load_revisions(engine)
+    fund = load_fundamentals(engine)
+    tracked = 0
+    if not fund.empty and "first_seen" in fund.columns:
+        tracked = int(fund["first_seen"].notna().sum())
+
+    if rev.empty:
+        return {"revisions": 0, "periods_tracked": tracked,
+                "tickers_affected": 0, "median_abs_rel_change": None,
+                "max_abs_rel_change": None, "by_field": {},
+                "note": ("no restatement observed yet; only periods carrying a "
+                         "non-null first_seen are being watched")}
+
+    old = pd.to_numeric(rev["old_value"], errors="coerce")
+    new = pd.to_numeric(rev["new_value"], errors="coerce")
+    scale = np.maximum(old.abs(), new.abs()).replace(0.0, np.nan)
+    rel = ((new - old).abs() / scale).replace([np.inf, -np.inf], np.nan)
+
+    return {
+        "revisions": int(len(rev)),
+        "periods_tracked": tracked,
+        "tickers_affected": int(rev["ticker"].nunique()),
+        "median_abs_rel_change": (float(rel.median())
+                                  if rel.notna().any() else None),
+        "max_abs_rel_change": (float(rel.max())
+                               if rel.notna().any() else None),
+        "by_field": {str(k): int(v)
+                     for k, v in rev["field"].value_counts().items()},
+    }
 
 
 def load_fundamentals(engine=None) -> pd.DataFrame:
     engine = engine or get_engine()
     try:
         with engine.connect() as conn:
+            # first_seen/fetched_at are selected because restatement_summary
+            # counts how many periods are actually being WATCHED. Omitting
+            # them made it report zero tracked periods however many were on
+            # file, which reads as "nothing to see" — the exact reassuring
+            # answer this log exists to avoid giving falsely.
             return pd.read_sql(text(
                 "SELECT ticker, period_end, effective_date, eps, "
-                "book_value_per_share FROM fundamentals"), conn)
+                "book_value_per_share, first_seen, fetched_at "
+                "FROM fundamentals"), conn)
     except Exception:                                           # noqa: BLE001
         return pd.DataFrame()
 
@@ -268,7 +466,50 @@ def fundamental_coverage(panel: pd.DataFrame) -> dict:
     }
 
 
-def sync_fundamentals(tickers: list[str], engine=None) -> int:
-    """Fetch and store in one call. Safe to re-run; upserts by period."""
+# Below this share of requested tickers coming back with statements, the sync
+# refuses to write. yfinance failing wholesale looks exactly like a universe of
+# companies that stopped reporting, and the upsert would happily record the
+# handful that did answer — leaving a cross-section where coverage correlates
+# with which HTTP calls happened to succeed that morning.
+MIN_FETCH_COVERAGE = 0.50
+
+
+class FetchCoverageRefused(RuntimeError):
+    """Raised when too few tickers returned statements to trust the batch."""
+
+
+def sync_fundamentals(tickers: list[str], engine=None,
+                      min_coverage: float = MIN_FETCH_COVERAGE,
+                      observed_at: str | None = None) -> dict:
+    """
+    Fetch and store in one call. Safe to re-run; upserts by period.
+
+    Refuses to write a batch that covers less than ``min_coverage`` of the
+    requested tickers. A partial write is worse than no write here: valuation
+    is a CROSS-SECTIONAL feature, standardised within each date, so a date on
+    which only the tickers whose fetch succeeded carry a figure is scored
+    against a mean and standard deviation taken over that arbitrary subset.
+    Nothing downstream can tell that apart from a real cross-section.
+    """
     frame = fetch_fundamentals(tickers)
-    return store_fundamentals(frame, engine)
+
+    requested = len(set(tickers))
+    returned = int(frame["ticker"].nunique()) if len(frame) else 0
+    coverage = (returned / requested) if requested else 0.0
+
+    if requested and coverage < min_coverage:
+        raise FetchCoverageRefused(
+            f"only {returned} of {requested} tickers returned statements "
+            f"({coverage:.0%}, floor {min_coverage:.0%}) — refusing to write a "
+            f"partial cross-section. The stored table is unchanged."
+        )
+
+    counts = store_fundamentals(frame, engine, observed_at=observed_at)
+    counts["tickers_requested"] = requested
+    counts["tickers_returned"] = returned
+    counts["fetch_coverage"] = round(coverage, 4)
+    logger.info(
+        f"[Fundamentals] sync: {returned}/{requested} tickers, "
+        f"{counts['periods']} periods ({counts['new']} new, "
+        f"{counts['revised']} revised, {counts['unchanged']} unchanged)")
+    return counts

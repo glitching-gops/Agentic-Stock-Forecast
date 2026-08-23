@@ -384,6 +384,39 @@ def run_weekly_evaluation_job():
     logger.info(f"[Scheduler] Weekly evaluation complete: "
                f"{len(results)}/{len(universe)} tickers evaluated")
 
+    # ── Fundamentals sync ────────────────────────────────────────────────────
+    #
+    # Here rather than in the daily job because annual statements step once a
+    # year per ticker: a daily refresh would be five times the vendor calls for
+    # a figure that cannot have moved. Here rather than a workflow of its own
+    # because the reader is twenty lines below — writer and reader in one job
+    # cannot drift apart, and a sync that silently stopped running would
+    # otherwise be invisible until someone wondered why coverage was stale.
+    #
+    # Runs BEFORE the comparisons, which consume it, and AFTER the per-ticker
+    # evaluation has persisted, so a vendor outage cannot cost the expensive
+    # work. Non-fatal for the same reason the baseline step is: this writes to
+    # `fundamentals` only, which nothing published reads. It is recorded either
+    # way — a step that can fail silently reads as "it was fine".
+    fundamentals_metrics: dict = {}
+    try:
+        from pipeline.fundamentals import restatement_summary, sync_fundamentals
+
+        fundamentals_metrics = sync_fundamentals(universe)
+        fundamentals_metrics["restatements"] = restatement_summary()
+        revised = fundamentals_metrics.get("revised", 0)
+        if revised:
+            # A restatement means the vendor changed a figure we had already
+            # attached to a date and scored a model against. It does not
+            # invalidate the run, but it is the one event in this step that
+            # bears on whether the valuation result is real.
+            logger.warning(
+                f"[Scheduler] {revised} fiscal period(s) were RESTATED by the "
+                f"vendor this week; see the fundamental_revisions table")
+    except Exception as exc:                                        # noqa: BLE001
+        logger.error(f"[Scheduler] Fundamentals sync failed: {exc}")
+        fundamentals_metrics = {"note": f"sync raised: {str(exc)[:300]}"}
+
     # ── Baseline comparison ──────────────────────────────────────────────────
     #
     # Regenerated here rather than left to a manual tool run, for the same
@@ -402,9 +435,10 @@ def run_weekly_evaluation_job():
     # either way, so a silent failure is still a visible one: `baselines.note`
     # carries the reason into experiment_runs.
     #
-    # It runs LAST because it is the cheapest thing here (~20s against an
-    # evaluation measured in tens of minutes) and because running it after the
-    # persist means a defect in it cannot cost the expensive work.
+    # It runs in the cheap tail of the job (~20s against an evaluation measured
+    # in tens of minutes), after the persist, so a defect in it cannot cost the
+    # expensive work. Only the valuation comparison — which reads the table the
+    # fundamentals sync above just wrote — comes after it.
     baseline_metrics: dict = {}
     try:
         from pipeline.baselines import compare_baselines
@@ -418,6 +452,29 @@ def run_weekly_evaluation_job():
         baseline_metrics = {"note": f"comparison raised: {str(exc)[:300]}",
                             "comparators": []}
 
+    # ── Valuation comparison ─────────────────────────────────────────────────
+    #
+    # A SECOND comparison rather than a flag on the first, because
+    # with_fundamentals restricts the panel to rows that carry a fundamental —
+    # roughly a third of it, starting in 2022. That restriction is correct (the
+    # with/without A/B has to run over identical rows or it measures the sample
+    # change instead) but it must not displace the full-panel table, or the
+    # weekly number would quietly start describing a different set of rows.
+    #
+    # Cheap: no foundation model, a third of the rows, ~10s.
+    valuation_metrics: dict = {}
+    try:
+        from pipeline.baselines import compare_baselines
+
+        valuation = compare_baselines(tickers=universe, with_fundamentals=True)
+        valuation_metrics = valuation.to_metrics()
+        (logger.info if valuation.ranked else logger.error)(
+            f"[Scheduler] valuation: {valuation.summary()}")
+    except Exception as exc:                                        # noqa: BLE001
+        logger.error(f"[Scheduler] Valuation comparison failed: {exc}")
+        valuation_metrics = {"note": f"comparison raised: {str(exc)[:300]}",
+                             "comparators": []}
+
     finish_run(run_id, "OK", gate=gate, metrics={
         "tickers_evaluated": len(results),
         "tickers_in_universe": len(universe),
@@ -425,6 +482,8 @@ def run_weekly_evaluation_job():
         "signals_skipped": signals_report.skipped,
         "signals_refused": signals_report.refused,
         "baselines": baseline_metrics,
+        "baselines_valuation": valuation_metrics,
+        "fundamentals": fundamentals_metrics,
     })
 
 

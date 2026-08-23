@@ -7,6 +7,7 @@ tools/run_baselines.py — Score every comparator on identical purged folds.
     python tools/run_baselines.py --json out.json
     python tools/run_baselines.py --chronos                # slow: needs torch
     python tools/run_baselines.py --timesfm                # slower: 200M params
+    python tools/run_baselines.py --fundamentals           # adds the +val rows
 
 This is the Phase 2 starting line. Everything the phase adds later — a pooled
 cross-sectional model, Chronos-2, TimesFM-2.5 — has to be reported in this
@@ -95,7 +96,7 @@ def main() -> int:
                          "2048, so budget ~1 hour for a full panel)")
     ap.add_argument("--chronos-context", type=int, default=SERIES_CONTEXT,
                     help=f"trailing observations handed to Chronos-2 "
-                         f"(default {SERIES_CONTEXT}; cost is linear in this)")
+                         f"(default {SERIES_CONTEXT}; cost is QUADRATIC in this - measured 14.8x for a 4x context)")
     ap.add_argument("--timesfm", action="store_true",
                     help="also score TimesFM-2.5 (200M decoder-only, a "
                          "different architecture from Chronos rather than "
@@ -103,6 +104,13 @@ def main() -> int:
     ap.add_argument("--timesfm-context", type=int, default=SERIES_CONTEXT,
                     help=f"trailing observations handed to TimesFM-2.5 "
                          f"(default {SERIES_CONTEXT})")
+    ap.add_argument("--fundamentals", action="store_true",
+                    help="also score the +val comparators, which add "
+                         "earnings_yield and book_to_market. RESTRICTS the "
+                         "panel to rows carrying a fundamental (~a third of "
+                         "it, from 2022) so the with/without comparison runs "
+                         "over identical rows; populate the table first with "
+                         "tools/sync_fundamentals.py")
     ap.add_argument("--record", action="store_true",
                     help="open an experiment_runs row and store the table in "
                          "it, beside the config_hash and data_hash that say "
@@ -147,6 +155,10 @@ def main() -> int:
         print(f"  Chronos-2 enabled at context {args.chronos_context}.")
     if args.timesfm:
         print(f"  TimesFM-2.5 enabled at context {args.timesfm_context}.")
+    if args.fundamentals:
+        print("  Valuation enabled: the panel is restricted to rows carrying "
+              "a fundamental,")
+        print("  so these numbers are NOT comparable with a full-panel run.")
     if args.chronos or args.timesfm:
         print("  These are the slow paths; the `secs` column reports what "
               "each cost.")
@@ -159,6 +171,7 @@ def main() -> int:
         chronos_context=args.chronos_context,
         with_timesfm=args.timesfm,
         timesfm_context=args.timesfm_context,
+        with_fundamentals=args.fundamentals,
         max_tickers=args.tickers,
         allow_thin=args.allow_thin,
         on_result=_persist,
@@ -190,6 +203,7 @@ def main() -> int:
                 "min_train": args.min_train,
                 "max_tickers": args.tickers,
                 "pooled_xgb": not args.no_pooled_xgb,
+                "fundamentals": bool(args.fundamentals),
             },
         })
 
