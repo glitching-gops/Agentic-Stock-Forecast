@@ -39,6 +39,7 @@ as-of date and require the predictions to be bit-identical.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -55,6 +56,51 @@ DEFAULT_CONTEXT = 2048
 # method: it is barely two horizons of data, so a trailing-return estimate
 # would be computed from a single non-overlapping window.
 MIN_CONTEXT = 90
+
+
+def resolve_device(preferred: str | None = None) -> str:
+    """
+    Where a foundation model should run: explicit choice, env, then autodetect.
+
+    Autodetect rather than a hardcoded default because the same code runs in
+    two places with opposite answers. A GitHub runner has no GPU and must land
+    on CPU without configuration; a workstation with a CUDA build should not
+    have to be told. ``SERIES_DEVICE`` overrides both — set it to ``cpu`` to
+    reproduce a CPU-measured table on a machine that has a GPU.
+
+    Imported lazily. This module is reachable from ``pipeline.baselines`` and
+    therefore from the API, where torch must never become a hard requirement.
+    """
+    choice = (preferred or os.getenv("SERIES_DEVICE") or "").strip().lower()
+    if choice:
+        return choice
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:                                           # noqa: BLE001
+        return "cpu"
+
+
+def configure_determinism() -> None:
+    """
+    Turn OFF TF32 so a GPU run reproduces the CPU-measured tables.
+
+    Ada and Ampere silently execute float32 matmuls in TF32, which keeps the
+    float32 exponent but truncates the mantissa from 23 bits to 10. That is
+    invisible in a loss curve and very visible here: the quantity being
+    forecast is around 1e-2, the comparison against the `zero` floor turns on
+    the fifth decimal of MAE, and every number recorded so far was measured on
+    CPU. A speedup that silently changes the third significant figure of the
+    result is not a speedup, it is a different experiment.
+    """
+    try:
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:                                           # noqa: BLE001
+        pass
 
 
 @runtime_checkable

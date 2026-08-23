@@ -338,6 +338,30 @@ def init_db():
             )
         """))
 
+        # Valuation fundamentals, stored point-in-time.
+        #
+        # `effective_date` is the load-bearing column and the reason this is a
+        # table rather than a join against a vendor call. A fundamental is
+        # known to the market when it is FILED, not when the fiscal period
+        # ended; attaching FY2025 earnings to 31 March 2025 hands the model two
+        # months nobody had. SEBI (LODR) Reg 33 allows 60 days for audited
+        # annual results, so effective_date is period_end + 60.
+        #
+        # Keyed on period rather than date: one row per fiscal period per
+        # ticker, expanded onto the daily grid by an as-of join at read time.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS fundamentals (
+                ticker               TEXT NOT NULL,
+                period_end           TEXT NOT NULL,  -- fiscal period end
+                effective_date       TEXT NOT NULL,  -- first date it was knowable
+                eps                  REAL,           -- diluted preferred, annual
+                book_value_per_share REAL,
+                shares               REAL,
+                source               TEXT,
+                PRIMARY KEY (ticker, period_end)
+            )
+        """))
+
         # One row per pipeline run: what code, what configuration, what data.
         # Without it, "the metrics moved" has no answer — the model, the
         # feature list, the universe rule and the labelled set can all change

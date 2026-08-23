@@ -236,6 +236,68 @@ def cross_sectional_zscore(
     return out
 
 
+def retarget_horizon(panel: pd.DataFrame, horizon: int,
+                     min_coverage: float = 0.90) -> pd.DataFrame:
+    """
+    Replaces ``TARGET`` with the excess return over `horizon` sessions.
+
+    Free, and exact, because of the identity in ``relative_price_frame``: the
+    h-session forward difference of ``log(close / benchmark_close)`` IS the
+    h-session excess return, for any h. Nothing has to be refetched and no
+    approximation is introduced — the stored 30-session label is simply one
+    value of h among many.
+
+    This is what makes a horizon sweep affordable. The alternative would be
+    recomputing labels through ``pipeline.signals`` at each horizon, which
+    means refetching every benchmark and rewriting the signals table four
+    times.
+
+    Refuses below `min_coverage`, because a ticker whose ``benchmark_close``
+    was never backfilled produces an all-NaN column here. Those tickers would
+    silently drop out of the labelled set, and the sweep would compare horizons
+    over different universes — which is exactly the confound it exists to
+    avoid.
+    """
+    wide = relative_price_frame(panel)
+    if wide.empty:
+        raise ValueError(
+            "retarget_horizon needs benchmark_close, which is absent from this "
+            "panel. Recompute signals before sweeping horizons."
+        )
+
+    labelled = int(pd.to_numeric(panel[TARGET], errors="coerce").notna().sum())
+    have_level = int(panel["benchmark_close"].notna().sum())
+    if labelled and have_level / labelled < min_coverage:
+        raise ValueError(
+            f"benchmark_close covers {have_level / labelled:.1%} of labelled "
+            f"rows, below {min_coverage:.0%}. Retargeting would drop the "
+            f"uncovered tickers and compare horizons over different universes."
+        )
+
+    # Shifted WITHIN each ticker, never across the shared date grid.
+    #
+    # The wide frame's index is the UNION of every ticker's dates, so a ticker
+    # absent on a date another one trades — a later listing, a suspension, a
+    # dropped row — has a placeholder there. `wide.shift(-h)` would step h rows
+    # of that union, which is more than h sessions for such a ticker, and the
+    # label would silently measure a longer horizon for exactly the names whose
+    # history is most irregular. Measured: it broke the identity by 4.8e-02
+    # against a stored label that reproduces at 1e-15 when shifted per ticker.
+    rel = panel[["date", "ticker"]].copy()
+    close = pd.to_numeric(panel["close"], errors="coerce")
+    bench = pd.to_numeric(panel["benchmark_close"], errors="coerce")
+    ratio = (close / bench).replace([np.inf, -np.inf], np.nan)
+    rel["_rel"] = np.log(ratio.where(ratio > 0))
+
+    rel = rel.sort_values(["ticker", "date"], kind="mergesort")
+    grouped = rel.groupby("ticker", sort=False)["_rel"]
+    rel["_retarget"] = grouped.shift(-horizon) - rel["_rel"]
+
+    out = panel.drop(columns=[TARGET]).merge(
+        rel[["date", "ticker", "_retarget"]], on=["date", "ticker"], how="left")
+    return out.rename(columns={"_retarget": TARGET})
+
+
 def relative_price_frame(panel: pd.DataFrame) -> pd.DataFrame:
     """
     The log relative-price series per ticker: ``log(close / benchmark_close)``.

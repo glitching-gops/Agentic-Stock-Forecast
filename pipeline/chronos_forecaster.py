@@ -52,20 +52,30 @@ from typing import Any
 
 import numpy as np
 
+from pipeline.series import configure_determinism, resolve_device
+
 logger = logging.getLogger(__name__)
 
-# The 28M checkpoint, published by the AutoGluon org rather than amazon — there
-# is no `amazon/chronos-2-small`. Reported within ~1% of the 120M
-# `amazon/chronos-2` at roughly half the inference cost, which is what makes a
-# ~1,900-date panel affordable on a two-core runner at all.
-DEFAULT_MODEL_ID = "autogluon/chronos-2-small"
+# The full 120M checkpoint. Chosen over the 28M `autogluon/chronos-2-small`
+# (note: there is no `amazon/chronos-2-small`) to put Chronos on comparable
+# footing with TimesFM-2.5 at 231M. A 28M-vs-231M result confounds
+# ARCHITECTURE with SCALE, and architecture is the thing the two-model
+# comparison exists to isolate. The small checkpoint remains available by
+# passing model_id, and is the right choice on a CPU-only runner.
+#
+# Measured: 119.5M params, context 8192, and **21 quantiles with the median
+# at index 10** — against the small model's 13 with the median at 6. Reading
+# the median by position rather than by value would return the 0.3 quantile
+# of every prediction here. See median-by-value below; this is the third
+# checkpoint whose layout differs.
+DEFAULT_MODEL_ID = "amazon/chronos-2"
 
-# Measured on a 2-thread CPU, 30-session horizon, per date:
-#   46 series x 2048 context -> 1.71 s   (~54 min over 1,900 dates)
-#   95 series x 2048 context -> 3.31 s   (~105 min)
-#   95 series x  512 context -> 0.93 s   (~29 min)
-# Recorded here because cost is linear in both and the context actually used is
-# otherwise invisible in the results table.
+# Cost, 95 series x 2048 context, 30-session horizon:
+#   amazon/chronos-2          0.71 s/date on an RTX 4050   (~22 min / 1,900)
+#   autogluon/chronos-2-small 0.19 s/date on the same GPU  (~6 min / 1,900)
+#   autogluon/chronos-2-small 3.31 s/date on 2 CPU threads (~105 min)
+# The 120M model is ~3.7x the small one and does NOT fit the 300-minute
+# workflow budget on a CPU runner at this context. GPU or a smaller context.
 
 _PIPELINES: dict[str, Any] = {}
 
@@ -74,7 +84,8 @@ class ChronosUnavailable(ImportError):
     """Raised when the optional torch/chronos dependency is not installed."""
 
 
-def load_pipeline(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = None):
+def load_pipeline(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = None,
+                  device: str | None = None):
     """
     Loads a ``Chronos2Pipeline``, once per model id per process.
 
@@ -88,8 +99,13 @@ def load_pipeline(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = 
     requirement of either. It is installed only by the series-comparison
     workflow, from ``requirements-series.txt``.
     """
-    if model_id in _PIPELINES:
-        return _PIPELINES[model_id]
+    # Keyed by (model, device): a cache keyed on the model alone would hand
+    # back a CPU-resident pipeline to a caller that asked for CUDA, and the
+    # run would be slow for no visible reason.
+    device = resolve_device(device)
+    key = (model_id, device)
+    if key in _PIPELINES:
+        return _PIPELINES[key]
 
     try:
         import torch
@@ -110,9 +126,11 @@ def load_pipeline(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = 
         # shared two-core box oversubscribes badly.
         torch.set_num_threads(threads)
 
-    logger.info(f"[Chronos] loading {model_id} (threads={torch.get_num_threads()})")
-    _PIPELINES[model_id] = Chronos2Pipeline.from_pretrained(model_id)
-    return _PIPELINES[model_id]
+    configure_determinism()
+    logger.info(f"[Chronos] loading {model_id} on {device} "
+                f"(threads={torch.get_num_threads()})")
+    _PIPELINES[key] = Chronos2Pipeline.from_pretrained(model_id, device_map=device)
+    return _PIPELINES[key]
 
 
 @dataclass
@@ -127,6 +145,10 @@ class Chronos2Forecaster:
     1.70 s against 1.71 s. It is nonetheless a genuinely different model, so it
     is a separate comparator rather than a default quietly flipped on.
 
+    ``model_id`` selects the checkpoint. The 21-quantile layout of the 120M
+    model and the 13-quantile layout of the 28M one are both handled, because
+    the median is located by value.
+
     ``pipeline`` may be injected for tests. Nothing else in this class knows
     what a Chronos is: it maps arrays to a batch, reads one number out, and
     subtracts the last observation.
@@ -135,6 +157,7 @@ class Chronos2Forecaster:
     model_id: str = DEFAULT_MODEL_ID
     cross_learning: bool = False
     torch_threads: int | None = None
+    device: str | None = None
     pipeline: Any = None
     max_abs_prediction: float = field(default=2.0, repr=False)
 
@@ -145,7 +168,8 @@ class Chronos2Forecaster:
 
     def _pipeline(self):
         if self.pipeline is None:
-            self.pipeline = load_pipeline(self.model_id, self.torch_threads)
+            self.pipeline = load_pipeline(self.model_id, self.torch_threads,
+                                         self.device)
         return self.pipeline
 
     def forecast(self, histories: dict[str, np.ndarray],
@@ -216,7 +240,12 @@ class Chronos2Forecaster:
 # Registered variants. Kept OUT of `series.SERIES_BASELINES`, whose contract is
 # that every member's answer is known in advance — that dict is the calibration
 # set, and a foundation model is the thing being calibrated against it.
+# Keys are DERIVED from the default model so a checkpoint swap renames the
+# table rows with it. A hardcoded key would label a 120M run "chronos2small"
+# and make two different models indistinguishable in experiment_runs.
+_STEM = DEFAULT_MODEL_ID.rsplit("/", 1)[-1].replace("-", "")
+
 CHRONOS_VARIANTS: dict[str, dict] = {
-    "chronos2small": {"cross_learning": False},
-    "chronos2small_xl": {"cross_learning": True},
+    _STEM: {"cross_learning": False},
+    f"{_STEM}_xl": {"cross_learning": True},
 }

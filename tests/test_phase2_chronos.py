@@ -131,6 +131,31 @@ def test_the_median_quantile_is_used():
     assert out["T00.NS"] == pytest.approx(+0.07)
 
 
+def test_the_real_checkpoints_disagree_about_where_the_median_lives():
+    """
+    Not hypothetical. Measured on the two published Chronos-2 checkpoints:
+
+        autogluon/chronos-2-small   13 quantiles, median at index 6
+        amazon/chronos-2            21 quantiles, median at index 10
+
+    Index 6 on the 120M model is the 0.3 quantile. Had the median been read by
+    position, swapping checkpoints would have applied a systematic downward
+    bias to every prediction, with no error and a perfectly plausible table.
+    """
+    _require_torch("chronos")
+
+    seen = {}
+    for mid in ("autogluon/chronos-2-small", "amazon/chronos-2"):
+        q = list(C.load_pipeline(mid).quantiles)
+        seen[mid] = (len(q), q.index(0.5))
+
+    assert seen["autogluon/chronos-2-small"] != seen["amazon/chronos-2"], seen
+    small_median = seen["autogluon/chronos-2-small"][1]
+    big_q = list(C.load_pipeline("amazon/chronos-2").quantiles)
+    assert big_q[small_median] != 0.5, (
+        "the checkpoints happen to agree; this test no longer proves anything")
+
+
 def test_the_median_is_found_by_value_not_by_position():
     """
     Position 6 is the median of the 13 quantiles this checkpoint emits, and of
@@ -307,9 +332,14 @@ def test_the_two_variants_have_distinct_names():
     crossed = C.Chronos2Forecaster(pipeline=StubPipeline([]), cross_learning=True)
 
     assert plain.name != crossed.name
-    assert set(C.CHRONOS_VARIANTS) == {"chronos2small", "chronos2small_xl"}
-    assert C.CHRONOS_VARIANTS["chronos2small"]["cross_learning"] is False
-    assert C.CHRONOS_VARIANTS["chronos2small_xl"]["cross_learning"] is True
+
+    # Derived from the checkpoint, not hardcoded: a model swap must rename
+    # the table rows with it, or a 120M run is recorded under the 28M name
+    # and the two become indistinguishable in experiment_runs.
+    stem = C.DEFAULT_MODEL_ID.rsplit("/", 1)[-1].replace("-", "")
+    assert set(C.CHRONOS_VARIANTS) == {stem, f"{stem}_xl"}
+    assert C.CHRONOS_VARIANTS[stem]["cross_learning"] is False
+    assert C.CHRONOS_VARIANTS[f"{stem}_xl"]["cross_learning"] is True
 
 
 def test_chronos_is_not_in_the_known_answer_set():
@@ -417,18 +447,38 @@ def test_the_missing_dependency_message_names_the_requirements_file():
 # ── The real checkpoint ───────────────────────────────────────────────────────
 
 
-chronos_installed = pytest.mark.skipif(
-    __import__("importlib.util", fromlist=["util"]).find_spec("chronos") is None,
-    reason="chronos-forecasting not installed (requirements-series.txt)",
-)
+def _require_torch(*extra: str) -> None:
+    """
+    Skip unless torch — and any named extra — is genuinely usable.
+
+    Called INSIDE each test, never at module scope. An earlier version probed
+    at import time, which pytest runs during COLLECTION: with torch mid-
+    reinstall that pulled a half-built torch and chronos into sys.modules
+    before a single test ran, and unrelated files across the suite then failed
+    together while passing in isolation. Collection must import nothing heavy.
+
+    find_spec and a bare import are both too weak on their own: a partially
+    removed package still has a spec and still imports, as an empty shell. So
+    touch something real.
+    """
+    import importlib
+
+    try:
+        torch = importlib.import_module("torch")
+        torch.__version__
+        torch.tensor([0.0])
+        for name in extra:
+            importlib.import_module(name)
+    except Exception as exc:                                # noqa: BLE001
+        pytest.skip(f"torch/{extra} not usable: {str(exc)[:80]}")
 
 
-@chronos_installed
 def test_the_real_checkpoint_emits_a_median_and_the_expected_shape():
     """
     Pins the two facts the index arithmetic depends on, against the actual
     weights rather than against the stub that was written to match them.
     """
+    _require_torch("chronos")
     pipe = C.load_pipeline(C.DEFAULT_MODEL_ID)
 
     assert 0.5 in pipe.quantiles
@@ -442,7 +492,6 @@ def test_the_real_checkpoint_emits_a_median_and_the_expected_shape():
     assert tuple(np.asarray(out[0]).shape) == (1, len(pipe.quantiles), 30)
 
 
-@chronos_installed
 def test_the_real_model_forecasts_a_move_on_the_scale_of_the_target():
     """
     A sanity bound, not an accuracy claim. target_excess_return over 30
@@ -451,6 +500,7 @@ def test_the_real_model_forecasts_a_move_on_the_scale_of_the_target():
     similarly far out. Anything inside this bound is merely not obviously
     broken.
     """
+    _require_torch("chronos")
     rng = np.random.default_rng(7)
     hist = {f"T{i:02d}.NS": np.log(500.0 / 20000.0)
             + np.cumsum(rng.normal(0.0, 0.012, 400)) for i in range(8)}
@@ -462,7 +512,6 @@ def test_the_real_model_forecasts_a_move_on_the_scale_of_the_target():
     assert max(abs(v) for v in out.values()) < 0.5
 
 
-@chronos_installed
 def test_the_pipeline_is_loaded_once_per_process():
     """
     panel_walk_forward builds a fresh estimator per fold and adapter_factory a
@@ -470,6 +519,57 @@ def test_the_pipeline_is_loaded_once_per_process():
     and unlike a fitted model there is nothing fold-specific to reset —
     precisely because nothing is fitted.
     """
+    _require_torch("chronos")
     first = C.load_pipeline(C.DEFAULT_MODEL_ID)
     second = C.load_pipeline(C.DEFAULT_MODEL_ID)
     assert first is second
+
+
+# ── The GPU must not change the answer ────────────────────────────────────────
+
+
+def test_the_pipeline_cache_is_keyed_by_device():
+    """
+    A cache keyed on the model alone hands a CPU-resident pipeline to a caller
+    that asked for CUDA. Nothing errors; the run is simply slow for no visible
+    reason, which is the hardest kind of performance bug to notice.
+    """
+    _require_torch("chronos")
+
+    C._PIPELINES.clear()
+    cpu = C.load_pipeline(C.DEFAULT_MODEL_ID, device="cpu")
+    assert ("cpu" in str(k) for k in C._PIPELINES)
+    again = C.load_pipeline(C.DEFAULT_MODEL_ID, device="cpu")
+    assert again is cpu
+
+    import torch
+    if torch.cuda.is_available():
+        gpu = C.load_pipeline(C.DEFAULT_MODEL_ID, device="cuda")
+        assert gpu is not cpu, "cuda request returned the cpu pipeline"
+
+
+def test_cpu_and_gpu_agree_to_float32_precision():
+    """
+    The tables recorded so far were all measured on CPU. If moving to a GPU
+    changed the third significant figure, none of them would be comparable with
+    anything measured afterwards — so the speedup has to be verified as a
+    speedup and not as a different experiment.
+
+    Measured at 4.8e-07 against predictions of order 5e-3, which is float32
+    rounding. TF32 is disabled in series.configure_determinism for this reason.
+    """
+    _require_torch("chronos")
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+
+    rng = np.random.default_rng(3)
+    hist = {f"T{i:02d}.NS": np.log(500.0 / 20000.0)
+            + np.cumsum(rng.normal(0.0, 0.012, 512)) for i in range(8)}
+
+    cpu = C.Chronos2Forecaster(device="cpu").forecast(hist, horizon=30)
+    gpu = C.Chronos2Forecaster(device="cuda").forecast(hist, horizon=30)
+
+    assert set(cpu) == set(gpu)
+    worst = max(abs(cpu[k] - gpu[k]) for k in cpu)
+    assert worst < 1e-5, f"cpu and gpu disagree by {worst:.2e}"

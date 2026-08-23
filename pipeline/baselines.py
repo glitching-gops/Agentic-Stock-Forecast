@@ -51,6 +51,7 @@ from pipeline.panel import (
     load_panel,
     panel_coverage,
     relative_price_frame,
+    retarget_horizon,
 )
 from pipeline.series import (
     DEFAULT_CONTEXT as SERIES_CONTEXT,
@@ -390,7 +391,9 @@ def _pooled_xgb_factory():
     )
 
 
-def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500) -> dict[str, float]:
+def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500,
+                        horizon: int = HORIZON_SESSIONS,
+                        columns: list[str] | None = None) -> dict[str, float]:
     """
     Fits the linear comparator once on the earliest training window, to read.
 
@@ -399,13 +402,18 @@ def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500) -> dict[str, 
     beside each other means anything.
     """
     grid = sorted(panel["date"].unique())
-    cut_at = min_train - HORIZON_SESSIONS * 2
+    cut_at = min_train - horizon * 2
     if cut_at <= 0 or len(grid) <= min_train:
         return {}
     train = panel[(panel["date"] < grid[cut_at]) & panel[TARGET].notna()]
     if len(train) < 100:
         return {}
-    return LinearFactorModel().fit(train[FACTORS], train[TARGET]).coefficients()
+    # Same default-columns trap as the comparator: LinearFactorModel reads
+    # self.columns, not X. Left unpassed, this table silently omits every
+    # column outside FACTORS while claiming to report the fitted model.
+    cols = list(columns) if columns else list(FACTORS)
+    cols = [c for c in cols if c in train.columns]
+    return LinearFactorModel(columns=cols).fit(train[cols], train[TARGET]).coefficients()
 
 
 def compare_baselines(
@@ -420,11 +428,20 @@ def compare_baselines(
     chronos_context: int = SERIES_CONTEXT,
     with_timesfm: bool = False,
     timesfm_context: int = SERIES_CONTEXT,
+    horizon: int = HORIZON_SESSIONS,
+    with_fundamentals: bool = False,
+    on_result=None,
     max_tickers: int | None = None,
     allow_thin: bool = False,
 ) -> BaselineComparison:
     """
     Loads the panel and scores every comparator on identical purged folds.
+
+    ``on_result`` is called with the running results list after EVERY
+    comparator finishes. A foundation-model table is a two-hour run and the
+    return value is the only thing that carries results out, so an
+    interruption at comparator 13 of 13 discards all twelve that succeeded.
+    That happened. The callback lets a caller persist as it goes.
 
     Read only. Nothing here writes to the database — the caller decides what to
     record — which is what makes it safe to run inside a job whose expensive
@@ -445,11 +462,39 @@ def compare_baselines(
     if panel.empty:
         return BaselineComparison(note="no signals rows in the database")
 
+    # The stored label is the 30-session excess return. Any other horizon is
+    # derived exactly from the relative-price identity - see
+    # panel.retarget_horizon. Done BEFORE coverage and z-scoring so every
+    # downstream statistic describes the horizon actually being scored.
+    if horizon != HORIZON_SESSIONS:
+        panel = retarget_horizon(panel, horizon)
+
+    # Valuation is the first information here that is not a transform of the
+    # same OHLCV series. Restricting the panel to rows that CARRY it is the
+    # point: the comparison has to be with and without fundamentals over
+    # identical rows, or it measures the sample change instead.
+    fundamental_cols: list[str] = []
+    if with_fundamentals:
+        from pipeline.fundamentals import (
+            FUNDAMENTAL_COLS, attach_fundamentals, fundamental_coverage)
+
+        panel = attach_fundamentals(panel, engine)
+        fcov = fundamental_coverage(panel)
+        panel = panel[panel[FUNDAMENTAL_COLS].notna().all(axis=1)].reset_index(drop=True)
+        if panel.empty:
+            return BaselineComparison(
+                note=('no row carries a complete set of fundamentals; run pipeline.fundamentals.sync_fundamentals first'))
+        fundamental_cols = list(FUNDAMENTAL_COLS)
+        logger.info(
+            f"[Baselines] fundamentals cover {fcov['fraction']:.1%} of rows; "
+            f"panel restricted to {len(panel):,} rows from "
+            f"{panel['date'].min()}")
+
     if max_tickers:
         counts = panel.groupby("ticker")["date"].count().sort_values(ascending=False)
         panel = panel[panel["ticker"].isin(counts.head(max_tickers).index)]
 
-    panel = cross_sectional_zscore(panel, SCALE_FREE)
+    panel = cross_sectional_zscore(panel, SCALE_FREE + fundamental_cols)
     coverage = panel_coverage(panel)
 
     if coverage["median_names_per_date"] < MIN_NAMES_PER_DATE and not allow_thin:
@@ -462,8 +507,8 @@ def compare_baselines(
         )
 
     splitter = PurgedPanelWalkForward(
-        n_folds=n_folds, horizon=HORIZON_SESSIONS,
-        embargo=HORIZON_SESSIONS, min_train=min_train,
+        n_folds=n_folds, horizon=horizon,
+        embargo=horizon, min_train=min_train,
     )
 
     runs: list[tuple[str, object, list[str]]] = [
@@ -471,6 +516,22 @@ def compare_baselines(
     ]
     if with_pooled_xgb:
         runs.append(("pooled_xgb", _pooled_xgb_factory, FACTORS))
+
+    # Added as SEPARATE rows rather than by widening FACTORS, so the table
+    # carries the with/without contrast on identical folds and rows. A
+    # comparator that improved because the sample moved would otherwise be
+    # indistinguishable from one that improved because valuation helped.
+    if fundamental_cols:
+        with_val = FACTORS + fundamental_cols
+        # LinearFactorModel defaults its column list to FACTORS and reads only
+        # those, so the extra columns must be passed to the CONSTRUCTOR and not
+        # merely present in X. Handing them only through feature_cols produced a
+        # row identical to `linear_factor` to five decimal places.
+        runs.append(("linear_factor+val",
+                     lambda cols=with_val: LinearFactorModel(columns=cols),
+                     with_val))
+        if with_pooled_xgb:
+            runs.append(("pooled_xgb+val", _pooled_xgb_factory, with_val))
 
     # Series comparators read the relative-price series, not the feature
     # matrix. They are added only when that series actually exists.
@@ -498,7 +559,7 @@ def compare_baselines(
     else:
         series = relative_price_frame(panel)
         for name, cls in SERIES_BASELINES.items():
-            runs.append((name, adapter_factory(cls, series, horizon=HORIZON_SESSIONS),
+            runs.append((name, adapter_factory(cls, series, horizon=horizon),
                          ["date", "ticker"]))
 
         # Chronos-2 rides the same series and the same folds as the three
@@ -516,7 +577,7 @@ def compare_baselines(
                 runs.append((
                     name,
                     adapter_factory(Chronos2Forecaster, series,
-                                    horizon=HORIZON_SESSIONS,
+                                    horizon=horizon,
                                     context=chronos_context, **kwargs),
                     ["date", "ticker"],
                 ))
@@ -534,7 +595,7 @@ def compare_baselines(
                 runs.append((
                     name,
                     adapter_factory(TimesFM25Forecaster, series,
-                                    horizon=HORIZON_SESSIONS,
+                                    horizon=horizon,
                                     context=timesfm_context, **kwargs),
                     ["date", "ticker"],
                 ))
@@ -549,7 +610,7 @@ def compare_baselines(
         res = panel_walk_forward(
             panel=panel, feature_cols=feature_cols, model_factory=factory,
             splitter=splitter, name=name, target=TARGET,
-            rebalance_every=HORIZON_SESSIONS,
+            rebalance_every=horizon,
         )
         m, xs = res.metrics, res.cross_sectional
         results.append({
@@ -574,6 +635,13 @@ def compare_baselines(
             "seconds": round(time.time() - started, 1),
         })
 
+        if on_result is not None:
+            # Never let persistence kill the measurement it is recording.
+            try:
+                on_result(results, coverage)
+            except Exception as exc:                            # noqa: BLE001
+                logger.error(f"[Baselines] on_result failed: {str(exc)[:200]}")
+
     if not any(r["n_oos"] for r in results):
         return BaselineComparison(
             coverage=coverage, results=[],
@@ -585,6 +653,7 @@ def compare_baselines(
     return BaselineComparison(
         coverage=coverage,
         results=results,
-        loadings=fit_factor_loadings(panel, min_train),
+        loadings=fit_factor_loadings(panel, min_train, horizon,
+                                     FACTORS + fundamental_cols),
         note=series_note,
     )

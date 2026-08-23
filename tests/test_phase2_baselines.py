@@ -936,3 +936,156 @@ def test_a_baseline_comparison_survives_a_round_trip_through_finish_run():
     assert restored["comparators"][0]["daily_rank_ic"] is None
     assert restored["comparators"][1]["daily_rank_ic"] == 0.0215
     assert restored["loadings"]["prox_52w"] == 0.00561
+
+
+# ── Retargeting the horizon ───────────────────────────────────────────────────
+
+
+def _price_panel_with_gaps(n_dates=700, n_tickers=14, horizon=30, seed=5):
+    """
+    A panel where tickers do NOT share every date.
+
+    The gaps are the point. `relative_price_frame` pivots onto the UNION of all
+    dates, so a ticker absent from a date another one trades gets a placeholder
+    row there. Shifting the wide frame steps that placeholder; shifting within
+    the ticker does not. A fixture where everyone trades every day cannot tell
+    the two apart.
+    """
+    rng = np.random.default_rng(seed)
+    dates = [f"D{i:05d}" for i in range(n_dates)]
+    bench = 20000.0 * np.exp(np.cumsum(rng.normal(0.0002, 0.009, n_dates)))
+
+    rows = []
+    for k in range(n_tickers):
+        close = 500.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.016, n_dates)))
+        log_rel = np.log(close / bench)
+        keep = np.ones(n_dates, dtype=bool)
+        if k % 3 == 1:                       # a late listing
+            keep[: 40 + k] = False
+        if k % 3 == 2:                       # an interior suspension
+            keep[200 + k: 200 + k + 7] = False
+
+        idx = np.flatnonzero(keep)
+        # The label is the ticker's OWN h-session forward move, which is what
+        # pipeline/signals.py computes.
+        target = np.full(len(idx), np.nan)
+        if len(idx) > horizon:
+            target[:-horizon] = log_rel[idx][horizon:] - log_rel[idx][:-horizon]
+
+        for j, i in enumerate(idx):
+            row = {"date": dates[i], "ticker": f"T{k:02d}.NS",
+                   "close": close[i], "benchmark_close": bench[i],
+                   "benchmark_ticker": "^NSEI", P.TARGET: target[j]}
+            for c in P.FEATURE_COLS:
+                row[c] = float(rng.normal())
+            rows.append(row)
+    return pd.DataFrame(rows).sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+def test_retargeting_at_the_stored_horizon_reproduces_the_stored_label():
+    """
+    THE CALIBRATION CASE. Retargeting is exact by the relative-price identity,
+    so asking for the horizon the label already uses must return the label
+    itself. Anything else means the derivation is wrong, and every other
+    horizon in a sweep is wrong with it.
+    """
+    panel = _price_panel_with_gaps()
+    back = P.retarget_horizon(panel, 30)
+
+    a = pd.to_numeric(panel[P.TARGET], errors="coerce")
+    b = pd.to_numeric(back[P.TARGET], errors="coerce")
+    both = a.notna() & b.notna()
+
+    assert both.sum() > 5_000
+    assert np.abs(a[both] - b[both]).max() < 1e-9
+    assert b.notna().sum() == a.notna().sum()
+
+
+def test_the_shift_is_within_each_ticker_not_across_the_date_grid():
+    """
+    The wide frame's index is the UNION of every ticker's dates. Shifting it
+    steps rows that belong to OTHER tickers, so a name with a late listing or a
+    suspension silently gets a longer horizon than the table claims — and only
+    for the names whose history is most irregular.
+
+    Measured on real data before the fix: the identity broke by 4.8e-02 against
+    a stored label that reproduces at 3.3e-15 once the shift is per ticker.
+    """
+    panel = _price_panel_with_gaps()
+    back = P.retarget_horizon(panel, 30)
+
+    gapped = panel[panel["ticker"] == "T02.NS"]          # the suspension case
+    assert len(gapped) < panel["date"].nunique(), "fixture must have a gap"
+
+    a = pd.to_numeric(panel[P.TARGET], errors="coerce")
+    b = pd.to_numeric(back[P.TARGET], errors="coerce")
+    per_ticker = panel.assign(_a=a, _b=b).groupby("ticker").apply(
+        lambda g: np.abs(g["_a"] - g["_b"]).max(), include_groups=False)
+
+    assert per_ticker.max() < 1e-9, (
+        f"worst ticker {per_ticker.idxmax()} off by {per_ticker.max():.2e}")
+
+
+def test_a_shorter_horizon_produces_a_smaller_target():
+    """A 5-session move is smaller than a 30-session one; roughly sqrt(6)x."""
+    panel = _price_panel_with_gaps()
+    sd = {h: pd.to_numeric(P.retarget_horizon(panel, h)[P.TARGET],
+                           errors="coerce").std() for h in (5, 10, 20, 30)}
+    assert sd[5] < sd[10] < sd[20] < sd[30]
+
+
+def test_a_shorter_horizon_labels_more_rows():
+    """Only the trailing h rows per ticker are unlabelled, so smaller h labels more."""
+    panel = _price_panel_with_gaps()
+    n = {h: pd.to_numeric(P.retarget_horizon(panel, h)[P.TARGET],
+                          errors="coerce").notna().sum() for h in (5, 30)}
+    assert n[5] > n[30]
+
+
+def test_retargeting_refuses_without_a_benchmark_level():
+    panel = _price_panel_with_gaps()
+    panel["benchmark_close"] = np.nan
+    with pytest.raises(ValueError, match="benchmark_close"):
+        P.retarget_horizon(panel, 10)
+
+
+def test_retargeting_refuses_on_thin_benchmark_coverage():
+    """
+    Retargeting a partly-covered panel would drop the uncovered tickers, so a
+    sweep would compare horizons over DIFFERENT universes — the exact confound
+    a sweep exists to avoid.
+    """
+    panel = _price_panel_with_gaps()
+    half = panel["ticker"].isin(panel["ticker"].unique()[:7])
+    panel.loc[half, "benchmark_close"] = np.nan
+    with pytest.raises(ValueError, match="below"):
+        P.retarget_horizon(panel, 10)
+
+
+def test_the_horizon_reaches_the_splitter_and_the_rebalance_schedule(monkeypatch):
+    """
+    A sweep that retargeted the label but left the embargo and the rebalance
+    frequency at 30 would purge six times too much at h=5 and count overlapping
+    windows as independent.
+    """
+    import pipeline.baselines
+
+    panel = _price_panel_with_gaps(n_dates=800, n_tickers=20, seed=11)
+    monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: panel)
+
+    seen = {}
+    real = pipeline.baselines.panel_walk_forward
+
+    def spy(**kw):
+        seen["rebalance_every"] = kw["rebalance_every"]
+        seen["horizon"] = kw["splitter"].horizon
+        seen["embargo"] = kw["splitter"].embargo
+        return real(**kw)
+
+    monkeypatch.setattr(pipeline.baselines, "panel_walk_forward", spy)
+    pipeline.baselines.compare_baselines(
+        with_pooled_xgb=False, with_series=False, horizon=5)
+
+    assert seen["rebalance_every"] == 5
+    assert seen["horizon"] == 5
+    assert seen["embargo"] == 5

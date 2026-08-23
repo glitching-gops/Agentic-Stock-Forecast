@@ -126,6 +126,22 @@ def main() -> int:
         run_id = start_run("series_comparison")
         print(f"  experiment_runs row {run_id}")
 
+    # Persist after every comparator, not just at the end. A killed
+    # two-hour run previously discarded twelve finished comparators
+    # because the results only left compare_baselines via its return
+    # value. Written to a .partial file so a crash mid-write cannot
+    # corrupt a completed table.
+    partial_path = (args.json + ".partial") if args.json else None
+
+    def _persist(results, coverage):
+        if not partial_path:
+            return
+        with open(partial_path, "w", encoding="utf-8") as fh:
+            json.dump({"coverage": coverage, "results": results,
+                       "complete": False}, fh, indent=2, default=str)
+        print(f"    ... {len(results)} comparator(s) saved to "
+              f"{partial_path}", flush=True)
+
     print("Loading panel and scoring comparators ...")
     if args.chronos:
         print(f"  Chronos-2 enabled at context {args.chronos_context}.")
@@ -145,6 +161,7 @@ def main() -> int:
         timesfm_context=args.timesfm_context,
         max_tickers=args.tickers,
         allow_thin=args.allow_thin,
+        on_result=_persist,
     )
 
     cov = comparison.coverage
@@ -221,7 +238,8 @@ def main() -> int:
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump({"coverage": cov, "results": comparison.results,
-                       "loadings": comparison.loadings}, fh, indent=2, default=str)
+                       "loadings": comparison.loadings,
+                       "complete": True}, fh, indent=2, default=str)
         print(f"\nWrote {args.json}")
 
     _record("OK")

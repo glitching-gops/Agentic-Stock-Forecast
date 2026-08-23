@@ -58,6 +58,8 @@ from typing import Any
 
 import numpy as np
 
+from pipeline.series import configure_determinism, resolve_device
+
 logger = logging.getLogger(__name__)
 
 # The transformers PORT, not the `timesfm` PyPI package. That package is still
@@ -74,7 +76,8 @@ class TimesFMUnavailable(ImportError):
     """Raised when torch or a transformers new enough to carry the port is absent."""
 
 
-def load_model(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = None):
+def load_model(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = None,
+               device: str | None = None):
     """
     Loads the model once per id per process, in eval mode and float32.
 
@@ -83,8 +86,12 @@ def load_model(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = Non
     reduced-precision forecast of a quantity around 1e-2 would be measuring the
     dtype as much as the model.
     """
-    if model_id in _MODELS:
-        return _MODELS[model_id]
+    # Keyed by (model, device) — a model-only key would return a CPU-resident
+    # model to a caller that asked for CUDA, silently and slowly.
+    device = resolve_device(device)
+    key = (model_id, device)
+    if key in _MODELS:
+        return _MODELS[key]
 
     try:
         import torch
@@ -102,11 +109,15 @@ def load_model(model_id: str = DEFAULT_MODEL_ID, torch_threads: int | None = Non
     if threads:
         torch.set_num_threads(threads)
 
-    logger.info(f"[TimesFM] loading {model_id} "
+    configure_determinism()
+    logger.info(f"[TimesFM] loading {model_id} on {device} "
                 f"(threads={torch.get_num_threads()})")
     model = TimesFm2_5ModelForPrediction.from_pretrained(model_id)
-    model = model.to(torch.float32).eval()
-    _MODELS[model_id] = model
+    # float32 on both devices. bfloat16 would be faster on an Ada GPU and
+    # would also change the numbers, which would make every CPU-measured
+    # table in this project incomparable with anything measured afterwards.
+    model = model.to(device=device, dtype=torch.float32).eval()
+    _MODELS[key] = model
     return model
 
 
@@ -149,6 +160,7 @@ class TimesFM25Forecaster:
     model_id: str = DEFAULT_MODEL_ID
     force_flip_invariance: bool = True
     torch_threads: int | None = None
+    device: str | None = None
     model: Any = None
     max_abs_prediction: float = field(default=2.0, repr=False)
 
@@ -159,7 +171,7 @@ class TimesFM25Forecaster:
 
     def _model(self):
         if self.model is None:
-            self.model = load_model(self.model_id, self.torch_threads)
+            self.model = load_model(self.model_id, self.torch_threads, self.device)
         return self.model
 
     def forecast(self, histories: dict[str, np.ndarray],
@@ -175,7 +187,10 @@ class TimesFM25Forecaster:
         # returned — forward() yields one row per input, positionally, and
         # names nothing.
         tickers = list(histories)
-        batch = [torch.tensor(np.asarray(histories[t], dtype=np.float32))
+        # Built directly on the model's device: forward() stacks these before
+        # anything moves them, so CPU tensors against a CUDA model raise.
+        dev = next(model.parameters()).device
+        batch = [torch.tensor(np.asarray(histories[t], dtype=np.float32), device=dev)
                  for t in tickers]
 
         median = median_index(model)
@@ -222,7 +237,7 @@ class TimesFM25Forecaster:
                 force_flip_invariance=self.force_flip_invariance,
             )
 
-        full = np.asarray(out.full_predictions)      # (batch, steps, 1 + n_q)
+        full = out.full_predictions.detach().to('cpu').numpy()   # (b, steps, 1+n_q)
         steps = full.shape[1]
         if steps < horizon:
             raise ValueError(

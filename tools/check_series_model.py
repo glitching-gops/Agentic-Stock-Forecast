@@ -158,10 +158,12 @@ def run_one(which: str, series: pd.DataFrame, context: int) -> None:
           f"level to ~-3")
     print("       sample: " + ", ".join(
         f"{t} {v:+.4f}" for t, v in list(zip(rows["ticker"], live))[:6]))
+    where = (torch.cuda.get_device_name(0) if torch.cuda.is_available()
+             else f"{torch.get_num_threads()} CPU threads")
     print(f"       cost: {len(series.columns)} tickers x {context} context "
-          f"= {per_date:.2f}s per date on {torch.get_num_threads()} threads")
-    print(f"             1,900 dates -> {per_date * 1900 / 60:.0f} min "
-          f"(a GitHub runner has 2 threads; scale accordingly)")
+          f"= {per_date:.2f}s per date on {where}")
+    print(f"             1,900 dates -> {per_date * 1900 / 60:.0f} min here. "
+          f"The workflow runner has 2 CPU threads and no GPU.")
 
 
 def main() -> int:
@@ -184,9 +186,15 @@ def main() -> int:
         return 1
     check("torch is installed", True,
           f"{torch.__version__}, {torch.get_num_threads()} threads")
-    check("this is a CPU build (a GPU wheel on a CPU box is 2.5GB wasted)",
-          "+cpu" in torch.__version__ or torch.cuda.is_available(),
-          torch.__version__)
+    # What this actually checks is that the wheel matches the hardware. A CUDA
+    # wheel on a box with no GPU is 2.5GB downloaded for nothing; a CPU wheel
+    # on a box with one leaves an 18x speedup unused. Labelling it "this is a
+    # CPU build" was wrong the moment CUDA arrived.
+    cuda = torch.cuda.is_available()
+    check("the torch build matches the hardware",
+          ("+cpu" in torch.__version__) or cuda,
+          f"{torch.__version__} | cuda {cuda}"
+          + (f" | {torch.cuda.get_device_name(0)}" if cuda else ""))
 
     from pipeline import series as S
     context = args.context or S.DEFAULT_CONTEXT

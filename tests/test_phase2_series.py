@@ -606,3 +606,46 @@ def test_the_contiguity_check_is_wired_into_the_gate():
     from pipeline.validation import CHECKS, check_sessions_are_contiguous
 
     assert check_sessions_are_contiguous in CHECKS
+
+
+# ── Device selection ──────────────────────────────────────────────────────────
+
+
+def test_an_explicit_device_beats_the_environment(monkeypatch):
+    monkeypatch.setenv("SERIES_DEVICE", "cpu")
+    assert S.resolve_device("cuda") == "cuda"
+
+
+def test_the_environment_beats_autodetect(monkeypatch):
+    """
+    SERIES_DEVICE=cpu is how a CPU-measured table is reproduced on a machine
+    that has a GPU. If autodetect won, that reproduction would be impossible.
+    """
+    monkeypatch.setenv("SERIES_DEVICE", "cpu")
+    assert S.resolve_device() == "cpu"
+
+
+def test_autodetect_falls_back_to_cpu_without_torch(monkeypatch):
+    """
+    A GitHub runner has no GPU and must land on CPU with no configuration —
+    and requirements.txt has no torch at all, so the import itself can fail.
+    """
+    import sys
+    monkeypatch.delenv("SERIES_DEVICE", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    assert S.resolve_device() == "cpu"
+
+
+def test_determinism_turns_tf32_off():
+    """
+    Ada and Ampere run float32 matmuls in TF32 by default: same exponent, 10
+    mantissa bits instead of 23. The forecast is around 1e-2 and the comparison
+    against the `zero` floor turns on the fifth decimal of MAE, so leaving it
+    on would silently make a GPU run a different experiment from every
+    CPU-measured table in this project.
+    """
+    torch = pytest.importorskip("torch")
+    torch.backends.cuda.matmul.allow_tf32 = True        # pretend someone set it
+    S.configure_determinism()
+    assert torch.backends.cuda.matmul.allow_tf32 is False
+    assert torch.backends.cudnn.allow_tf32 is False

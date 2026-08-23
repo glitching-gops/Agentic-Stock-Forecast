@@ -32,6 +32,31 @@ import pytest
 from pipeline import series as S
 from pipeline import timesfm_forecaster as T
 
+def _require_torch(*extra: str) -> None:
+    """
+    Skip unless torch — and any named extra — is genuinely usable.
+
+    Called INSIDE each test, never at module scope. An earlier version probed
+    at import time, which pytest runs during COLLECTION: with torch mid-
+    reinstall that pulled a half-built torch and chronos into sys.modules
+    before a single test ran, and unrelated files across the suite then failed
+    together while passing in isolation. Collection must import nothing heavy.
+
+    find_spec and a bare import are both too weak on their own: a partially
+    removed package still has a spec and still imports, as an empty shell. So
+    touch something real.
+    """
+    import importlib
+
+    try:
+        torch = importlib.import_module("torch")
+        torch.__version__
+        torch.tensor([0.0])
+        for name in extra:
+            importlib.import_module(name)
+    except Exception as exc:                                # noqa: BLE001
+        pytest.skip(f"torch/{extra} not usable: {str(exc)[:80]}")
+
 
 # ── A stub whose right answer is known ────────────────────────────────────────
 
@@ -46,8 +71,17 @@ class StubConfig:
 
 
 class StubOutput:
+    """
+    The real TimesFm2_5OutputForPrediction returns a torch TENSOR, which the
+    forecaster detaches and moves off the device. A stub returning a numpy
+    array does not model that, and lets a device-handling regression pass.
+    """
+
     def __init__(self, full_predictions):
-        self.full_predictions = full_predictions
+        import torch
+
+        self.full_predictions = torch.as_tensor(full_predictions,
+                                                dtype=torch.float32)
 
 
 class StubModel:
@@ -68,6 +102,17 @@ class StubModel:
         self.context_len = context_len
         self.steps = steps
         self.calls: list[dict] = []
+
+    def parameters(self):
+        """
+        The real model exposes parameters, and the forecaster reads their
+        device to build its input batch there — forward() stacks the tensors
+        before anything moves them, so a CPU tensor against a CUDA model
+        raises. A stub that omits this does not model the interface.
+        """
+        import torch
+
+        yield torch.zeros(1)
 
     def __call__(self, past_values, forecast_context_len=None,
                  truncate_negative=None, force_flip_invariance=None, **kwargs):
@@ -122,6 +167,7 @@ def histories(last_values, length=200):
 
 
 def test_the_prediction_is_a_move_not_a_level():
+    _require_torch("transformers")
     hist = histories([-3.0, -2.0])
     stub = ExactStub(levels=[-3.0 + 0.05, -2.0 - 0.02])
 
@@ -132,6 +178,7 @@ def test_the_prediction_is_a_move_not_a_level():
 
 
 def test_the_reference_is_the_last_observation_not_the_first():
+    _require_torch("transformers")
     hist = {"T00.NS": np.linspace(-5.0, -3.0, 300)}
     stub = ExactStub(levels=[-3.0 + 0.10])
 
@@ -146,6 +193,7 @@ def test_the_median_column_is_offset_by_the_point_output():
     quantiles, so the median is at 1 + index(0.5) = 5, not index(0.5) = 4.
     Dropping the offset returns the 40th percentile of every prediction.
     """
+    _require_torch("transformers")
     stub = ExactStub(levels=[-3.0])
     assert T.median_index(stub) == 5
     assert list(stub.config.quantiles).index(0.5) == 4
@@ -158,6 +206,7 @@ def test_a_chronos_style_position_would_read_the_wrong_quantile():
     the case tests/test_phase2_chronos.py was written against as a
     hypothetical; here it is the actual second checkpoint.
     """
+    _require_torch("transformers")
     stub = ExactStub(levels=[-3.0])
     quantiles = list(stub.config.quantiles)
 
@@ -171,6 +220,7 @@ def test_a_median_disagreement_between_layout_and_config_raises():
     they diverge, one of them is a systematic bias in every prediction, and
     picking a winner would be guessing which.
     """
+    _require_torch("transformers")
     stub = ExactStub(levels=[-3.0], decode_index=7)
 
     with pytest.raises(ValueError, match="disagreement"):
@@ -178,6 +228,7 @@ def test_a_median_disagreement_between_layout_and_config_raises():
 
 
 def test_the_last_horizon_step_is_used_not_the_first():
+    _require_torch("transformers")
     hist = histories([-3.0])
     stub = ExactStub(levels=[-3.0 + 0.07], horizon=30)
 
@@ -186,6 +237,7 @@ def test_the_last_horizon_step_is_used_not_the_first():
 
 
 def test_each_forecast_goes_to_the_ticker_that_produced_it():
+    _require_torch("transformers")
     hist = histories([-3.0, -2.0, -1.0, -4.0])
     stub = ExactStub(levels=[-3.0 + 0.01, -2.0 + 0.02, -1.0 + 0.03, -4.0 + 0.04])
 
@@ -211,6 +263,7 @@ def test_negative_truncation_is_forced_off():
     date where every name traded above its benchmark level, silently, on some
     dates and not others, producing a table that is right most of the time.
     """
+    _require_torch("transformers")
     hist = histories([-3.0])
     stub = ExactStub(levels=[-3.0])
 
@@ -226,6 +279,7 @@ def test_the_context_length_is_passed_explicitly():
     becomes whatever the checkpoint prefers, and the results table reports the
     number that was asked for rather than the one that was used.
     """
+    _require_torch("transformers")
     hist = histories([-3.0, -2.0], length=768)          # already 24 * 32
     stub = ExactStub(levels=[-3.0, -2.0])
 
@@ -245,6 +299,7 @@ def test_the_context_is_rounded_up_to_a_patch_boundary_never_down():
     Rounding up costs nothing. _preprocess left-pads to the requested length
     and masks the padding, so the model sees the same real observations.
     """
+    _require_torch("transformers")
     hist = histories([-3.0], length=777)                # 24.28 patches
     stub = ExactStub(levels=[-3.0])
 
@@ -271,6 +326,7 @@ def test_the_rounded_context_never_exceeds_the_model():
     470-context model even though the raw history does exactly. That gap is the
     whole point of guarding the rounded value rather than the raw length.
     """
+    _require_torch("transformers")
     fits = ExactStub(levels=[-3.0], context_len=512)
     T.TimesFM25Forecaster(model=fits).forecast(
         histories([-3.0], length=500), horizon=30)
@@ -284,6 +340,7 @@ def test_the_rounded_context_never_exceeds_the_model():
 
 
 def test_flip_invariance_reaches_the_model():
+    _require_torch("transformers")
     hist = histories([-3.0])
     for flag in (True, False):
         stub = ExactStub(levels=[-3.0])
@@ -293,6 +350,7 @@ def test_flip_invariance_reaches_the_model():
 
 
 def test_a_history_longer_than_the_model_context_raises():
+    _require_torch("transformers")
     hist = histories([-3.0], length=900)
     stub = ExactStub(levels=[-3.0], context_len=512)
 
@@ -305,6 +363,7 @@ def test_a_horizon_longer_than_the_model_returns_raises():
     Silently reading the last step the model DID return would answer a
     different question — a 20-session forecast reported as a 30-session one.
     """
+    _require_torch("transformers")
     hist = histories([-3.0])
     stub = ExactStub(levels=[-3.0], steps=20)
 
@@ -316,6 +375,7 @@ def test_a_horizon_longer_than_the_model_returns_raises():
 
 
 def test_a_non_finite_forecast_is_declined():
+    _require_torch("transformers")
     hist = histories([-3.0, -2.0])
     stub = ExactStub(levels=[np.nan, -2.0 + 0.02])
 
@@ -326,6 +386,7 @@ def test_a_non_finite_forecast_is_declined():
 
 
 def test_an_implausible_forecast_is_declined():
+    _require_torch("transformers")
     hist = histories([-3.0, -2.0])
     stub = ExactStub(levels=[-3.0 + 5.0, -2.0 + 0.02])
 
@@ -335,6 +396,7 @@ def test_an_implausible_forecast_is_declined():
 
 
 def test_no_histories_makes_no_call():
+    _require_torch("transformers")
     stub = ExactStub(levels=[])
     assert T.TimesFM25Forecaster(model=stub).forecast({}, horizon=30) == {}
     assert stub.calls == []
@@ -344,6 +406,7 @@ def test_no_histories_makes_no_call():
 
 
 def test_timesfm_is_not_in_the_known_answer_set():
+    _require_torch("transformers")
     assert not any("timesfm" in name for name in S.SERIES_BASELINES)
 
 
@@ -352,6 +415,7 @@ def test_importing_the_comparator_module_does_not_import_torch():
     Same guard as Chronos. pipeline.baselines is imported by the weekly job and
     by the API; torch must stay inside load_model().
     """
+    _require_torch("transformers")
     import subprocess
     import sys
 
@@ -367,6 +431,7 @@ def test_importing_the_comparator_module_does_not_import_torch():
 
 
 def test_timesfm_requires_the_series_comparators():
+    _require_torch("transformers")
     from pipeline.baselines import compare_baselines
 
     with pytest.raises(ValueError, match="foundation-model"):
@@ -374,6 +439,7 @@ def test_timesfm_requires_the_series_comparators():
 
 
 def test_timesfm_is_scored_when_asked_for(monkeypatch):
+    _require_torch("transformers")
     import pipeline.baselines
     import pipeline.timesfm_forecaster
     from tests.test_phase2_baselines import make_panel
@@ -404,18 +470,12 @@ def test_timesfm_is_scored_when_asked_for(monkeypatch):
 # ── The real checkpoint ───────────────────────────────────────────────────────
 
 
-timesfm_installed = pytest.mark.skipif(
-    __import__("importlib.util", fromlist=["util"]).find_spec("torch") is None,
-    reason="torch not installed (requirements-series.txt)",
-)
-
-
-@timesfm_installed
 def test_the_real_checkpoint_lays_its_median_out_where_we_think():
     """
     Pins the layout the index arithmetic depends on against the actual weights,
     rather than against the stub that was written to match them.
     """
+    _require_torch("transformers")
     model = T.load_model(T.DEFAULT_MODEL_ID)
 
     quantiles = list(model.config.quantiles)
@@ -424,13 +484,13 @@ def test_the_real_checkpoint_lays_its_median_out_where_we_think():
     assert T.median_index(model) == int(model.config.decode_index)
 
 
-@timesfm_installed
 def test_the_real_model_forecasts_a_move_on_the_scale_of_the_target():
     """
     A sanity bound, not an accuracy claim. Returning levels instead of moves
     would land near -3; reading the wrong quantile decade would be similarly
     far out.
     """
+    _require_torch("transformers")
     rng = np.random.default_rng(11)
     hist = {f"T{i:02d}.NS": np.log(500.0 / 20000.0)
             + np.cumsum(rng.normal(0.0, 0.012, 400)) for i in range(6)}
@@ -442,6 +502,6 @@ def test_the_real_model_forecasts_a_move_on_the_scale_of_the_target():
     assert max(abs(v) for v in out.values()) < 0.5
 
 
-@timesfm_installed
 def test_the_model_is_loaded_once_per_process():
+    _require_torch("transformers")
     assert T.load_model(T.DEFAULT_MODEL_ID) is T.load_model(T.DEFAULT_MODEL_ID)
