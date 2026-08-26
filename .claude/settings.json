@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/render-redeploy-check.sh",
+            "shell": "bash",
+            "timeout": 15,
+            "statusMessage": "Checking Render import path"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pipeline-invariants.sh",
+            "shell": "bash",
+            "timeout": 90,
+            "statusMessage": "Checking pipeline invariants"
+          }
+        ]
+      }
+    ]
+  }
+}

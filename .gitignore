@@ -62,3 +62,13 @@ scratch/
 # Scheduler lock file
 *.lock
 scheduler.lock
+
+# Claude Code — machine-specific settings (interpreter paths, personal allowlist).
+# .claude/settings.json, .claude/hooks/, .claude/agents/ and .claude/skills/
+# ARE committed: they are project truths, not personal preference.
+.claude/settings.local.json
+*.doctor-backup
+
+# Generated model packages (LoRA export, probe embedding caches) — regenerable
+# from tools/export_lora_package.py and tools/run_probe.py, and large.
+*.npz
