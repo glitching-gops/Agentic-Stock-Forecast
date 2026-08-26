@@ -24,15 +24,16 @@ def _to_bool(value) -> bool | None:
 @router.get("/{ticker}", response_model=ForecastResponse)
 def get_forecast(ticker: str):
     engine = get_engine()
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT * FROM forecasts WHERE ticker = :ticker "
-                     "ORDER BY last_updated DESC LIMIT 1"),
-                {"ticker": ticker.upper()},
-            ).mappings().first()
-    except Exception as exc:                                   # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # No try/except around the query. It used to raise a 500 whose detail was
+    # str(exc), which on a connection failure is the database hostname and its
+    # resolved IP — published to any caller. A DBAPIError now reaches the
+    # application handler in api/main.py and is served as a 503.
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM forecasts WHERE ticker = :ticker "
+                 "ORDER BY last_updated DESC LIMIT 1"),
+            {"ticker": ticker.upper()},
+        ).mappings().first()
 
     if row is None:
         raise HTTPException(

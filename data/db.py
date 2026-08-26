@@ -4,6 +4,7 @@
 import os
 import numpy as np
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import NoSuchTableError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -58,6 +59,75 @@ def to_native(value):
 def to_native_params(params: dict) -> dict:
     """Applies to_native() across a bind-parameter dict."""
     return {k: to_native(v) for k, v in params.items()}
+
+
+# ── Telling "the schema is behind" apart from "the database is gone" ─────────
+#
+# Several read paths fail soft to an empty result on purpose: a fresh
+# production database has no index_membership table until the first sync, and
+# data/db.py adds some leaderboard columns lazily, so a query naming one of
+# them must degrade rather than 500.
+#
+# That intent is narrow and the guard was not. A bare `except Exception` around
+# those queries also catches "cannot connect to the database", and an outage
+# was therefore reported to callers as HTTP 200 with an EMPTY UNIVERSE. That is
+# worse than a 500: the Next.js frontend caches read-through, so a revalidation
+# during an outage silently replaced a good page with an empty board, and
+# nothing anywhere said the database was down.
+#
+# So the soft path is now keyed on the specific SQLSTATE it was written for.
+# Anything else propagates.
+_UNDEFINED_TABLE = "42P01"
+_UNDEFINED_COLUMN = "42703"
+
+
+def _chain(exc: BaseException):
+    """
+    `exc` and everything it wraps: SQLAlchemy's `orig`, and `__cause__`.
+
+    Both links are needed and neither is enough. pandas raises its OWN
+    `DatabaseError` from a driver failure inside `read_sql`, so the SQLSTATE
+    sits two levels down — under `__cause__` and then under `orig`. Reading
+    only the outermost exception's message would miss it, and against Postgres
+    that message says `relation "x" does not exist` rather than anything the
+    SQLite text match below looks for.
+    """
+    seen: set[int] = set()
+    queue = [exc]
+    while queue:
+        link = queue.pop(0)
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        yield link
+        queue.append(getattr(link, "orig", None))
+        queue.append(link.__cause__)
+
+
+def is_missing_relation(exc: BaseException) -> bool:
+    """
+    True when a query failed because the table or column is not there yet.
+
+    False for every other database failure, connection loss above all.
+
+    Postgres reports this through SQLSTATE, which is unambiguous, so a code is
+    trusted the moment one is found. SQLite has no SQLSTATE and raises
+    `OperationalError` for a missing table — the SAME class SQLAlchemy uses for
+    a failed connection against Postgres — so on that path the message is the
+    only discriminator and it is matched narrowly. Tests run on SQLite, so that
+    branch is the one under test and the SQLSTATE branch is pinned with a stub.
+    """
+    for link in _chain(exc):
+        # The inspector does not go through the driver at all. It reports an
+        # absent table as NoSuchTableError, whose str() is the bare table name
+        # and matches no message test.
+        if isinstance(link, NoSuchTableError):
+            return True
+        pgcode = getattr(link, "pgcode", None)
+        if pgcode is not None:
+            return pgcode in (_UNDEFINED_TABLE, _UNDEFINED_COLUMN)
+
+    return "no such table" in str(exc).lower() or "no such column" in str(exc).lower()
 
 
 def get_engine():

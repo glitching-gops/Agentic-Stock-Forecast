@@ -48,7 +48,7 @@ import pandas as pd
 import requests
 from sqlalchemy import bindparam, text
 
-from data.db import get_engine
+from data.db import get_engine, is_missing_relation
 
 # ── Rule parameters ───────────────────────────────────────────────────────────
 # These define the universe. They must never reference model output.
@@ -292,10 +292,15 @@ def get_index_members(as_of: str, index_name: str = INDEX_NAME) -> list[str]:
     """
     Returns index membership as of a date, from recorded intervals only.
 
-    Fails soft to an empty list if the table doesn't exist yet — a fresh
+    Fails soft to an empty list if the table doesn't exist YET — a fresh
     production database has no index_membership table until the first
     sync_current_membership() call, and this is read from public endpoints
     (/api/stocks) that should degrade rather than 500.
+
+    It does NOT fail soft on anything else. This guard used to catch every
+    exception, so a database that was merely unreachable produced an empty
+    universe and an HTTP 200, and /api/stocks reported "0 stocks" during a
+    full outage. See data.db.is_missing_relation.
     """
     engine = get_engine()
     try:
@@ -310,7 +315,9 @@ def get_index_members(as_of: str, index_name: str = INDEX_NAME) -> list[str]:
             engine, params={"idx": index_name, "d": as_of},
         )
     except Exception as exc:                                    # noqa: BLE001
-        print(f"[Universe] index_membership unavailable ({exc}). "
+        if not is_missing_relation(exc):
+            raise
+        print(f"[Universe] index_membership does not exist yet ({exc}). "
               f"Run sync_current_membership() to populate it.")
         return []
     return df["ticker"].tolist() if not df.empty else []
@@ -467,7 +474,9 @@ def describe_universe_bias(index_name: str = INDEX_NAME) -> dict:
             """),
             engine, params={"idx": index_name},
         )
-    except Exception:
+    except Exception as exc:                                    # noqa: BLE001
+        if not is_missing_relation(exc):
+            raise
         return {"known_from": None, "survivorship_bias": True,
                 "note": "No membership history recorded."}
 

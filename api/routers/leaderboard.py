@@ -21,7 +21,7 @@ from fastapi import APIRouter, Query
 from sqlalchemy import inspect, text
 
 from api.schemas.leaderboard import LeaderboardEntry, LeaderboardResponse
-from data.db import get_engine
+from data.db import get_engine, is_missing_relation
 
 router = APIRouter()
 
@@ -57,7 +57,9 @@ def _leaderboard_columns() -> frozenset[str]:
     try:
         return frozenset(c["name"] for c in
                          inspect(get_engine()).get_columns("leaderboard"))
-    except Exception:                                           # noqa: BLE001
+    except Exception as exc:                                    # noqa: BLE001
+        if not is_missing_relation(exc):
+            raise
         return frozenset()
 
 
@@ -151,7 +153,12 @@ def get_leaderboard(
 
     try:
         df = pd.read_sql(sql, con=get_engine(), params=params)
-    except Exception:                                           # noqa: BLE001
+    except Exception as exc:                                    # noqa: BLE001
+        # Only the case this was written for: a column named in ORDER BY or
+        # WHERE that the deployed schema does not carry yet. A connection
+        # failure must not be served as an empty leaderboard with a 200.
+        if not is_missing_relation(exc):
+            raise
         _leaderboard_columns.cache_clear()   # schema may have moved under us
         return _empty(filters)
 

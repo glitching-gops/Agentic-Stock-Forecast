@@ -26,18 +26,14 @@ def get_signals(ticker: str, days: int = Query(200, ge=1, le=2000)):
     precisely what let it survive: an injection sink one unrelated exception
     away from being live. There is no fallback now.
     """
-    try:
-        df = pd.read_sql(
-            text("SELECT * FROM signals WHERE ticker = :ticker "
-                 "ORDER BY date DESC LIMIT :days"),
-            con=get_engine(),
-            params={"ticker": ticker.upper(), "days": days},
-        )
-    except Exception as exc:                                    # noqa: BLE001
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to fetch signals for {ticker}: {exc}",
-        ) from exc
+    # A database failure is served as a 503 by api/main.py, not wrapped in a
+    # 500 whose detail leaks the connection string.
+    df = pd.read_sql(
+        text("SELECT * FROM signals WHERE ticker = :ticker "
+             "ORDER BY date DESC LIMIT :days"),
+        con=get_engine(),
+        params={"ticker": ticker.upper(), "days": days},
+    )
 
     if df.empty:
         raise HTTPException(

@@ -33,6 +33,7 @@ def get_signals(ticker: str, days: int = 30):
     Only queries columns that exist in the signals table.
     """
     from data.db import get_engine
+    from sqlalchemy.exc import DBAPIError
     from fastapi import HTTPException
     from sqlalchemy import text
     import pandas as pd
@@ -64,9 +65,14 @@ def get_signals(ticker: str, days: int = 30):
             params={"ticker": ticker.upper(), "days": days},
         )
     except Exception as e:
+        # Not str(e): a connection failure carries the database hostname and
+        # its resolved IP, and this response is public. api/main.py serves
+        # DBAPIError as a 503.
+        if isinstance(e, DBAPIError):
+            raise
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to fetch signals for {ticker}: {e}",
+            detail=f"Failed to fetch signals for {ticker}.",
         ) from e
 
     df = df.sort_values("date", ascending=True)
