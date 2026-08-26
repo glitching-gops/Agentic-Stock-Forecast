@@ -131,6 +131,11 @@ TOKENIZERS: dict[str, tuple[str, int]] = {
 
 DEFAULT_MODEL = "NeoQuasar/Kronos-base"
 
+# The upstream commit `pipeline/vendor/kronos/` was taken from. Named here so
+# the Kaggle notebook can pin its own clone to the same source and so a drift
+# between the two is a checkable fact rather than an assumption. See VENDOR.md.
+VENDORED_COMMIT = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
+
 # The five columns handed to the model. `amount` is deliberately NOT supplied:
 # the predictor derives it as volume * mean(prices) when absent, and supplying
 # our own would be inventing a turnover figure we do not have.
@@ -226,6 +231,35 @@ def relative_candles(ohlcv: pd.DataFrame,
     return out
 
 
+def usable_mask(blocks: dict[str, pd.DataFrame]) -> np.ndarray:
+    """
+    Which (row, ticker) cells of an aligned slice may be handed to the model.
+
+    JOINT, not per-column. `series._history_ending_at` drops non-finite values
+    per ticker, which is right for one series and wrong for five aligned ones:
+    a hole in `high` that `low` does not share shifts one column against the
+    other and builds a bar from two different sessions, with nothing downstream
+    able to detect it.
+
+    Two checks, and neither subsumes the other. Finiteness catches `+inf`,
+    which passes `> 0`, and it is the only check on `volume` — a halted session
+    legitimately trades zero. Positivity catches a zero or negative price,
+    which is finite and is not a price; vendors emit those.
+
+    Shared with `tools/export_kronos_package.py` so the rows shipped to a
+    notebook are exactly the rows this forecaster would have scored at home.
+    """
+    close = blocks["close"]
+    usable = np.ones((len(close), len(close.columns)), dtype=bool)
+    for col in INPUT_COLS:
+        usable &= np.isfinite(blocks[col].to_numpy(dtype=float))
+
+    positive = np.ones_like(usable)
+    for col in PRICE_COLS:
+        positive &= blocks[col].to_numpy(dtype=float) > 0
+    return usable & positive
+
+
 def candle_frames(relative: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """
     Long relative candles -> one wide ``dates x tickers`` frame per column.
@@ -310,6 +344,11 @@ class KronosForecaster:
     top_p: float = 0.9
     device: str | None = None
 
+    # How many sampled paths may share one batch. Memory scales with this
+    # because the library samples by repeating the input; 2.68 GiB at 1 sample
+    # for 90 series at context 512 puts a 6 GB card near its limit at 2.
+    max_batch_samples: int = 2
+
     # Counted rather than logged away: an abstention lands as 0.0, which is
     # exactly the `zero` floor's prediction, so a comparator that quietly
     # declined most of the panel would be indistinguishable from a genuine null.
@@ -354,15 +393,7 @@ class KronosForecaster:
         # other and builds a candle from two different days. Nothing downstream
         # could detect it. So a row is kept only if every column is finite for
         # that ticker, and the columns stay aligned by construction.
-        usable = np.ones((len(close), len(tickers)), dtype=bool)
-        for col in INPUT_COLS:
-            usable &= np.isfinite(blocks[col].to_numpy(dtype=float))
-
-        # Volume is legitimately zero on a halted session; a price is not.
-        positive = np.ones_like(usable)
-        for col in PRICE_COLS:
-            positive &= blocks[col].to_numpy(dtype=float) > 0
-        usable &= positive
+        usable = usable_mask(blocks)
 
         dfs, x_stamps, y_stamps, kept, anchors = [], [], [], [], []
         future = pd.Series(pd.bdate_range(
@@ -398,27 +429,69 @@ class KronosForecaster:
         torch.manual_seed(self.seed + self.dates_scored)
         self.dates_scored += 1
 
-        out = predictor.predict_batch(
-            dfs, x_stamps, y_stamps, pred_len=horizon,
-            T=self.temperature, top_p=self.top_p,
-            sample_count=self.sample_count, verbose=False)
+        # SAMPLING IN CHUNKS, AVERAGED IN LOG SPACE.
+        #
+        # `sample_count` is not a refinement here, it is what makes the output a
+        # forecast at all. Chronos and TimesFM return a median quantile from one
+        # forward pass; Kronos returns a DRAW from a 30-step autoregressive
+        # sampler, and a single draw is a path, not an estimate. Measured on the
+        # real panel at sample_count=1: predicted cross-sectional SD 0.192 for
+        # base@512 and 0.421 for mini@2048, against a TARGET dispersion of
+        # 0.102 — one name at a predicted +247% excess return.
+        #
+        # But the library expands the BATCH to sample: `x.repeat(1, N, 1, 1)`,
+        # so memory scales with N and 2.68 GiB at N=1 caps a 6 GB card around
+        # N=2. Chunking keeps memory flat and makes cost linear in time
+        # instead, which is a budget rather than a wall.
+        #
+        # The average is taken in LOG space, on the quantity actually scored.
+        # `predict_batch` averages decoded PRICES internally, and the mean of
+        # log-prices is not the log of the mean — averaging in price space
+        # would apply a Jensen bias that grows with the dispersion, which is
+        # exactly the thing being reduced.
+        chunks = self._sample_chunks()
+        totals = np.zeros(len(dfs), dtype=float)
+        for chunk in chunks:
+            batch = predictor.predict_batch(
+                dfs, x_stamps, y_stamps, pred_len=horizon,
+                T=self.temperature, top_p=self.top_p,
+                sample_count=chunk, verbose=False)
+            terminal = np.array([float(f["close"].iloc[-1]) for f in batch])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                totals += np.where(terminal > 0, np.log(terminal), np.nan) * chunk
+        mean_log = totals / float(self.sample_count)
+
+        out = mean_log
 
         predictions: dict[str, float] = {}
-        for ticker, frame, anchor in zip(kept, out, anchors):
+        for ticker, log_terminal, anchor in zip(kept, out, anchors):
             # THE LAST ROW IS t+horizon, AND THE ANCHOR IS t.
             # `pred_len=horizon` rows are returned, so `iloc[-1]` is the
-            # horizon-th session ahead. An off-by-one here forecasts 29 or 31
-            # sessions against a 30-session label and still renders a full,
-            # plausible table.
-            terminal = float(frame["close"].iloc[-1])
-            if not (np.isfinite(terminal) and terminal > 0 and anchor > 0):
+            # horizon-th session ahead — read above, where the chunk is
+            # reduced. An off-by-one there forecasts 29 or 31 sessions against
+            # a 30-session label and still renders a full, plausible table.
+            if not (np.isfinite(log_terminal) and anchor > 0):
                 # Sampling can decode to a non-positive price once the per-series
                 # standardisation is undone. log() of that is not a return.
                 self.skipped_bad_forecast += 1
                 continue
-            predictions[ticker] = float(np.log(terminal) - np.log(anchor))
+            predictions[ticker] = float(log_terminal - np.log(anchor))
 
         return predictions
+
+    def _sample_chunks(self) -> list[int]:
+        """
+        `sample_count` split into batches of at most `max_batch_samples`.
+
+        Sizes are returned rather than a count so the weighted average above
+        stays correct when the last chunk is short — a plain mean over chunks
+        would silently overweight it.
+        """
+        if self.sample_count < 1:
+            raise ValueError("sample_count must be at least 1")
+        cap = max(1, self.max_batch_samples)
+        whole, remainder = divmod(self.sample_count, cap)
+        return [cap] * whole + ([remainder] if remainder else [])
 
 
 @dataclass

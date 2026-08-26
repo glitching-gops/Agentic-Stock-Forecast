@@ -13,6 +13,9 @@ every guarantee collapses onto the history slice ending at the as-of date. The
 corruption test below is therefore the most important one in this file.
 """
 
+import json
+import pathlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -437,11 +440,90 @@ def test_the_seed_is_per_date_so_a_subset_reproduces_the_whole(stub):
         f"got {stub.seeds}")
 
 
-def test_sample_count_reaches_the_predictor(stub):
+def test_sampling_is_chunked_so_memory_does_not_scale_with_sample_count(stub):
+    """
+    The library samples by REPEATING the input batch, so memory scales with
+    `sample_count` — 2.68 GiB at one sample for 90 series at context 512 caps a
+    6 GB card around two. Chunking turns a wall into a time budget.
+    """
     frames = _frames()
-    _adapter(frames, sample_count=4).predict(
+    adapter = _adapter(frames, sample_count=7, max_batch_samples=2)
+    adapter.predict(_X(frames, frames["close"].index[CONTEXT - 1]))
+
+    sizes = [c["sample_count"] for c in stub.calls]
+    assert sizes == [2, 2, 2, 1], f"chunks were {sizes}"
+    assert sum(sizes) == 7, "every requested sample must actually be drawn"
+    assert max(sizes) <= 2, "a chunk above the cap defeats the point"
+
+
+def test_a_short_final_chunk_is_not_overweighted(stub):
+    """
+    `sample_count=3` at a cap of 2 gives chunks of 2 and 1. A plain mean over
+    CHUNKS weights the single draw as heavily as the pair — a 3:1 error in the
+    wrong direction that produces a perfectly ordinary-looking number.
+    """
+    assert kf.KronosForecaster(sample_count=3, max_batch_samples=2)._sample_chunks()         == [2, 1]
+    assert kf.KronosForecaster(sample_count=4, max_batch_samples=2)._sample_chunks()         == [2, 2]
+    assert kf.KronosForecaster(sample_count=1, max_batch_samples=8)._sample_chunks()         == [1]
+
+
+def test_paths_are_averaged_in_LOG_space_not_price_space(monkeypatch):
+    """
+    The mean of log-prices is not the log of the mean.
+
+    `predict_batch` averages decoded PRICES internally, so doing the same across
+    chunks would apply a Jensen bias that GROWS with dispersion — precisely the
+    quantity sampling is meant to reduce. Measured dispersion here is large
+    (predicted SD 0.19 at one sample against a target SD of 0.10), so the bias
+    is not academic.
+
+    This stub returns a different terminal price on each chunk, so the two
+    conventions give different answers and the assertion can tell them apart.
+    """
+    class _Varying:
+        def __init__(self):
+            self.n = 0
+
+        def predict_batch(self, df_list, x_ts, y_ts, pred_len, T=1.0, top_p=0.9,
+                          sample_count=1, verbose=True):
+            self.n += 1
+            step = 0.4 * self.n                     # 0.4 then 0.8
+            out = []
+            for df, y in zip(df_list, y_ts):
+                terminal = float(df["close"].iloc[-1]) * np.exp(step)
+                close = np.full(pred_len, terminal * 100.0)
+                close[-1] = terminal
+                out.append(pd.DataFrame(
+                    {"open": close, "high": close, "low": close, "close": close,
+                     "volume": close, "amount": close},
+                    index=pd.Index(list(y)[:pred_len])))
+            return out
+
+    varying = _Varying()
+    monkeypatch.setattr(kf, "load_predictor", lambda *a, **k: varying)
+    monkeypatch.setitem(__import__("sys").modules, "torch",
+                        type("torch", (), {"manual_seed": staticmethod(lambda s: None)}))
+
+    frames = _frames()
+    out = _adapter(frames, sample_count=2, max_batch_samples=1).predict(
         _X(frames, frames["close"].index[CONTEXT - 1]))
-    assert stub.calls[-1]["sample_count"] == 4
+
+    log_space = (0.4 + 0.8) / 2                                   # 0.6
+    price_space = float(np.log((np.exp(0.4) + np.exp(0.8)) / 2))   # 0.6199...
+
+    assert out[0] == pytest.approx(log_space, abs=1e-12)
+    assert abs(price_space - log_space) > 0.01, "the two must be separable"
+
+    # UNEVEN chunks, end to end. Equal chunks cannot tell a weighted average
+    # from an unweighted one, so the test above passes either way.
+    varying.n = 0
+    out = _adapter(frames, sample_count=3, max_batch_samples=2).predict(
+        _X(frames, frames["close"].index[CONTEXT - 1]))
+
+    weighted = (0.4 * 2 + 0.8 * 1) / 3          # 0.5333...
+    unweighted = (0.4 + 0.8) / 2                # 0.6, the chunk-mean error
+    assert out[0] == pytest.approx(weighted, abs=1e-12), (
+        f"got {out[0]:.6f}; a plain mean over chunks would give {unweighted}")
 
 
 # ── The dependency boundary ──────────────────────────────────────────────────
@@ -565,3 +647,126 @@ def test_the_grid_is_built_from_LABELLED_rows_only():
     assert not (set(grid) & unlabelled), (
         "dates with no label reached the scoring grid; the rebalance dates "
         "would then differ between comparators")
+
+
+# ── The Kaggle split: the round trip must not change the number ──────────────
+
+def test_the_kaggle_round_trip_reproduces_the_local_prediction(stub, tmp_path):
+    """
+    The one thing the export/score split has to guarantee.
+
+    Moving the compute to a notebook is not a compute problem, it is a
+    COMPARABILITY problem: a second path that differences against a different
+    anchor, reads a different row, or averages in price space produces a
+    complete and plausible number that cannot go in the same table. So the
+    notebook returns raw terminal prices and `score_kronos` does the arithmetic
+    — and this asserts the two paths agree to the last bit on identical inputs.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "score_kronos", pathlib.Path("tools/score_kronos.py"))
+    score_kronos = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(score_kronos)
+
+    frames = _frames()
+    as_of = frames["close"].index[CONTEXT - 1]
+    tickers = list(frames["close"].columns)
+
+    # (a) THE LOCAL PATH.
+    local = _adapter(frames, sample_count=2, max_batch_samples=1).predict(
+        _X(frames, as_of))
+
+    # (b) THE NOTEBOOK PATH, replayed. The stub's terminal close for input
+    # position i is anchor * exp((i+1)/100) — the same value the notebook would
+    # have written into `terminal`, identical across both samples because the
+    # stub is deterministic.
+    end = CONTEXT - 1
+    anchors = np.array([float(frames["close"][t].iloc[end]) for t in tickers])
+    terminal = np.stack([anchors * np.exp((np.arange(len(tickers)) + 1) / 100.0)] * 2,
+                        axis=1)
+
+    # float64, matching the exporter — see its comment on the anchor.
+    candles = np.stack([frames[c].to_numpy(dtype=np.float64)
+                        for c in kf.INPUT_COLS], axis=-1)
+    package = {
+        "candles": candles,
+        "tickers": np.array(tickers, dtype=object),
+        "row_date": np.array([str(as_of)] * len(tickers), dtype=object),
+        "row_ticker": np.arange(len(tickers), dtype=np.int16),
+        "row_end": np.full(len(tickers), end, dtype=np.int32),
+        "row_fold": np.zeros(len(tickers), dtype=np.int8),
+        "row_target": np.zeros(len(tickers), dtype=np.float32),
+        "meta": np.array([json.dumps({"input_cols": kf.INPUT_COLS})],
+                         dtype=object),
+    }
+    np.savez(tmp_path / "pred.npz", terminal=terminal,
+             row_index=np.arange(len(tickers), dtype=np.int32),
+             run=np.array([json.dumps({"model": "NeoQuasar/Kronos-base",
+                                       "context": CONTEXT, "samples": 2,
+                                       "seed": 0, "seconds": 1.0})],
+                          dtype=object))
+
+    frame, _ = score_kronos.load_run(str(tmp_path / "pred.npz"), package)
+
+    assert list(frame["ticker"]) == tickers, "the row mapping is positional"
+    np.testing.assert_allclose(frame["y_pred"].to_numpy(), local, rtol=0, atol=1e-12)
+
+
+def test_the_scorer_averages_paths_in_LOG_space(tmp_path):
+    """
+    The round-trip test above cannot catch this: its stub is deterministic, so
+    every sampled path is identical and the log-space mean equals the
+    price-space one. Real samples differ — that is the entire point of drawing
+    more than one — and `predict_batch` averages decoded PRICES inside a chunk,
+    so repeating that across chunks applies a Jensen bias that GROWS with
+    dispersion. Measured dispersion here is large, so it is not academic.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "score_kronos", pathlib.Path("tools/score_kronos.py"))
+    score_kronos = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(score_kronos)
+
+    anchor = 0.5
+    paths = np.array([[anchor * np.exp(0.4), anchor * np.exp(0.8)]])
+
+    candles = np.zeros((1, 1, len(kf.INPUT_COLS)), dtype=np.float64)
+    candles[0, 0, kf.INPUT_COLS.index("close")] = anchor
+    package = {
+        "candles": candles,
+        "tickers": np.array(["A.NS"], dtype=object),
+        "row_date": np.array(["2024-01-02"], dtype=object),
+        "row_ticker": np.zeros(1, dtype=np.int16),
+        "row_end": np.zeros(1, dtype=np.int32),
+        "row_fold": np.zeros(1, dtype=np.int8),
+        "row_target": np.zeros(1, dtype=np.float32),
+        "meta": np.array([json.dumps({"input_cols": kf.INPUT_COLS})],
+                         dtype=object),
+    }
+    np.savez(tmp_path / "p.npz", terminal=paths,
+             row_index=np.zeros(1, dtype=np.int32),
+             run=np.array([json.dumps({"model": "m", "context": 512,
+                                       "samples": 2, "seed": 0,
+                                       "seconds": 1.0})], dtype=object))
+
+    frame, _ = score_kronos.load_run(str(tmp_path / "p.npz"), package)
+
+    log_space = (0.4 + 0.8) / 2                                    # 0.6
+    price_space = float(np.log((np.exp(0.4) + np.exp(0.8)) / 2))    # 0.6199...
+    assert abs(price_space - log_space) > 0.01, "the two must be separable"
+    assert frame["y_pred"].iloc[0] == pytest.approx(log_space, abs=1e-12)
+
+
+def test_the_scorer_reads_the_close_column_by_NAME_from_the_package():
+    """
+    `candles` is a dense (dates, tickers, 5) array, so the close is at an
+    INDEX. The package carries `input_cols` and the scorer looks the position
+    up there rather than hardcoding 3 — a column reorder in INPUT_COLS would
+    otherwise silently anchor every prediction on `low`.
+    """
+    source = pathlib.Path("tools/score_kronos.py").read_text(encoding="utf-8")
+    assert 'input_cols.index("close")' in source
+    assert kf.INPUT_COLS.index("close") == 3, (
+        "if this moved, the guard above is what keeps the scorer correct")
