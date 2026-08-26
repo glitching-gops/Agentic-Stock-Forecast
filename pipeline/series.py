@@ -126,22 +126,41 @@ class SeriesForecaster(Protocol):
         ...
 
 
+def _block_ending_at(series: pd.DataFrame, positions: dict[str, int],
+                     as_of: str, context: int) -> pd.DataFrame | None:
+    """
+    The trailing `context` rows up to AND INCLUDING `as_of`. Nothing else.
+
+    THE SINGLE LINE THE ZERO-SHOT GUARANTEE RESTS ON — see the module docstring.
+    `positions` maps a date to its row position in `series`, which is sorted
+    once by the caller; slicing positionally on a pre-sorted index avoids
+    relying on label-based `.loc[:as_of]`, whose inclusivity depends on the
+    index being monotonic and which silently returns everything if it is not.
+
+    Factored out so the multivariate path (`pipeline.kronos_forecaster`, which
+    needs four price series and a volume per ticker rather than one) reuses this
+    boundary instead of writing a second one. A model handed five slices made by
+    two different functions would only have to disagree by a row to acquire an
+    answer it should not have, and the table would still render.
+    """
+    end = positions.get(as_of)
+    if end is None:
+        return None
+    return series.iloc[max(0, end + 1 - context): end + 1]
+
+
 def _history_ending_at(series: pd.DataFrame, positions: dict[str, int],
                        as_of: str, context: int) -> dict[str, np.ndarray]:
     """
     Each ticker's observations up to AND INCLUDING `as_of`, most recent last.
 
-    The single line the zero-shot guarantee rests on — see the module docstring.
-    `positions` maps a date to its row position in `series`, which is sorted
-    once by the caller; slicing positionally on a pre-sorted index avoids
-    relying on label-based `.loc[:as_of]`, whose inclusivity depends on the
-    index being monotonic and which silently returns everything if it is not.
+    Non-finite values are dropped PER TICKER, which is right for a univariate
+    series and wrong for aligned ones — see `kronos_forecaster` for why the
+    multivariate path masks jointly instead.
     """
-    end = positions.get(as_of)
-    if end is None:
+    block = _block_ending_at(series, positions, as_of, context)
+    if block is None:
         return {}
-
-    block = series.iloc[max(0, end + 1 - context): end + 1]
 
     histories: dict[str, np.ndarray] = {}
     for ticker in block.columns:

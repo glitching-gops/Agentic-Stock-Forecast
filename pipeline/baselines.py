@@ -37,12 +37,14 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 
-from pipeline.evaluation import PurgedPanelWalkForward, panel_walk_forward
+from pipeline.evaluation import (PurgedPanelWalkForward, oos_dates,
+                                 panel_walk_forward)
 from pipeline.panel import (
     MIN_NAMES_PER_DATE,
     SCALE_FREE,
@@ -428,6 +430,11 @@ def compare_baselines(
     chronos_context: int = SERIES_CONTEXT,
     with_timesfm: bool = False,
     timesfm_context: int = SERIES_CONTEXT,
+    with_kronos: bool = False,
+    kronos_models: Sequence[tuple[str, int]] = (),
+    kronos_seed: int = 0,
+    kronos_sample_count: int = 1,
+    rebalance_only: bool = False,
     horizon: int = HORIZON_SESSIONS,
     with_fundamentals: bool = False,
     on_result=None,
@@ -447,15 +454,31 @@ def compare_baselines(
     record — which is what makes it safe to run inside a job whose expensive
     work has already been persisted.
     """
-    if (with_chronos or with_timesfm) and not with_series:
+    if with_kronos and not rebalance_only:
+        # NOT a default that can be forgotten. Kronos decodes autoregressively
+        # with no KV cache — 30 sequential passes over the full context per
+        # date — and it MEASURED 643 s for one 46-ticker cross-section at
+        # context 512 on CPU against a ridge's ~1 s for its entire run. The
+        # full ~2,400-date grid is 429 hours. Refused rather than allowed with
+        # a warning, because the warning would be read after the run started.
+        raise ValueError(
+            "with_kronos requires rebalance_only=True. Scoring every date "
+            "costs ~429 CPU-hours and buys only `daily_IC`, which cannot "
+            "support inference — ~1,900 overlapping dates hold ~60 independent "
+            "windows. The rebalance grid preserves reb_IC and its t-statistic, "
+            "which is the pre-registered criterion, exactly."
+        )
+
+    if (with_chronos or with_timesfm or with_kronos) and not with_series:
         # Chronos reads the relative-price series and nothing else, so this
         # combination cannot mean anything. Raised rather than silently
         # dropped: a run that was asked for a foundation model and quietly
         # returned six linear comparators reads as "it did not help".
         raise ValueError(
-            "a foundation-model comparator requires with_series=True: both "
-            "Chronos-2 and TimesFM-2.5 forecast the relative-price series, "
-            "which with_series=False switches off"
+            "a foundation-model comparator requires with_series=True: "
+            "Chronos-2, TimesFM-2.5 and Kronos all rest on the relative-price "
+            "series — Kronos on a candle built from it — and with_series=False "
+            "switches off the coverage check that says the series exists"
         )
 
     panel = load_panel(tickers=tickers, engine=engine, start=start)
@@ -600,6 +623,40 @@ def compare_baselines(
                     ["date", "ticker"],
                 ))
 
+        # Kronos is the FINANCE-PRETRAINED comparator: 12B K-line records from
+        # 45 exchanges, against Chronos' and TimesFM's general time-series
+        # corpora. Two general architectures already agree this target is not
+        # forecastable zero-shot, so a model trained on candlesticks is the one
+        # remaining argument that the CORPUS rather than the TARGET was the
+        # limitation. It rides its own adapter because it is multivariate — see
+        # pipeline/kronos_forecaster.py for the synthetic relative candle that
+        # keeps the excess-return identity intact.
+        if with_kronos:
+            from pipeline.kronos_forecaster import (
+                adapter_factory as kronos_factory, load_relative_candles)
+
+            frames = load_relative_candles(panel, engine=engine)
+            for model_id, ctx in kronos_models:
+                factory = kronos_factory(
+                    frames, horizon=horizon, context=ctx, model_id=model_id,
+                    seed=kronos_seed, sample_count=kronos_sample_count)
+                runs.append((factory().name, factory, ["date", "ticker"]))
+
+    # ── The scoring grid, chosen ONCE and applied to every comparator ───────
+    #
+    # Derived from the splitter and the labels alone, so it is identical for
+    # each row of the table by construction — an expensive model scored on a
+    # subset and a ridge scored on everything would not be comparable, and the
+    # difference would look like a result.
+    score_dates = None
+    rebalance_every = horizon
+    if rebalance_only:
+        grid = oos_dates(panel, splitter, TARGET)[::horizon]
+        score_dates = set(grid.tolist())
+        rebalance_every = 1
+        logger.info("[Baselines] rebalance-only: %d of %d out-of-sample dates",
+                    len(score_dates), len(oos_dates(panel, splitter, TARGET)))
+
     results = []
     for i, (name, factory, feature_cols) in enumerate(runs, 1):
         started = time.time()
@@ -610,7 +667,7 @@ def compare_baselines(
         res = panel_walk_forward(
             panel=panel, feature_cols=feature_cols, model_factory=factory,
             splitter=splitter, name=name, target=TARGET,
-            rebalance_every=horizon,
+            rebalance_every=rebalance_every, score_dates=score_dates,
         )
         m, xs = res.metrics, res.cross_sectional
         results.append({

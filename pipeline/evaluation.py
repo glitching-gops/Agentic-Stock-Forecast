@@ -467,6 +467,34 @@ class PanelResult:
         return json.dumps(payload, indent=2, default=str)
 
 
+def oos_dates(panel: pd.DataFrame, splitter: "PurgedPanelWalkForward",
+              target: str = "target_excess_return") -> np.ndarray:
+    """
+    Every out-of-sample date the folds would score, pooled and sorted.
+
+    Derived from the splitter and the labels alone — no model runs — so it is
+    identical for every comparator by construction. That is what lets an
+    expensive model be scored on a SUBSET of dates and still sit in the same
+    table as the cheap ones: the subset is chosen once, from the same grid,
+    before anything is fitted.
+    """
+    panel = panel.sort_values(["date", "ticker"])
+    y = pd.to_numeric(panel[target], errors="coerce").to_numpy()
+    dates = panel["date"].to_numpy()
+
+    seen: list[np.ndarray] = []
+    for train_idx, test_idx in splitter.split(dates):
+        train_labelled = train_idx[np.isfinite(y[train_idx])]
+        test_labelled = test_idx[np.isfinite(y[test_idx])]
+        if len(train_labelled) < 100 or len(test_labelled) == 0:
+            continue
+        seen.append(dates[test_labelled])
+
+    if not seen:
+        return np.array([], dtype=dates.dtype)
+    return np.array(sorted(pd.unique(np.concatenate(seen))))
+
+
 def panel_walk_forward(
     panel: pd.DataFrame,
     feature_cols: Sequence[str],
@@ -475,6 +503,7 @@ def panel_walk_forward(
     name: str = "",
     target: str = "target_excess_return",
     rebalance_every: int = 30,
+    score_dates: set | None = None,
 ) -> PanelResult:
     """
     Runs a pooled model across the whole cross-section under purged folds.
@@ -490,6 +519,28 @@ def panel_walk_forward(
     training would ask the model to fit one.
     """
     splitter = splitter or PurgedPanelWalkForward()
+
+    # SCORING FEWER DATES IS NOT SCORING DIFFERENTLY.
+    #
+    # `score_dates` narrows what is PREDICTED and therefore what is measured;
+    # it never touches the training set, so the folds, the purge and the
+    # embargo are exactly as they were. It exists because an autoregressive
+    # model costs orders of magnitude more per date than a ridge — Kronos
+    # measured 109 s for one cross-section against a ridge's whole run in
+    # about a second — and ~1,900 dates hold only ~60 independent windows
+    # anyway. Dropping to the non-overlapping grid loses `daily_IC`, which
+    # cannot support inference, and keeps `reb_IC` and its t-statistic, which
+    # is the pre-registered criterion, unchanged.
+    #
+    # Sub-sampling an already-sub-sampled grid would silently take every 30th
+    # rebalance, so that combination is refused rather than quietly obeyed.
+    if score_dates is not None and rebalance_every != 1:
+        raise ValueError(
+            "score_dates already selects the rebalance grid; pass "
+            "rebalance_every=1 with it, or the report will take every "
+            f"{rebalance_every}th of those dates as well"
+        )
+
     required = {"date", "ticker", target}
     missing = required - set(panel.columns)
     if missing:
@@ -508,6 +559,17 @@ def panel_walk_forward(
         test_labelled = test_idx[np.isfinite(y_all.to_numpy()[test_idx])]
         if len(train_labelled) < 100 or len(test_labelled) == 0:
             continue
+
+        if score_dates is not None:
+            # Applied AFTER the split and only to the test side. Filtering
+            # before the split would move the fold boundaries and this would
+            # stop being the same experiment.
+            keep = np.fromiter(
+                (d in score_dates for d in dates[test_labelled]),
+                dtype=bool, count=len(test_labelled))
+            test_labelled = test_labelled[keep]
+            if len(test_labelled) == 0:
+                continue
 
         X_train = panel.iloc[train_labelled][features]
         y_train = y_all.iloc[train_labelled]

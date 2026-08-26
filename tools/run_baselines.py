@@ -76,6 +76,27 @@ def render(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+
+# Both checkpoints by default, and deliberately: `Kronos-base` is 102M but caps
+# at context 512, which is exactly where every model in this project is null
+# (`chronos2` went +1.86 at 2048 to +0.88 at 512 on the same rows), while
+# `Kronos-mini` reaches 2048 at 4.1M parameters. Either alone confounds
+# architecture with context; the pair separates them.
+DEFAULT_KRONOS_MODELS = (("NeoQuasar/Kronos-base", 512),
+                         ("NeoQuasar/Kronos-mini", 2048))
+
+
+def _kronos_models(args) -> tuple[tuple[str, int], ...]:
+    if not args.kronos_model:
+        return DEFAULT_KRONOS_MODELS
+    out = []
+    for spec in args.kronos_model:
+        model_id, _, ctx = spec.rpartition(":")
+        if not model_id or not ctx.isdigit():
+            raise SystemExit(f"--kronos-model wants ID:CONTEXT, got {spec!r}")
+        out.append((model_id, int(ctx)))
+    return tuple(out)
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -104,6 +125,27 @@ def main() -> int:
     ap.add_argument("--timesfm-context", type=int, default=SERIES_CONTEXT,
                     help=f"trailing observations handed to TimesFM-2.5 "
                          f"(default {SERIES_CONTEXT})")
+    ap.add_argument("--kronos", action="store_true",
+                    help="score Kronos, the finance-pretrained comparator. "
+                         "Implies --rebalance-only: it decodes autoregressively "
+                         "and measured 643s for ONE 46-ticker cross-section at "
+                         "context 512 on CPU.")
+    ap.add_argument("--kronos-model", action="append", default=None,
+                    metavar="ID:CONTEXT",
+                    help="repeatable, e.g. NeoQuasar/Kronos-base:512 and "
+                         "NeoQuasar/Kronos-mini:2048. Default is both — the "
+                         "only pairing that separates finance-pretraining from "
+                         "context, since 512 is where every model here is null.")
+    ap.add_argument("--kronos-seed", type=int, default=0,
+                    help="Kronos SAMPLES; a single reb_t is one draw. Sweep this.")
+    ap.add_argument("--kronos-samples", type=int, default=1,
+                    help="paths averaged per forecast. Averaging shrinks toward "
+                         "the mean, and MAE rewards shrinkage on this target "
+                         "with no extra information - read reb_IC, not MAE.")
+    ap.add_argument("--rebalance-only", action="store_true",
+                    help="score only the non-overlapping rebalance dates. Loses "
+                         "daily_IC, which cannot support inference; keeps reb_IC "
+                         "and its t-statistic, which is the pre-registered bar.")
     ap.add_argument("--fundamentals", action="store_true",
                     help="also score the +val comparators, which add "
                          "earnings_yield and book_to_market. RESTRICTS the "
@@ -172,6 +214,11 @@ def main() -> int:
         with_timesfm=args.timesfm,
         timesfm_context=args.timesfm_context,
         with_fundamentals=args.fundamentals,
+        with_kronos=args.kronos,
+        kronos_models=_kronos_models(args),
+        kronos_seed=args.kronos_seed,
+        kronos_sample_count=args.kronos_samples,
+        rebalance_only=args.rebalance_only or args.kronos,
         max_tickers=args.tickers,
         allow_thin=args.allow_thin,
         on_result=_persist,
