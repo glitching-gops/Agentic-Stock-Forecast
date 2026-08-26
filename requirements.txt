@@ -27,10 +27,6 @@ uvicorn>=0.30.1
 pydantic>=2.7.1
 psycopg2-binary==2.9.9
 
-# Frontend
-streamlit>=1.35.0
-plotly>=5.22.0
-
 # Ops
 apscheduler
 python-dotenv>=1.0.1
@@ -51,3 +47,9 @@ pytest>=8.0.0
 # pipeline/archived/ and is not imported anywhere on the live path. Dropping it
 # also removes the largest contributor to memory pressure on the free tier.
 # Reinstall it if experiment E3 brings the ensemble back.
+
+# streamlit and plotly went with the app/ directory. The Streamlit dashboard was
+# retired once the Next.js frontend took over; it was the ONLY consumer of
+# either package, and both were being installed on Render — which serves the
+# API and has never rendered a chart. plotly alone is ~15MB on an instance that
+# has already been OOM-killed once.

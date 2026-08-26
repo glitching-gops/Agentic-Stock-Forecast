@@ -1,6 +1,8 @@
 from fastapi import APIRouter, HTTPException
-from data.db import get_engine
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
+
+from data.db import get_engine
 
 router = APIRouter()
 
@@ -25,4 +27,14 @@ def get_headlines(ticker: str):
             
         return [dict(row) for row in rows]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+        # Not str(e): a connection failure carries the database hostname and its
+        # resolved IP, and this response is public. Re-raising DBAPIError is what
+        # lets api/main.py serve an outage as 503 + no-store — catching it here
+        # turned a dead database into a 500 that named the host, which is the
+        # defect the other three routers were fixed for. This one was missed.
+        if isinstance(e, DBAPIError):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch headlines for {ticker}.",
+        ) from e

@@ -315,6 +315,62 @@ def test_a_driver_failure_wrapped_by_pandas_is_also_an_outage():
     assert "supabase.co" not in response.text
 
 
+def test_the_sentiment_router_was_missed_by_the_first_fix(tmp_path):
+    """
+    Four read paths were fixed; there were five.
+
+    `/api/sentiment/{ticker}/headlines` kept a bare `except Exception` that
+    raised `HTTPException(500, detail=f"Database error: {e}")`. Two defects in
+    one line. It caught DBAPIError, so an outage never reached the 503 handler
+    and was served as a 500 telling the caller their request was broken; and it
+    interpolated the exception, so the response published the database hostname
+    and its resolved IP on a public unauthenticated endpoint.
+
+    Found by the test suite rather than by review: retiring the Streamlit app
+    broke a test that grepped its source, and reading this router to replace
+    that test is what surfaced the leak.
+    """
+    import api.routers.sentiment as sent
+
+    original = sent.get_engine
+    sent.get_engine = lambda: _broken_engine(tmp_path)
+    try:
+        response = _client().get("/api/sentiment/RELIANCE.NS/headlines")
+    finally:
+        sent.get_engine = original
+
+    assert response.status_code == 503, (
+        f"an unreachable database must not be reported as a 500; got "
+        f"{response.status_code} with body {response.text[:200]}")
+    assert response.headers.get("cache-control") == "no-store"
+
+
+def test_the_sentiment_router_does_not_publish_the_connection_string():
+    """The other half of that line: `detail=f"...{e}"` on a public endpoint."""
+    import api.routers.sentiment as sent
+
+    exc = _unreachable_database()
+    assert "supabase.co" in str(exc), "the fixture must carry a host to leak"
+
+    # The failure has to happen INSIDE the try block. `get_engine()` is called
+    # above it, so throwing from there propagates uncaught and never exercises
+    # the handler under test — the first draft of this test did exactly that
+    # and passed against the unfixed router.
+    class _DeadEngine:
+        def connect(self):
+            raise exc
+
+    original = sent.get_engine
+    sent.get_engine = _DeadEngine
+    try:
+        body = _client().get("/api/sentiment/RELIANCE.NS/headlines").text
+    finally:
+        sent.get_engine = original
+
+    assert "supabase.co" not in body and "10.24.0.7" not in body, (
+        f"the connection string reached the public response: {body[:300]}")
+
+
 def test_a_pandas_error_that_is_not_a_driver_failure_stays_a_500():
     """
     The counterweight. A DatabaseError with no driver failure underneath it is

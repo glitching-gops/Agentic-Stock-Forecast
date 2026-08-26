@@ -44,12 +44,15 @@ app = FastAPI(
 # Restrict origins. The wildcard was paired with an admin route whose
 # /run-all variant kicks off a full pipeline run for the entire universe
 # (audit finding F15). Set ALLOWED_ORIGINS as a comma-separated list.
-_origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://glitching-gops-zer0.streamlit.app,"
-    "https://agentic-stock-forecast.streamlit.app,"
-    "http://localhost:8501",
-)
+#
+# The two Streamlit origins were dropped with the app/ directory. Note what the
+# Next.js frontend does NOT need: every page there renders on the server and
+# revalidates on a timer, so the fetches reach this API from Vercel's runtime
+# rather than from a browser, and CORS never applies to them. The default below
+# is local development only. If a client component is ever given a direct fetch,
+# its deployed origin has to be added to ALLOWED_ORIGINS on Render or it will
+# fail in the browser and work everywhere else — including in `next build`.
+_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,

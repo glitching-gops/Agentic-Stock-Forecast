@@ -800,13 +800,48 @@ def test_aggregate_sentiment_is_none_when_nothing_is_scored():
     assert mixed == pytest.approx(0.9)
 
 
-def test_sentiment_view_does_not_plot_a_gauge_without_a_reading():
-    """A needle parked mid-dial reads as a measured neutral, not as missing."""
-    source = (REPO / "app" / "components" / "sentiment_view.py").read_text(
-        encoding="utf-8")
+def test_an_unscored_headline_serialises_as_null_and_never_as_zero():
+    """
+    A needle parked mid-dial reads as a measured neutral, not as missing.
 
-    assert "if sentiment_score is None:" in source
-    assert "NOT SCORED" in source
+    This used to be pinned by grepping the Streamlit component for the string
+    "NOT SCORED". That test went with app/ when the dashboard was retired, and
+    it was the wrong altitude anyway — it asserted the spelling of one widget in
+    one frontend, so it could not have survived a redesign and said nothing
+    about the two other callers of this endpoint.
+
+    The invariant that outlives any frontend is here: no scorer runs in this
+    pipeline, so every headline is stored unscored, and the API must say so with
+    null. A 0.0 is what puts the needle in the middle — it is a POSITION on the
+    dial, indistinguishable downstream from a real neutral reading, and it is
+    what the dead FinBERT loader produced for months while the dashboard showed
+    a confident neutral gauge.
+    """
+    from sqlalchemy import create_engine, text
+
+    import api.routers.sentiment as sent
+
+    engine = create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(text("CREATE TABLE sentiment (date TEXT, ticker TEXT, "
+                          "headline TEXT, sentiment_label TEXT, "
+                          "sentiment_score REAL)"))
+        conn.execute(text("INSERT INTO sentiment VALUES ('2026-08-25', "
+                          "'RELIANCE.NS', 'Refinery margins widen', "
+                          "'unscored', NULL)"))
+        conn.commit()
+
+    original = sent.get_engine
+    sent.get_engine = lambda: engine
+    try:
+        rows = sent.get_headlines("RELIANCE.NS")
+    finally:
+        sent.get_engine = original
+
+    assert len(rows) == 1
+    assert rows[0]["sentiment_score"] is None, (
+        "an unscored headline must serialise as null; a 0.0 is a reading")
+    assert rows[0]["sentiment_label"] == "unscored"
 
 
 # ── The evidence gate must need more than one weak correlation ────────────────

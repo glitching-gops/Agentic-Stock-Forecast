@@ -6,7 +6,6 @@ data is fetched, because every downstream step now takes an explicit ticker
 list rather than reaching for a hard-coded one.
 """
 
-import os
 import subprocess
 import sys
 
@@ -85,10 +84,12 @@ if __name__ == "__main__":
     from scheduler import start_scheduler
     start_scheduler()
 
-    print("[5/5] Launching dashboard...\n")
-    dashboard_path = os.path.join(os.path.dirname(__file__), "app", "main.py")
+    print("[5/5] Launching the API on http://127.0.0.1:8000 ...")
+    print("      The frontend is a separate process now that the Streamlit")
+    print("      dashboard has been retired: `cd web && npm run dev`.")
 
     try:
-        subprocess.run([sys.executable, "-m", "streamlit", "run", dashboard_path])
+        subprocess.run([sys.executable, "-m", "uvicorn", "api.main:app",
+                        "--host", "127.0.0.1", "--port", "8000"])
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("Shutting down...")

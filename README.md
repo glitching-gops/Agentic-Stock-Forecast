@@ -6,7 +6,6 @@
 > reported here rather than hidden, and the measurement apparatus that produces
 > it is the point of the project. See [Measured Performance](#measured-performance).
 
-[![Live App](https://img.shields.io/badge/Live%20App-Streamlit-FF4B4B?style=flat&logo=streamlit)](https://glitching-gops-zer0.streamlit.app)
 [![API](https://img.shields.io/badge/API-Render-46E3B7?style=flat&logo=render)](https://agentic-stock-forecast.onrender.com/api/health)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python)](https://python.org)
@@ -154,7 +153,7 @@ NSE constituent list ──► point-in-time universe (index + liquidity + listi
               refreshes cached production hyperparameters
                                     │
                                     ▼
-              Supabase PostgreSQL ──► FastAPI (Render) ──► Streamlit dashboard
+              Supabase PostgreSQL ──► FastAPI (Render) ──► Next.js (Vercel, ISR)
 ```
 
 Render only ever serves reads and on-demand admin-triggered single-ticker
@@ -224,7 +223,7 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 | Signals | `ta`, pandas, numpy |
 | Universe | NSE archives constituent lists, liquidity screen |
 | Backend | FastAPI + Uvicorn |
-| Frontend | Streamlit + Plotly |
+| Frontend | Next.js (App Router, ISR) + Recharts, on Vercel |
 | Database | Supabase PostgreSQL |
 | Compute | GitHub Actions — daily forecast (weekdays 18:30 IST) + weekly evaluation (Saturday 08:30 IST), both writing directly to Supabase |
 | Tests | pytest |
@@ -252,7 +251,6 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 │   └── weekly-evaluation.yml   expensive purged walk-forward evaluation
 ├── agents/            LangGraph nodes and shared state
 ├── api/               FastAPI routers and schemas — reads + on-demand admin only
-├── app/               Streamlit dashboard
 ├── data/
 │   ├── universe.py    point-in-time universe rule and membership history
 │   ├── tickers.py     ticker metadata and benchmark mapping
@@ -265,6 +263,7 @@ Stated plainly, because a forecasting system that hides these is not worth trust
 │   ├── conformal.py   prediction intervals and calibrated probabilities
 │   ├── tuning.py      nested, seeded hyperparameter search
 │   └── archived/      LSTM and meta-learner, with the reasons they were removed
+├── web/               Next.js frontend (App Router, ISR) — reads the API only
 ├── tests/             leakage, regression, and daily/weekly split suite
 ├── tools/             maintenance scripts
 ├── main.py            local entry point
@@ -289,11 +288,11 @@ cp .env.example .env               # fill in DATABASE_URL, GROQ_API_KEY, ADMIN_A
 python main.py                     # sync universe, ingest, forecast, launch dashboard
 ```
 
-Backend and dashboard separately:
+Backend and frontend separately:
 
 ```bash
 uvicorn api.main:app --reload --port 8000
-streamlit run app/main.py
+cd web && npm run dev
 ```
 
 Recover historical index membership when archive.org is responsive:
@@ -363,6 +362,6 @@ before transaction costs. Past performance does not guarantee future results.
 - [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert) — financial sentiment
 - [Groq](https://groq.com) — LLM inference
 - [Supabase](https://supabase.com) — PostgreSQL hosting
-- [Render](https://render.com) · [Streamlit](https://streamlit.io) — hosting
+- [Render](https://render.com) · [Vercel](https://vercel.com) — hosting
 - Purging, embargo and deflated Sharpe follow López de Prado,
   *Advances in Financial Machine Learning*
