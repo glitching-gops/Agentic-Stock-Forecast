@@ -4,36 +4,45 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { cx } from "@/lib/format";
+import { cx, daysAgo, timestamp } from "@/lib/format";
 import type { StockInfo } from "@/lib/types";
 
 const LINKS = [
-  { href: "/", label: "Leaderboard" },
+  { href: "/", label: "Board" },
+  { href: "/research", label: "Research" },
   { href: "/portfolio", label: "Portfolio" },
-  { href: "/methodology", label: "Methodology" },
+  { href: "/methodology", label: "Method" },
   { href: "/about", label: "About" },
 ] as const;
 
-export function SiteNav({ stocks }: { stocks: StockInfo[] }) {
+export function SiteNav({
+  stocks,
+  lastRun,
+  universe,
+}: {
+  stocks: StockInfo[];
+  lastRun: string | null;
+  universe: number | null;
+}) {
   const pathname = usePathname();
 
   return (
-    <header className="sticky top-0 z-40 border-b border-ink-500/70 bg-ink-900/85 backdrop-blur-md">
-      <div className="mx-auto flex h-14 max-w-[1400px] items-center gap-3 px-4 sm:px-6">
+    <header className="sticky top-0 z-40 border-b border-rule-hi bg-void/95 backdrop-blur-md">
+      <div className="mx-auto flex h-12 max-w-[1560px] items-center gap-4 px-4 sm:px-6">
         <Link
           href="/"
           className="flex shrink-0 items-baseline gap-2"
           aria-label="ZeRO home"
         >
-          <span className="text-base font-bold tracking-tight text-brand-400">
+          <span className="font-display text-[0.95rem] font-bold tracking-tight text-bright">
             ZeRO
           </span>
-          <span className="hidden text-[0.7rem] font-medium uppercase tracking-[0.14em] text-mist-500 sm:inline">
-            Stock Forecast
+          <span className="hidden text-[0.62rem] uppercase tracking-[0.2em] text-dim md:inline">
+            Forecast Terminal
           </span>
         </Link>
 
-        <nav className="ml-2 flex min-w-0 items-center gap-0.5 overflow-x-auto">
+        <nav className="flex min-w-0 items-center gap-px overflow-x-auto">
           {LINKS.map((link) => {
             const active =
               link.href === "/"
@@ -45,10 +54,10 @@ export function SiteNav({ stocks }: { stocks: StockInfo[] }) {
                 href={link.href}
                 aria-current={active ? "page" : undefined}
                 className={cx(
-                  "whitespace-nowrap rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
+                  "whitespace-nowrap px-2.5 py-1 text-[0.72rem] uppercase tracking-[0.12em] transition-colors",
                   active
-                    ? "bg-ink-600 text-mist-100"
-                    : "text-mist-400 hover:bg-ink-700 hover:text-mist-200",
+                    ? "inv font-semibold"
+                    : "text-dim hover:bg-raise hover:text-text",
                 )}
               >
                 {link.label}
@@ -61,7 +70,77 @@ export function SiteNav({ stocks }: { stocks: StockInfo[] }) {
           <StockSwitcher stocks={stocks} />
         </div>
       </div>
+
+      <StatusLine lastRun={lastRun} universe={universe} />
     </header>
+  );
+}
+
+/**
+ * The status line.
+ *
+ * Everything on it is a fact about what the reader is looking at rather than
+ * decoration: when the pipeline last wrote, how many names it covers, and the
+ * two parameters that define the target. The caret is the only motion on the
+ * site and it carries meaning — it blinks while the data is current and goes
+ * dark once the last run is older than the daily cadence, so a stale board
+ * announces itself without a banner.
+ */
+function StatusLine({
+  lastRun,
+  universe,
+}: {
+  lastRun: string | null;
+  universe: number | null;
+}) {
+  const age = daysAgo(lastRun);
+  const live = age !== null && age <= 2;
+
+  return (
+    <div className="border-t border-rule bg-inset">
+      <div className="mx-auto flex max-w-[1560px] flex-wrap items-center gap-x-4 gap-y-0.5 px-4 py-1 text-[0.64rem] uppercase tracking-[0.12em] text-dim sm:px-6">
+        <span className="flex items-center gap-1.5">
+          <span
+            aria-hidden
+            className={cx(
+              "inline-block h-2 w-1.5",
+              live ? "caret bg-pos" : "bg-rule-hi",
+            )}
+          />
+          {lastRun ? (
+            <>
+              Last run{" "}
+              <span className="text-mid">{timestamp(lastRun)}</span>
+              {!live && age !== null ? (
+                <span className="text-bar">· stale {age}d</span>
+              ) : null}
+            </>
+          ) : (
+            <span className="text-bar">Pipeline status unavailable</span>
+          )}
+        </span>
+        <Sep />
+        <span>
+          Universe <span className="text-mid">{universe ?? "—"}</span>
+        </span>
+        <Sep />
+        <span>
+          Horizon <span className="text-mid">30 sessions</span>
+        </span>
+        <Sep />
+        <span>
+          Target <span className="text-mid">excess vs sector benchmark</span>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function Sep() {
+  return (
+    <span aria-hidden className="text-rule-hi">
+      /
+    </span>
   );
 }
 
@@ -131,7 +210,7 @@ function StockSwitcher({ stocks }: { stocks: StockInfo[] }) {
         aria-expanded={open}
         aria-controls="stock-switcher-list"
         aria-label="Find a stock"
-        placeholder="Find a stock…"
+        placeholder="FIND ⌘K"
         value={query}
         onChange={(event) => {
           setQuery(event.target.value);
@@ -154,22 +233,26 @@ function StockSwitcher({ stocks }: { stocks: StockInfo[] }) {
             inputRef.current?.blur();
           }
         }}
-        className="w-36 rounded-md border border-ink-500 bg-ink-700 px-2.5 py-1.5 text-sm text-mist-100 placeholder:text-mist-500 focus:w-56 focus:border-brand-500/60 focus:outline-none sm:w-48 sm:focus:w-72"
+        className="w-32 border border-rule bg-inset px-2 py-1 text-[0.72rem] uppercase tracking-[0.1em] text-bright placeholder:text-dim focus:w-52 focus:border-rule-hi focus:outline-none sm:w-40 sm:focus:w-64"
       />
 
       {open ? (
         <ul
           id="stock-switcher-list"
           role="listbox"
-          className="absolute right-0 z-50 mt-1.5 max-h-[min(28rem,70vh)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto rounded-lg border border-ink-500 bg-ink-800 py-1 shadow-2xl shadow-black/60"
+          className="absolute right-0 z-50 mt-1 max-h-[min(28rem,70vh)] w-[min(24rem,calc(100vw-2rem))] overflow-y-auto border border-rule-hi bg-shell py-1 shadow-2xl shadow-black/70"
         >
           {matches.length === 0 ? (
-            <li className="px-3 py-3 text-sm text-mist-500">
-              Nothing matches “{query}”.
+            <li className="px-3 py-3 text-[0.75rem] text-dim">
+              No name matches “{query}”.
             </li>
           ) : (
             matches.map((stock, index) => (
-              <li key={stock.ticker} role="option" aria-selected={index === highlight}>
+              <li
+                key={stock.ticker}
+                role="option"
+                aria-selected={index === highlight}
+              >
                 <Link
                   href={`/stocks/${stock.ticker}`}
                   onClick={() => {
@@ -178,14 +261,19 @@ function StockSwitcher({ stocks }: { stocks: StockInfo[] }) {
                   }}
                   onMouseEnter={() => setHighlight(index)}
                   className={cx(
-                    "flex items-baseline justify-between gap-3 px-3 py-1.5",
-                    index === highlight ? "bg-ink-600" : "",
+                    "flex items-baseline justify-between gap-3 px-3 py-1",
+                    index === highlight ? "inv" : "text-text",
                   )}
                 >
-                  <span className="truncate text-sm text-mist-100">
+                  <span className="truncate text-[0.78rem]">
                     {stock.company}
                   </span>
-                  <span className="shrink-0 font-mono text-[0.7rem] text-mist-500">
+                  <span
+                    className={cx(
+                      "shrink-0 text-[0.68rem]",
+                      index === highlight ? "opacity-70" : "text-dim",
+                    )}
+                  >
                     {stock.ticker.replace(/\.NS$/, "")}
                   </span>
                 </Link>

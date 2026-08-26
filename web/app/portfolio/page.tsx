@@ -16,12 +16,12 @@ export default async function PortfolioPage() {
   const data = await getLeaderboard();
 
   return (
-    <div className="space-y-8">
-      <header className="max-w-2xl">
-        <h1 className="text-2xl font-semibold tracking-tight text-mist-100">
+    <div className="space-y-6">
+      <header className="max-w-3xl">
+        <h1 className="font-display text-[1.15rem] font-bold tracking-tight text-bright">
           Portfolio
         </h1>
-        <p className="mt-2 text-sm leading-relaxed text-mist-400">
+        <p className="mt-2 font-prose text-[0.86rem] leading-relaxed text-mid">
           An equal-weight allocation across the top-ranked stocks — a view of
           the ranking, not an optimised portfolio and not a backtest. Position
           sizing, a cost model and risk metrics are Phase 4 of the roadmap.

@@ -26,10 +26,15 @@ export function Tabs({ tabs }: { tabs: TabSpec[] }) {
 
   return (
     <div>
+      {/*
+        The selected tab is inverse video rather than an underline in an accent
+        colour. Inverse video is the terminal's own emphasis and it costs
+        nothing from a palette where every hue is spoken for.
+      */}
       <div
         role="tablist"
         aria-label="Stock detail sections"
-        className="flex gap-1 overflow-x-auto border-b border-ink-500/70"
+        className="flex gap-px overflow-x-auto border-b border-rule-hi"
       >
         {tabs.map((tab) => {
           const selected = tab.id === active;
@@ -43,10 +48,10 @@ export function Tabs({ tabs }: { tabs: TabSpec[] }) {
               aria-controls={`${uid}-panel-${tab.id}`}
               onClick={() => setActive(tab.id)}
               className={cx(
-                "-mb-px flex items-center gap-2 whitespace-nowrap border-b-2 px-3.5 py-2.5 text-sm font-medium transition-colors",
+                "flex items-center gap-2 whitespace-nowrap px-3 py-1.5 text-[0.72rem] uppercase tracking-[0.12em] transition-colors",
                 selected
-                  ? "border-brand-500 text-mist-100"
-                  : "border-transparent text-mist-500 hover:text-mist-300",
+                  ? "inv font-semibold"
+                  : "text-dim hover:bg-raise hover:text-text",
               )}
             >
               {tab.label}
@@ -63,7 +68,7 @@ export function Tabs({ tabs }: { tabs: TabSpec[] }) {
           id={`${uid}-panel-${tab.id}`}
           aria-labelledby={`${uid}-tab-${tab.id}`}
           hidden={tab.id !== active}
-          className="pt-6"
+          className="pt-5"
         >
           {tab.content}
         </div>

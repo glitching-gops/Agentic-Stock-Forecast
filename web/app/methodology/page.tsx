@@ -1,4 +1,13 @@
-import { Callout, Card, Prose, SectionHeading, Stat } from "@/components/ui";
+import Link from "next/link";
+
+import {
+  Eyebrow,
+  Note,
+  Panel,
+  Prose,
+  Readout,
+  SectionHead,
+} from "@/components/ui";
 import { getLeaderboard, soft } from "@/lib/api";
 import { pctPoints, signed } from "@/lib/format";
 import type { LeaderboardEntry } from "@/lib/types";
@@ -21,70 +30,67 @@ export default async function MethodologyPage() {
   const measured = data ? measure(data.entries) : null;
 
   return (
-    <div className="max-w-4xl space-y-12">
+    <div className="max-w-5xl space-y-11">
       <header>
-        <h1 className="text-2xl font-semibold tracking-tight text-mist-100">
+        <h1 className="font-display text-[1.15rem] font-bold tracking-tight text-bright">
           Methodology
         </h1>
-        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-mist-400">
+        <p className="mt-2 max-w-[78ch] font-prose text-[0.86rem] leading-relaxed text-mid">
           ZeRO ranks NSE stocks by their predicted 30-session return{" "}
-          <em className="not-italic text-mist-300">
-            relative to a sector benchmark
-          </em>
-          . This page states how that is measured, what the measurement
-          currently says, and what the system does not model. Every figure here
-          is read live from the evaluation harness rather than typed in — a
-          number written into a page cannot be audited and goes stale in
-          silence.
+          <span className="text-text">relative to a sector benchmark</span>.
+          This page states how that is measured, what the measurement currently
+          says, and what the system does not model. Every figure here is read
+          live from the evaluation harness rather than typed in — a number
+          written into a page cannot be audited and goes stale in silence.
         </p>
       </header>
 
       {/* ── Measured performance ─────────────────────────────────────────── */}
       <section>
-        <SectionHeading
+        <SectionHead
           title="Measured performance"
           description="Purged walk-forward validation with a 30-session embargo. Hyperparameters are tuned inside each training fold, so no configuration is ever chosen with sight of the rows it is later scored on. Before transaction costs."
         />
 
         {measured === null ? (
-          <Card className="px-6 py-8 text-center text-sm text-mist-400">
+          <Panel className="px-6 py-8 text-center text-[0.8rem] text-dim">
             Evaluation metrics could not be loaded.
-          </Card>
+          </Panel>
         ) : (
           <>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <Stat
+            <div className="grid grid-cols-1 gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-4">
+              <Readout
                 label="Mean rank IC"
                 value={signed(measured.meanIc)}
-                tone={measured.meanIc > 0 ? "positive" : "negative"}
-                sub={`${measured.positiveIc} positive · ${measured.negativeIc} negative`}
+                tone={measured.meanIc > 0 ? "pos" : "neg"}
                 help="Out-of-sample Spearman correlation between predicted and realised excess return. 0 = no skill; 0.02–0.05 is typical for a genuine technical signal."
+                sub={`${measured.positiveIc} positive, ${measured.negativeIc} negative.`}
               />
-              <Stat
+              <Readout
                 label="Directional accuracy"
                 value={pctPoints(measured.meanHit)}
-                tone={measured.edge > 0 ? "positive" : "negative"}
-                sub={`${measured.edge >= 0 ? "+" : "−"}${Math.abs(measured.edge).toFixed(1)}pp against a ${measured.meanBaseline.toFixed(1)}% majority-class baseline`}
+                tone={measured.edge > 0 ? "pos" : "neg"}
+                sub={`${measured.edge >= 0 ? "+" : "−"}${Math.abs(measured.edge).toFixed(1)}pp against a ${measured.meanBaseline.toFixed(1)}% majority-class baseline.`}
               />
-              <Stat
+              <Readout
                 label="Beats a random walk"
-                value={`${measured.beatsRw} of ${measured.total}`}
-                tone={measured.beatsRw > measured.total / 2 ? "positive" : "negative"}
+                value={`${measured.beatsRw} / ${measured.total}`}
+                tone={measured.beatsRw > measured.total / 2 ? "pos" : "neg"}
                 sub="Mean absolute error better than forecasting zero excess return."
               />
-              <Stat
+              <Readout
                 label="Below their own baseline"
-                value={`${measured.belowBaseline} of ${measured.paired}`}
-                tone="negative"
+                value={`${measured.belowBaseline} / ${measured.paired}`}
+                tone="neg"
                 sub={`${measured.degenerate} more tie it exactly by predicting one direction for every row.`}
               />
             </div>
 
-            <div className="mt-4">
+            <div className="mt-5">
               {measured.nullResult ? (
-                <Callout
-                  tone="negative"
-                  title="The model does not currently beat its baselines."
+                <Note
+                  tone="neg"
+                  title="The model does not currently beat its baselines"
                 >
                   Mean rank IC is at or below zero and directional accuracy
                   trails the majority-class rate on most stocks. Treat every
@@ -92,19 +98,20 @@ export default async function MethodologyPage() {
                   <strong>no demonstrated edge</strong>. This system is, for
                   now, a measuring instrument that reports its own signal is
                   absent — and that is a more useful thing to publish than a
-                  number that flatters it.
-                </Callout>
+                  number that flatters it.{" "}
+                  <Link href="/research">Everything that was tried →</Link>
+                </Note>
               ) : (
-                <Callout tone="warning" title="Read these honestly.">
+                <Note tone="bar" title="Read these honestly">
                   A rank IC near 0.05 is a weak signal — real, but not a licence
                   to trade. Where the model does not beat a random walk on
                   magnitude, the ranking is the output and the rupee target is
                   illustrative only.
-                </Callout>
+                </Note>
               )}
             </div>
 
-            <Prose className="mt-4">
+            <Prose className="mt-5">
               <p>
                 <strong>One result does hold up.</strong> The conformal
                 intervals are calibrated: the harness measures realised coverage
@@ -124,7 +131,7 @@ export default async function MethodologyPage() {
 
       {/* ── What it predicts ─────────────────────────────────────────────── */}
       <section>
-        <SectionHeading title="What the model actually predicts" />
+        <SectionHead title="What the model actually predicts" />
         <Prose>
           <p>
             The target is the{" "}
@@ -153,8 +160,11 @@ export default async function MethodologyPage() {
 
       {/* ── Pipeline ─────────────────────────────────────────────────────── */}
       <section>
-        <SectionHeading title="How it works" />
-        <div className="space-y-3">
+        <SectionHead
+          title="How it works"
+          description="Four stages, in order. The numbering is the data's own dependency chain — nothing downstream can run before what precedes it."
+        />
+        <div className="border-t border-rule">
           <Step n="1" title="Universe — point-in-time construction">
             <p>
               The tradable universe comes from a rule that references{" "}
@@ -185,11 +195,10 @@ export default async function MethodologyPage() {
             </p>
             <p>
               Earnings surprise attaches to the first session{" "}
-              <em className="not-italic text-mist-100">strictly after</em> the
-              announcement, because Indian results are commonly declared
-              post-close. Prices are stored raw and adjusted separately, so a
-              split or dividend cannot splice two adjustment bases into one
-              series.
+              <strong>strictly after</strong> the announcement, because Indian
+              results are commonly declared post-close. Prices are stored raw
+              and adjusted separately, so a split or dividend cannot splice two
+              adjustment bases into one series.
             </p>
           </Step>
 
@@ -197,8 +206,8 @@ export default async function MethodologyPage() {
             <p>
               <strong>XGBoost</strong>, heavily regularised, trained per stock on
               the excess-return target. Optuna searches hyperparameters{" "}
-              <em className="not-italic text-mist-100">inside each training
-              fold</em>, seeded so a tuning run is reproducible.
+              <strong>inside each training fold</strong>, seeded so a tuning run
+              is reproducible.
             </p>
             <p>
               That search runs <strong>weekly, not daily</strong>. Every ticker
@@ -244,19 +253,18 @@ export default async function MethodologyPage() {
             <p>
               One check used to be enough. On 2026-08-15 that handed a
               validation badge to a stock whose rank IC was +0.049 while its hit
-              rate sat 4.7pp <em className="not-italic text-mist-100">below</em>{" "}
-              its baseline, its IC t-statistic was indistinguishable from noise,
-              and its error was worse than a random walk&rsquo;s — with twelve
-              more names on the same basis. A badge that one weak correlation
-              can buy is not reporting evidence, it is laundering it. Requiring
-              two checks cut WEAK from 13 names to 5.
+              rate sat 4.7pp <strong>below</strong> its baseline, its IC
+              t-statistic was indistinguishable from noise, and its error was
+              worse than a random walk&rsquo;s — with twelve more names on the
+              same basis. A badge that one weak correlation can buy is not
+              reporting evidence, it is laundering it. Requiring two checks cut
+              WEAK from 13 names to 5.
             </p>
             <p>
               <strong>The LLM review</strong> looks for contradictions in the
               signal snapshot and may add flags. It can only{" "}
-              <em className="not-italic text-mist-100">downgrade</em>. It sees
-              numbers it has no way to verify, so it is allowed to raise doubt
-              and never to certify.
+              <strong>downgrade</strong>. It sees numbers it has no way to
+              verify, so it is allowed to raise doubt and never to certify.
             </p>
           </Step>
         </div>
@@ -264,26 +272,26 @@ export default async function MethodologyPage() {
 
       {/* ── Composite ────────────────────────────────────────────────────── */}
       <section>
-        <SectionHeading
+        <SectionHead
           title="The composite score"
           description="A ranking heuristic in [0, 100]. Not an expected return, and not a price target."
         />
-        <div className="overflow-x-auto rounded-xl border border-ink-500/70">
-          <table className="w-full min-w-[620px] border-collapse text-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[620px] border-collapse text-[0.78rem]">
             <thead>
-              <tr className="border-b border-ink-500/70 bg-ink-800/70 text-left">
-                <th className="px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                  Component
+              <tr className="bg-inset text-left">
+                <th className="border-y border-rule px-2 py-1">
+                  <Eyebrow as="span">Component</Eyebrow>
                 </th>
-                <th className="px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                  Effect
+                <th className="border-y border-rule px-2 py-1">
+                  <Eyebrow as="span">Effect</Eyebrow>
                 </th>
-                <th className="px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                  Description
+                <th className="border-y border-rule px-2 py-1">
+                  <Eyebrow as="span">Description</Eyebrow>
                 </th>
               </tr>
             </thead>
-            <tbody className="text-mist-300">
+            <tbody className="text-mid">
               {[
                 [
                   "Signal",
@@ -306,22 +314,19 @@ export default async function MethodologyPage() {
                   "Contradictions raised by the LLM signal review, floored at zero.",
                 ],
               ].map(([component, effect, description]) => (
-                <tr
-                  key={component}
-                  className="border-b border-ink-500/40 last:border-b-0"
-                >
-                  <td className="px-3 py-2.5 font-medium text-mist-100">
-                    {component}
+                <tr key={component} className="border-b border-rule/70">
+                  <td className="px-2 py-1.5 text-bright">{component}</td>
+                  <td className="whitespace-nowrap px-2 py-1.5">{effect}</td>
+                  <td className="px-2 py-1.5 font-prose leading-relaxed">
+                    {description}
                   </td>
-                  <td className="nums whitespace-nowrap px-3 py-2.5">{effect}</td>
-                  <td className="px-3 py-2.5 leading-relaxed">{description}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
 
-        <Prose className="mt-4">
+        <Prose className="mt-5">
           <p>
             Both components floor at zero, which makes the composite a{" "}
             <strong>long-only</strong> ranking: a confidently predicted
@@ -335,22 +340,21 @@ export default async function MethodologyPage() {
             Conviction used to be computed independently of the point forecast,
             and that was not long-only at all. PNB ranked{" "}
             <strong>third</strong> on the live board on 2026-08-17 while
-            forecasting a 1.69% <em className="not-italic">underperformance</em>
-            : the signal component floored to 0.00 as intended, but conviction
-            still collected 10.75 points from a calibrated probability of 0.567.
-            The two inputs disagreed and the score quietly sided with the
-            cheerier one. They disagree for a real reason — the calibrated
-            probability is the share of residuals above the negated forecast, so
-            a value over 0.5 means the model runs biased low for that ticker —
-            but that is a statement that the model contradicts itself, not a
-            ranking signal. It now ranks nowhere.
+            forecasting a 1.69% underperformance: the signal component floored
+            to 0.00 as intended, but conviction still collected 10.75 points
+            from a calibrated probability of 0.567. The two inputs disagreed and
+            the score quietly sided with the cheerier one. They disagree for a
+            real reason — the calibrated probability is the share of residuals
+            above the negated forecast, so a value over 0.5 means the model runs
+            biased low for that ticker — but that is a statement that the model
+            contradicts itself, not a ranking signal. It now ranks nowhere.
           </p>
         </Prose>
       </section>
 
       {/* ── Evaluation ───────────────────────────────────────────────────── */}
       <section>
-        <SectionHeading title="Evaluation" />
+        <SectionHead title="Evaluation" />
         <Prose>
           <ul>
             <li>
@@ -373,8 +377,10 @@ export default async function MethodologyPage() {
             <li>
               <strong>Overlap-corrected t-statistics.</strong> Consecutive
               30-session labels are ~97% overlapping, so the effective sample is
-              roughly <em className="not-italic">n / 30</em>. Treating all rows
-              as independent inflates every t-statistic by about 5.5×.
+              roughly <em>n / 30</em>. Treating all rows as independent inflates
+              every t-statistic by about 5.5×. Panel comparisons on{" "}
+              <Link href="/research">the research page</Link> are therefore
+              quoted on non-overlapping rebalance dates only.
             </li>
             <li>
               <strong>Measured interval coverage.</strong> Conformal intervals
@@ -387,7 +393,7 @@ export default async function MethodologyPage() {
 
       {/* ── Limitations ──────────────────────────────────────────────────── */}
       <section>
-        <SectionHeading
+        <SectionHead
           title="Known limitations"
           description="Stated plainly, because a system that hides these is not worth trusting."
         />
@@ -416,10 +422,11 @@ export default async function MethodologyPage() {
               is currently measured.
             </li>
             <li>
-              <strong>Nothing measures whether a published forecast came
-              true.</strong> The outcomes table exists but has no writer yet, so
-              realised performance against past forecasts is not tracked. It is
-              the highest-value missing piece and the next thing to be built.
+              <strong>Realised outcomes are recorded but not yet reported
+              here.</strong> Each published forecast is resolved against the
+              same stored target it was scored on, appended once and never
+              updated — a published claim cannot be quietly improved after the
+              fact. The record exists; no page reads it back yet.
             </li>
             <li>
               <strong>Survivorship bias.</strong> Point-in-time index membership
@@ -438,9 +445,12 @@ export default async function MethodologyPage() {
               at the 15:30 close is actionable at the next open at the earliest.
             </li>
             <li>
-              <strong>Benchmark mapping is unaudited.</strong> Sector indices are
-              assigned by a static map that has not been independently checked.
-              A wrong benchmark corrupts the excess-return target directly.
+              <strong>Fundamentals arrive as restated, not as filed.</strong>{" "}
+              The vendor serves the latest version of each statement, so a
+              figure may have been revised after the date the model is told it
+              was known. Every revision observed since instrumentation began is
+              appended to a log rather than overwritten, which makes the size of
+              the bias measurable going forward — but not backwards.
             </li>
           </ul>
         </Prose>
@@ -448,8 +458,8 @@ export default async function MethodologyPage() {
 
       {/* ── Stack ────────────────────────────────────────────────────────── */}
       <section>
-        <SectionHeading title="Stack" />
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <SectionHead title="Stack" />
+        <div className="grid grid-cols-1 gap-px bg-rule sm:grid-cols-2">
           <StackCard
             title="Modelling"
             items={[
@@ -490,6 +500,12 @@ export default async function MethodologyPage() {
   );
 }
 
+/**
+ * A disclosure per pipeline stage.
+ *
+ * The number is not decoration: these four stages are a strict dependency
+ * chain, and the order is the one fact about them a reader most needs.
+ */
 function Step({
   n,
   title,
@@ -500,22 +516,20 @@ function Step({
   children: React.ReactNode;
 }) {
   return (
-    <details className="group rounded-xl border border-ink-500/70 bg-ink-700/40">
-      <summary className="flex cursor-pointer list-none items-center gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
-        <span className="nums flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-ink-600 text-xs font-semibold text-brand-400">
-          {n}
-        </span>
-        <span className="flex-1 text-sm font-semibold text-mist-100">
+    <details className="group border-b border-rule">
+      <summary className="flex cursor-pointer list-none items-center gap-3 px-1 py-2.5 hover:bg-raise [&::-webkit-details-marker]:hidden">
+        <span className="w-5 shrink-0 text-[0.7rem] text-dim">{n}</span>
+        <span className="flex-1 text-[0.8rem] font-semibold text-bright">
           {title}
         </span>
         <span
           aria-hidden
-          className="text-mist-500 transition-transform group-open:rotate-90"
+          className="text-[0.7rem] text-dim transition-transform group-open:rotate-90"
         >
           ▶
         </span>
       </summary>
-      <div className="border-t border-ink-500/70 px-4 py-4">
+      <div className="border-t border-rule bg-inset px-4 py-4 pl-9">
         <Prose>{children}</Prose>
       </div>
     </details>
@@ -524,21 +538,19 @@ function Step({
 
 function StackCard({ title, items }: { title: string; items: string[] }) {
   return (
-    <Card className="p-4">
-      <h3 className="text-[0.68rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
-        {title}
-      </h3>
-      <ul className="mt-2.5 space-y-1.5 text-sm text-mist-300">
+    <div className="bg-shell p-4">
+      <Eyebrow as="h3">{title}</Eyebrow>
+      <ul className="mt-2.5 space-y-1 text-[0.78rem] text-text">
         {items.map((item) => (
           <li key={item} className="flex gap-2">
-            <span aria-hidden className="text-mist-500">
+            <span aria-hidden className="text-rule-hi">
               ·
             </span>
             {item}
           </li>
         ))}
       </ul>
-    </Card>
+    </div>
   );
 }
 

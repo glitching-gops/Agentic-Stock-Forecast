@@ -1,74 +1,174 @@
 @import "tailwindcss";
 
 /*
-  Palette lineage is deliberate: cyan #00B4D8, mint #06D6A0, amber #FFB703 and
-  rose #EF476F are carried over from the Streamlit theme so the app still reads
-  as the same product. The surfaces underneath them are new — the old #0D1B3E
-  base sat too close to its own cards to separate them without borders.
+  ──────────────────────────────────────────────────────────────────────────
+  Colour is scarce here on purpose.
+
+  This project's measured finding is that the signal is absent: 2 of 95 names
+  rank, nothing in Phase 2 clears the pre-registered bar. A palette that lit
+  every panel would be arguing the opposite of the data. So the surface is
+  graphite and hairlines, and a hue appears only where a measurement exists.
+
+  Each hue has exactly one job, and nothing else may use it:
+
+    bar    phosphor amber   a threshold, and whether it was met
+    pos    jade             a realised or predicted move upward
+    neg    coral            a realised or predicted move downward
+
+  Links and focus carry no hue at all — they use inverse video, which is the
+  terminal's own emphasis device and costs nothing from the colour budget.
+  ──────────────────────────────────────────────────────────────────────────
 */
 @theme {
-  --color-ink-900: #060b1a;
-  --color-ink-800: #0a1129;
-  --color-ink-700: #0f1834;
-  --color-ink-600: #16203f;
-  --color-ink-500: #1e2b52;
-  --color-ink-400: #2b3a66;
+  /* Surfaces. Warm-neutral graphite, not the blue-black of the old theme —
+     the previous #0D1B3E base sat so close to its own cards that every panel
+     needed a border to be visible at all. */
+  --color-void: #0a0a0b;
+  --color-shell: #101012;
+  --color-raise: #17171a;
+  --color-inset: #060607;
 
-  --color-mist-500: #64748b;
-  --color-mist-400: #8c9bb8;
-  --color-mist-300: #b6c2d9;
-  --color-mist-100: #e8f0fe;
+  /* Rules do the work borders used to. Two weights only. */
+  --color-rule: #232327;
+  --color-rule-hi: #35353c;
 
-  --color-brand-500: #00b4d8;
-  --color-brand-400: #22c9e8;
-  --color-brand-300: #67e0f5;
+  /* Text ramp. Nothing is pure white; a terminal's brightest state is
+     reserved for inverse video, so body text sits below it. */
+  --color-dim: #6b6b75;
+  --color-mid: #9a9aa6;
+  --color-text: #c9c9d2;
+  --color-bright: #ececf2;
 
-  --color-pos-500: #06d6a0;
-  --color-neg-500: #ef476f;
-  --color-warn-500: #ffb703;
+  /* The three semantic hues. See the note above before adding a fourth. */
+  --color-bar: #ffb000;
+  --color-bar-dim: #7a5504;
+  --color-pos: #4fd1a5;
+  --color-neg: #ff6b85;
 
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --font-display: var(--font-martian-mono), ui-monospace, monospace;
+  --font-mono: var(--font-plex-mono), ui-monospace, monospace;
+  --font-prose: var(--font-plex-sans), ui-sans-serif, system-ui, sans-serif;
 }
 
 /*
-  Single-theme by intent. A dashboard whose whole job is to say "this signal is
-  absent" should not also be negotiating two colour schemes; the semantic
-  colours (mint = outperform, rose = underperform) are tuned for one background.
+  Single theme by intent. A dashboard whose whole job is to say "this signal is
+  absent" should not also be negotiating two colour schemes, and the semantic
+  hues above are tuned against one background.
 */
 html {
   color-scheme: dark;
-  background-color: var(--color-ink-900);
+  background-color: var(--color-void);
 }
 
 body {
-  background-color: var(--color-ink-900);
-  color: var(--color-mist-100);
+  background-color: var(--color-void);
+  color: var(--color-text);
+  font-family: var(--font-mono);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* Tabular figures everywhere a number sits in a column. */
-.nums {
+/*
+  Every figure in this interface sits in a column that has to line up with the
+  one above it, so tabular figures are the default rather than an opt-in class.
+*/
+body,
+table,
+input,
+select,
+button {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── Inverse video ────────────────────────────────────────────────────────
+   The terminal's emphasis device, used here in place of an accent colour.
+   Applied to the active nav item, to focus, and to section eyebrows. */
+.inv {
+  background-color: var(--color-bright);
+  color: var(--color-void);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-bright);
+  outline-offset: 1px;
+}
+
+/* ── Rules ────────────────────────────────────────────────────────────────
+   Hairlines at any device pixel ratio. A 1px border at DPR 2 renders at half
+   a CSS pixel and washes out; these stay crisp. */
+.rule-t {
+  border-top: 1px solid var(--color-rule);
+}
+.rule-b {
+  border-bottom: 1px solid var(--color-rule);
+}
+
+/* ── Scanline ─────────────────────────────────────────────────────────────
+   One ambient texture, at an opacity that reads as surface rather than as
+   effect. Suppressed under reduced-motion preferences alongside everything
+   else, since it is the only non-content ornament on the page. */
+.scan::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgb(255 255 255 / 0.012) 0px,
+    rgb(255 255 255 / 0.012) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan::before {
+    display: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Caret ────────────────────────────────────────────────────────────────
+   The only motion on the page. One blinking block, in the status line, and it
+   means something: it stops when the pipeline data is stale. */
+@keyframes caret {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+.caret {
+  animation: caret 1.2s step-end infinite;
+}
+
 ::selection {
-  background-color: color-mix(in srgb, var(--color-brand-500) 35%, transparent);
+  background-color: var(--color-bright);
+  color: var(--color-void);
 }
 
 /* Scrollbars — the default light thumb is jarring on this background. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--color-ink-500) transparent;
+  scrollbar-color: var(--color-rule-hi) transparent;
 }
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background-color: var(--color-ink-500);
-  border-radius: 999px;
-  border: 2px solid var(--color-ink-900);
+  background-color: var(--color-rule-hi);
+  border: 3px solid var(--color-void);
 }
 ::-webkit-scrollbar-track {
   background: transparent;

@@ -1,15 +1,15 @@
 "use client";
 
-import { Badge, Card, type Tone } from "@/components/ui";
+import { Badge, Eyebrow, SectionHead, type Tone } from "@/components/ui";
 import { cx, dateOnly, decimal } from "@/lib/format";
 import type { SignalRow } from "@/lib/types";
 
 type Reading = "Bullish" | "Bearish" | "Neutral";
 
 const READING_TONE: Record<Reading, Tone> = {
-  Bullish: "positive",
-  Bearish: "negative",
-  Neutral: "muted",
+  Bullish: "pos",
+  Bearish: "neg",
+  Neutral: "dim",
 };
 
 /**
@@ -18,19 +18,19 @@ const READING_TONE: Record<Reading, Tone> = {
  * These thresholds are the textbook ones and are carried over unchanged from
  * the Streamlit view. They are a description of the indicator, NOT the model's
  * opinion: the model consumes these columns as raw features and reaches its
- * own conclusion, which the Overview tab reports. A row of green badges here
- * next to an INSUFFICIENT evidence grade is not a contradiction — it means the
- * indicators look constructive and the model has failed to turn that into
- * out-of-sample skill.
+ * own conclusion, which the Overview tab reports. A column of Bullish badges
+ * here next to an INSUFFICIENT evidence grade is not a contradiction — it
+ * means the indicators look constructive and the model has failed to turn that
+ * into out-of-sample skill.
  */
-interface ReadingCard {
+interface ReadingRow {
   label: string;
   value: number | null;
   reading: Reading;
   note: string;
 }
 
-function readings(latest: Record<string, unknown>): ReadingCard[] {
+function readings(latest: Record<string, unknown>): ReadingRow[] {
   const num = (key: string): number | null => {
     const value = latest[key];
     return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -111,7 +111,9 @@ function readings(latest: Record<string, unknown>): ReadingCard[] {
       label: "Price vs upper band",
       value: close,
       reading:
-        close !== null && num("bb_upper") !== null && close > (num("bb_upper") as number)
+        close !== null &&
+        num("bb_upper") !== null &&
+        close > (num("bb_upper") as number)
           ? "Bearish"
           : "Neutral",
       note: `Upper band at ${decimal(num("bb_upper"))}.`,
@@ -120,7 +122,9 @@ function readings(latest: Record<string, unknown>): ReadingCard[] {
       label: "Price vs lower band",
       value: close,
       reading:
-        close !== null && num("bb_lower") !== null && close < (num("bb_lower") as number)
+        close !== null &&
+        num("bb_lower") !== null &&
+        close < (num("bb_lower") as number)
           ? "Bullish"
           : "Neutral",
       note: `Lower band at ${decimal(num("bb_lower"))}.`,
@@ -135,37 +139,58 @@ export function SignalsPanel({
   latest: Record<string, unknown>;
   history: SignalRow[];
 }) {
-  const cards = readings(latest);
+  const rows = readings(latest);
 
   return (
     <div className="space-y-8">
       <section>
-        <h3 className="mb-1 text-sm font-semibold text-mist-100">
-          Latest technical readings
-        </h3>
-        <p className="mb-4 max-w-3xl text-xs leading-relaxed text-mist-500">
-          Conventional overbought/oversold thresholds applied to the most recent
-          session. These describe the indicators — the model consumes them as
-          raw features and its own conclusion is on the Overview tab.
-        </p>
+        <SectionHead
+          as="h3"
+          title="Latest technical readings"
+          description="Conventional overbought/oversold thresholds applied to the most recent session. These describe the indicators — the model consumes them as raw features and its own conclusion is on the Overview tab."
+        />
 
-        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 xl:grid-cols-3">
-          {cards.map((card) => (
-            <Card key={card.label} className="p-3">
-              <div className="flex items-start justify-between gap-2">
-                <span className="text-xs font-medium text-mist-400">
-                  {card.label}
-                </span>
-                <Badge tone={READING_TONE[card.reading]}>{card.reading}</Badge>
-              </div>
-              <div className="nums mt-1.5 text-lg font-semibold text-mist-100">
-                {decimal(card.value)}
-              </div>
-              <div className="mt-0.5 text-[0.68rem] text-mist-500">
-                {card.note}
-              </div>
-            </Card>
-          ))}
+        {/*
+          A table, not a grid of cards. Ten readings share one set of columns,
+          and the comparison a reader wants is down a column: which of these
+          agree. Cards put a border between every pair of numbers being
+          compared.
+        */}
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[560px] border-collapse text-[0.76rem]">
+            <thead>
+              <tr className="bg-inset">
+                <th className="border-y border-rule px-2 py-1 text-left">
+                  <Eyebrow>Indicator</Eyebrow>
+                </th>
+                <th className="border-y border-rule px-2 py-1 text-right">
+                  <Eyebrow>Value</Eyebrow>
+                </th>
+                <th className="border-y border-rule px-2 py-1 text-left">
+                  <Eyebrow>Reading</Eyebrow>
+                </th>
+                <th className="border-y border-rule px-2 py-1 text-left">
+                  <Eyebrow>Threshold</Eyebrow>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.label} className="border-b border-rule/70">
+                  <td className="px-2 py-1 text-text">{row.label}</td>
+                  <td className="px-2 py-1 text-right text-bright">
+                    {decimal(row.value)}
+                  </td>
+                  <td className="px-2 py-1">
+                    <Badge tone={READING_TONE[row.reading]}>
+                      {row.reading}
+                    </Badge>
+                  </td>
+                  <td className="px-2 py-1 text-dim">{row.note}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </section>
 
@@ -202,7 +227,9 @@ function SignalHeatmap({ history }: { history: SignalRow[] }) {
   const features = Object.keys(window[window.length - 1])
     .filter((key) => !excluded.has(key))
     .filter((key) =>
-      window.some((row) => typeof row[key] === "number" && Number.isFinite(row[key] as number)),
+      window.some(
+        (row) => typeof row[key] === "number" && Number.isFinite(row[key] as number),
+      ),
     )
     .sort();
 
@@ -210,22 +237,27 @@ function SignalHeatmap({ history }: { history: SignalRow[] }) {
 
   return (
     <section>
-      <h3 className="mb-1 text-sm font-semibold text-mist-100">
-        Signal heatmap — last {window.length} sessions
-      </h3>
-      <p className="mb-4 max-w-3xl text-xs leading-relaxed text-mist-500">
-        Each row is min–max normalised across the window shown, so colour means
-        “high or low <em className="not-italic text-mist-400">for this feature,
-        recently</em>” and carries no absolute scale. Forward-looking columns —
-        the target and its benchmark components — are excluded so the grid can
-        never leak a label.
-      </p>
+      <SectionHead
+        as="h3"
+        title={`Signal heatmap — last ${window.length} sessions`}
+        description={
+          <>
+            Each row is min–max normalised across the window shown, so
+            brightness means “high or low{" "}
+            <span className="text-text">for this feature, recently</span>” and
+            carries no absolute scale. Forward-looking columns — the target and
+            its benchmark components — are excluded so the grid can never leak
+            a label.
+          </>
+        }
+      />
 
-      <div className="overflow-x-auto rounded-xl border border-ink-500/70 bg-ink-700/40 p-3">
-        <div className="min-w-[640px] space-y-[3px]">
+      <div className="overflow-x-auto border border-rule bg-inset p-3">
+        <div className="min-w-[640px] space-y-[2px]">
           {features.map((feature) => {
             const values = window.map((row) =>
-              typeof row[feature] === "number" && Number.isFinite(row[feature] as number)
+              typeof row[feature] === "number" &&
+              Number.isFinite(row[feature] as number)
                 ? (row[feature] as number)
                 : null,
             );
@@ -236,18 +268,19 @@ function SignalHeatmap({ history }: { history: SignalRow[] }) {
 
             return (
               <div key={feature} className="flex items-center gap-2">
-                <div className="w-36 shrink-0 truncate text-right font-mono text-[0.65rem] text-mist-500">
+                <div className="w-36 shrink-0 truncate text-right text-[0.64rem] text-dim">
                   {feature}
                 </div>
-                <div className="flex flex-1 gap-[2px]">
+                <div className="flex flex-1 gap-px">
                   {values.map((value, index) => {
-                    const t = value === null || span === 0 ? 0.5 : (value - min) / span;
+                    const t =
+                      value === null || span === 0 ? 0.5 : (value - min) / span;
                     return (
                       <div
                         key={window[index].date}
                         title={`${feature} · ${dateOnly(window[index].date)} · ${decimal(value, 4)}`}
                         className={cx(
-                          "h-4 flex-1 rounded-[2px]",
+                          "h-4 flex-1",
                           value === null && "opacity-25",
                         )}
                         style={{ backgroundColor: rampColor(t) }}
@@ -260,13 +293,14 @@ function SignalHeatmap({ history }: { history: SignalRow[] }) {
           })}
         </div>
 
-        <div className="mt-4 flex items-center gap-2 pl-[9.5rem] text-[0.65rem] text-mist-500">
+        <div className="mt-4 flex items-center gap-2 pl-[9.5rem] text-[0.64rem] uppercase tracking-[0.12em] text-dim">
           <span>low</span>
           <div
-            className="h-2 w-32 rounded-full"
+            aria-hidden
+            className="h-2 w-32"
             style={{
               background:
-                "linear-gradient(90deg, var(--color-brand-500), var(--color-ink-700), var(--color-warn-500))",
+                "linear-gradient(90deg, var(--color-inset), var(--color-bright))",
             }}
           />
           <span>high</span>
@@ -276,19 +310,19 @@ function SignalHeatmap({ history }: { history: SignalRow[] }) {
   );
 }
 
-/** Cyan → deep navy → amber, the ramp the Streamlit heatmap used. */
+/**
+ * A luminance ramp, not a hue ramp.
+ *
+ * The Streamlit original ran cyan → navy → amber. Two of those now mean
+ * something specific elsewhere on the site, and a min–max normalised value has
+ * no meaningful midpoint for a diverging scale to diverge around — it is a
+ * rank within a window. Brightness carries that with no colour spent, and the
+ * grid reads as the phosphor matrix it is.
+ */
 function rampColor(t: number): string {
   const clamped = Math.max(0, Math.min(1, t));
-  const stops: [number, number, number][] = [
-    [0, 180, 216],
-    [15, 24, 52],
-    [255, 183, 3],
-  ];
-  const scaled = clamped * (stops.length - 1);
-  const index = Math.min(Math.floor(scaled), stops.length - 2);
-  const local = scaled - index;
-  const [r1, g1, b1] = stops[index];
-  const [r2, g2, b2] = stops[index + 1];
-  const mix = (a: number, b: number) => Math.round(a + (b - a) * local);
+  const [r1, g1, b1] = [6, 6, 7]; // --color-inset
+  const [r2, g2, b2] = [236, 236, 242]; // --color-bright
+  const mix = (a: number, b: number) => Math.round(a + (b - a) * clamped);
   return `rgb(${mix(r1, r2)} ${mix(g1, g2)} ${mix(b1, b2)})`;
 }

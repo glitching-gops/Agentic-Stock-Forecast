@@ -3,10 +3,10 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 
-import { Badge, Card, ScoreMeter, evidenceTone, verdictTone } from "@/components/ui";
+import { Badge, Eyebrow, Meter, evidenceTone, verdictTone } from "@/components/ui";
 import {
   cx,
-  money,
+  decimal,
   probability,
   scoreBasisExplainer,
   scoreBasisLabel,
@@ -26,16 +26,16 @@ import type { LeaderboardEntry } from "@/lib/types";
  * The one thing NOT recomputed here is `rank`. It is issued by the API as a
  * SQL window function over the full filtered set, with ties sharing a rank.
  * Re-deriving that client-side would mean maintaining the same tie semantics
- * in two languages, so instead the rank badge is shown only while the ordering
- * it refers to is in effect, and hidden the moment the reader sorts by
- * something else.
+ * in two languages, so instead the rank column is shown only while the
+ * ordering it refers to is in effect, and hidden the moment the reader sorts
+ * by something else.
  */
 
 const SORTS = {
-  composite_score: "Composite score",
-  pred_excess_return: "Predicted excess return",
+  composite_score: "Score",
+  pred_excess_return: "Excess return",
   prob_outperform: "P(outperform)",
-  eval_rank_ic: "Out-of-sample rank IC",
+  eval_rank_ic: "Rank IC",
   eval_hit_rate: "Hit rate",
 } as const;
 
@@ -95,7 +95,8 @@ export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
     .concat({
       basis: "__other__",
       rows: unranked.filter(
-        (e) => !BASIS_ORDER.includes(e.score_basis as (typeof BASIS_ORDER)[number]),
+        (e) =>
+          !BASIS_ORDER.includes(e.score_basis as (typeof BASIS_ORDER)[number]),
       ),
     })
     .filter((group) => group.rows.length > 0);
@@ -104,7 +105,7 @@ export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
   const anyFilter = Boolean(sector || evidence || verdict || query);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <Filters
         sectors={sectors}
         sector={sector}
@@ -128,52 +129,50 @@ export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
         }}
       />
 
-      {/* ── Ranked ───────────────────────────────────────────────────────── */}
+      {/* ── Rated ────────────────────────────────────────────────────────── */}
       <section aria-labelledby="ranked-heading">
-        <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-rule-hi pb-1.5">
           <h2
             id="ranked-heading"
-            className="text-sm font-semibold uppercase tracking-[0.09em] text-mist-300"
+            className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-bright"
           >
-            Ranked
-            <span className="ml-2 font-mono text-xs font-normal text-mist-500">
-              {ranked.length}
-            </span>
+            Rated
+            <span className="ml-2 font-normal text-dim">{ranked.length}</span>
           </h2>
           {!showRank && ranked.length > 0 ? (
-            <p className="text-xs text-mist-500">
-              Ranks are assigned on composite score; hidden while sorted by{" "}
+            <p className="text-[0.68rem] text-dim">
+              Rank is assigned on score — hidden while sorted by{" "}
               {SORTS[sortKey].toLowerCase()}.
             </p>
           ) : null}
         </div>
 
         {ranked.length === 0 ? (
-          <Card className="px-6 py-8 text-center text-sm text-mist-400">
+          <div className="border border-rule bg-shell px-4 py-6 text-center text-[0.78rem] text-dim">
             {anyFilter
-              ? "No ranked stock matches these filters."
-              : "No stock currently clears the evidence gate with a positive forecast."}
-          </Card>
+              ? "No rated name matches these filters."
+              : "No name currently clears the evidence gate with a positive forecast."}
+          </div>
         ) : (
           <EntryTable rows={ranked} showRank={showRank} />
         )}
       </section>
 
-      {/* ── Not ranked ───────────────────────────────────────────────────── */}
+      {/* ── Not rated ────────────────────────────────────────────────────── */}
       {groups.length > 0 ? (
-        <section aria-labelledby="unranked-heading" className="space-y-3">
-          <div>
+        <section aria-labelledby="unranked-heading" className="space-y-1.5">
+          <div className="mb-2 border-b border-rule-hi pb-1.5">
             <h2
               id="unranked-heading"
-              className="text-sm font-semibold uppercase tracking-[0.09em] text-mist-300"
+              className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-bright"
             >
-              Not ranked
-              <span className="ml-2 font-mono text-xs font-normal text-mist-500">
+              Not rated
+              <span className="ml-2 font-normal text-dim">
                 {unranked.length}
               </span>
             </h2>
-            <p className="mt-1 max-w-3xl text-xs leading-relaxed text-mist-500">
-              Every stock below scores exactly 0.0, and that one value covers
+            <p className="mt-2 max-w-4xl font-prose text-[0.8rem] leading-relaxed text-mid">
+              Every name below scores exactly 0.0, and that one value covers
               several unrelated situations. They are grouped by the reason
               rather than numbered off in an order the score cannot support.
             </p>
@@ -233,20 +232,20 @@ function Filters(props: {
   const dirty = props.matched !== props.total;
 
   return (
-    <Card className="flex flex-wrap items-end gap-3 p-3">
-      <Field label="Search">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-y border-rule bg-shell px-3 py-2">
+      <Field label="Find">
         <input
           type="search"
           value={props.query}
           onChange={(e) => props.setQuery(e.target.value)}
-          placeholder="Company or ticker"
-          className="w-44 rounded-md border border-ink-500 bg-ink-800 px-2.5 py-1.5 text-sm text-mist-100 placeholder:text-mist-500 focus:border-brand-500/60 focus:outline-none"
+          placeholder="name or ticker"
+          className="w-36 border border-rule bg-inset px-2 py-0.5 text-[0.74rem] text-bright placeholder:text-dim focus:border-rule-hi focus:outline-none"
         />
       </Field>
 
       <Field label="Sector">
         <Select value={props.sector} onChange={props.setSector}>
-          <option value="">All sectors</option>
+          <option value="">all</option>
           {props.sectors.map((s) => (
             <option key={s} value={s}>
               {s}
@@ -257,23 +256,23 @@ function Filters(props: {
 
       <Field label="Evidence">
         <Select value={props.evidence} onChange={props.setEvidence}>
-          <option value="">Any grade</option>
-          <option value="STRONG">Strong</option>
-          <option value="WEAK">Weak</option>
-          <option value="INSUFFICIENT">None</option>
+          <option value="">any</option>
+          <option value="STRONG">strong</option>
+          <option value="WEAK">weak</option>
+          <option value="INSUFFICIENT">none</option>
         </Select>
       </Field>
 
-      <Field label="Critic verdict">
+      <Field label="Critic">
         <Select value={props.verdict} onChange={props.setVerdict}>
-          <option value="">Any verdict</option>
-          <option value="APPROVED">Approved</option>
-          <option value="FLAGGED">Flagged</option>
-          <option value="REJECTED">Rejected</option>
+          <option value="">any</option>
+          <option value="APPROVED">approved</option>
+          <option value="FLAGGED">flagged</option>
+          <option value="REJECTED">rejected</option>
         </Select>
       </Field>
 
-      <Field label="Sort by">
+      <Field label="Sort">
         <Select
           value={props.sortKey}
           onChange={(v) => props.setSortKey(v as SortKey)}
@@ -286,30 +285,34 @@ function Filters(props: {
         </Select>
       </Field>
 
-      <div className="ml-auto flex items-center gap-3 pb-1">
-        <span className="nums text-xs text-mist-500">
-          {props.matched} of {props.total}
+      <div className="ml-auto flex items-center gap-3">
+        <span className="text-[0.7rem] text-dim">
+          {props.matched}/{props.total}
         </span>
         {dirty ? (
           <button
             type="button"
             onClick={props.onReset}
-            className="rounded-md border border-ink-500 px-2 py-1 text-xs font-medium text-mist-300 hover:bg-ink-600"
+            className="border border-rule-hi px-2 py-0.5 text-[0.68rem] uppercase tracking-[0.1em] text-text hover:bg-bright hover:text-void"
           >
             Reset
           </button>
         ) : null}
       </div>
-    </Card>
+    </div>
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[0.65rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
-        {label}
-      </span>
+    <label className="flex items-center gap-2">
+      <Eyebrow as="span">{label}</Eyebrow>
       {children}
     </label>
   );
@@ -328,7 +331,7 @@ function Select({
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="rounded-md border border-ink-500 bg-ink-800 px-2.5 py-1.5 text-sm text-mist-100 focus:border-brand-500/60 focus:outline-none"
+      className="border border-rule bg-inset px-1.5 py-0.5 text-[0.74rem] text-bright focus:border-rule-hi focus:outline-none"
     >
       {children}
     </select>
@@ -337,7 +340,13 @@ function Select({
 
 /* ── Grouped disclosure ────────────────────────────────────────────────── */
 
-function BasisGroup({ basis, rows }: { basis: string; rows: LeaderboardEntry[] }) {
+function BasisGroup({
+  basis,
+  rows,
+}: {
+  basis: string;
+  rows: LeaderboardEntry[];
+}) {
   const label = basis === "__other__" ? "Other" : scoreBasisLabel(basis);
   const explainer =
     basis === "__other__"
@@ -345,28 +354,28 @@ function BasisGroup({ basis, rows }: { basis: string; rows: LeaderboardEntry[] }
       : scoreBasisExplainer(basis);
 
   return (
-    <details className="group rounded-xl border border-ink-500/70 bg-ink-700/40">
-      <summary className="flex cursor-pointer list-none items-start gap-3 px-4 py-3 [&::-webkit-details-marker]:hidden">
+    <details className="group border border-rule bg-shell">
+      <summary className="flex cursor-pointer list-none items-start gap-2.5 px-3 py-2 hover:bg-raise [&::-webkit-details-marker]:hidden">
         <span
           aria-hidden
-          className="mt-1 text-mist-500 transition-transform group-open:rotate-90"
+          className="mt-[3px] text-[0.6rem] text-dim transition-transform group-open:rotate-90"
         >
           ▶
         </span>
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-baseline gap-2">
-            <span className="text-sm font-semibold text-mist-100">{label}</span>
-            <span className="nums rounded-md bg-ink-600 px-1.5 py-0.5 text-[0.68rem] font-semibold text-mist-400">
-              {rows.length}
+            <span className="text-[0.76rem] font-semibold uppercase tracking-[0.12em] text-bright">
+              {label}
             </span>
+            <span className="text-[0.7rem] text-dim">{rows.length}</span>
           </span>
-          <span className="mt-1 block max-w-3xl text-xs leading-relaxed text-mist-500">
+          <span className="mt-1 block max-w-4xl font-prose text-[0.78rem] leading-relaxed text-dim">
             {explainer}
           </span>
         </span>
       </summary>
-      <div className="border-t border-ink-500/70">
-        <EntryTable rows={rows} showRank={false} />
+      <div className="border-t border-rule">
+        <EntryTable rows={rows} showRank={false} flush />
       </div>
     </details>
   );
@@ -377,23 +386,29 @@ function BasisGroup({ basis, rows }: { basis: string; rows: LeaderboardEntry[] }
 function EntryTable({
   rows,
   showRank,
+  flush = false,
 }: {
   rows: LeaderboardEntry[];
   showRank: boolean;
+  flush?: boolean;
 }) {
   return (
-    <div className="overflow-x-auto rounded-xl border border-ink-500/70">
-      <table className="w-full min-w-[1020px] border-collapse text-sm">
+    <div className={cx("overflow-x-auto", !flush && "border border-rule")}>
+      <table className="w-full min-w-[1120px] border-collapse text-[0.76rem]">
         <thead>
-          <tr className="border-b border-ink-500/70 bg-ink-800/70 text-left">
-            {showRank ? <Th className="w-14 text-center">#</Th> : null}
-            <Th className="min-w-[230px]">Stock</Th>
-            <Th align="right">Price</Th>
+          <tr className="border-b border-rule-hi bg-inset text-left">
+            {showRank ? <Th className="w-9 text-right">#</Th> : null}
+            <Th className="w-24">Ticker</Th>
+            <Th className="min-w-[150px]">Name</Th>
+            <Th className="w-36">Sector</Th>
+            <Th align="right" help="Last close, in rupees.">
+              Last
+            </Th>
             <Th
               align="right"
               help="Implied price assuming the benchmark index is flat. The model forecasts relative performance and says nothing about where the index goes."
             >
-              Implied target
+              Target
             </Th>
             <Th
               align="right"
@@ -411,17 +426,17 @@ function EntryTable({
               align="right"
               help="Out-of-sample Spearman correlation between predicted and realised excess return. 0 means no skill."
             >
-              Rank IC
+              IC
             </Th>
             <Th
               align="right"
-              help="Out-of-sample directional accuracy against the majority-class baseline on the same window."
+              help="Out-of-sample directional accuracy minus the majority-class baseline on the same window. This is the number that matters, not the raw hit rate."
             >
-              Hit vs base
+              Hit−base
             </Th>
-            <Th>Evidence</Th>
+            <Th className="w-40">Evidence</Th>
             <Th
-              className="min-w-[150px]"
+              className="w-32"
               help="Ranking heuristic in [0,100]: predicted excess return and conviction, multiplied by an evidence grade. Not an expected return."
             >
               Score
@@ -445,7 +460,7 @@ function Th({
   help,
 }: {
   children: React.ReactNode;
-  align?: "left" | "right" | "center";
+  align?: "left" | "right";
   className?: string;
   help?: string;
 }) {
@@ -454,14 +469,13 @@ function Th({
       scope="col"
       title={help}
       className={cx(
-        "px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500",
+        "px-2.5 py-1.5 text-[0.62rem] font-medium uppercase tracking-[0.12em] text-dim",
         align === "right" && "text-right",
-        align === "center" && "text-center",
         className,
       )}
     >
       {children}
-      {help ? <span className="ml-1 opacity-60">ⓘ</span> : null}
+      {help ? <span className="ml-0.5 opacity-50">?</span> : null}
     </th>
   );
 }
@@ -501,115 +515,111 @@ function Row({
     hit !== null && base !== null && Math.abs(hit - base) < 1e-6;
 
   return (
-    <tr className="border-b border-ink-500/40 last:border-b-0 hover:bg-ink-600/40">
+    <tr className="border-b border-rule/70 last:border-b-0 hover:bg-raise">
       {showRank ? (
-        <td className="nums px-3 py-2.5 text-center text-sm font-semibold text-mist-300">
-          {entry.rank ?? "—"}
-        </td>
+        <td className="px-2.5 py-1 text-right text-dim">{entry.rank ?? "—"}</td>
       ) : null}
 
-      <td className="px-3 py-2.5">
+      <td className="px-2.5 py-1">
         <Link
           href={`/stocks/${entry.ticker}`}
-          className="block truncate font-medium text-mist-100 hover:text-brand-300"
+          className="font-semibold text-bright underline-offset-2 hover:underline"
         >
-          {entry.company ?? entry.ticker}
+          {entry.ticker.replace(/\.NS$/, "")}
         </Link>
-        <div className="mt-0.5 truncate text-xs text-mist-500">
-          <span className="font-mono">{entry.ticker.replace(/\.NS$/, "")}</span>
-          {entry.sector ? ` · ${entry.sector}` : ""}
-        </div>
       </td>
 
-      <td className="nums px-3 py-2.5 text-right text-mist-200">
-        {money(entry.current_price)}
+      <td className="max-w-[220px] truncate px-2.5 py-1 text-text">
+        {entry.company ?? "—"}
       </td>
 
-      <td className="nums px-3 py-2.5 text-right text-mist-300">
-        {money(entry.forecast_price)}
+      <td className="max-w-[9rem] truncate px-2.5 py-1 text-dim">
+        {entry.sector ?? "—"}
+      </td>
+
+      <td className="px-2.5 py-1 text-right text-text">
+        {decimal(entry.current_price)}
+      </td>
+
+      <td className="px-2.5 py-1 text-right text-mid">
+        {decimal(entry.forecast_price)}
         {entry.interval_low !== null && entry.interval_high !== null ? (
-          <div className="text-[0.68rem] text-mist-500">
-            {money(entry.interval_low)} – {money(entry.interval_high)}
-          </div>
+          <span className="ml-1.5 text-[0.66rem] text-dim">
+            [{decimal(entry.interval_low, 0)}–{decimal(entry.interval_high, 0)}]
+          </span>
         ) : null}
       </td>
 
       <td
         className={cx(
-          "nums px-3 py-2.5 text-right font-semibold",
-          excess === null
-            ? "text-mist-500"
-            : excess >= 0
-              ? "text-pos-500"
-              : "text-neg-500",
+          "px-2.5 py-1 text-right font-semibold",
+          excess === null ? "text-dim" : excess >= 0 ? "text-pos" : "text-neg",
         )}
       >
         {signedPct(excess)}
       </td>
 
-      <td className="nums px-3 py-2.5 text-right text-mist-200">
-        <span className="inline-flex items-center gap-1">
-          {contradicts ? (
-            <span
-              className="text-warn-500"
-              title="The calibrated probability says up while the point forecast says down. The model is biased low for this ticker; the composite refuses to rank on the cheerier half."
-            >
-              ⚠
-            </span>
-          ) : null}
-          {probability(entry.prob_outperform)}
-        </span>
+      <td className="px-2.5 py-1 text-right text-text">
+        {contradicts ? (
+          <span
+            className="mr-1 text-bar"
+            title="The calibrated probability says up while the point forecast says down. The model is biased low for this ticker; the composite refuses to rank on the cheerier half."
+          >
+            !
+          </span>
+        ) : null}
+        {probability(entry.prob_outperform)}
       </td>
 
       <td
         className={cx(
-          "nums px-3 py-2.5 text-right",
+          "px-2.5 py-1 text-right",
           entry.eval_rank_ic === null
-            ? "text-mist-500"
+            ? "text-dim"
             : entry.eval_rank_ic >= 0
-              ? "text-mist-200"
-              : "text-neg-500/90",
+              ? "text-text"
+              : "text-neg/85",
         )}
       >
         {signed(entry.eval_rank_ic)}
       </td>
 
-      <td className="nums px-3 py-2.5 text-right text-mist-300">
+      <td className="px-2.5 py-1 text-right">
         {hit === null || base === null ? (
-          "—"
+          <span className="text-dim">—</span>
         ) : (
-          <span className="inline-flex items-center gap-1">
+          <>
             {degenerate ? (
               <span
-                className="text-warn-500"
+                className="mr-1 text-bar"
                 title="Hit rate equals the majority-class baseline exactly: the model predicted one direction for every row, so it matched the baseline by never disagreeing with it."
               >
-                ≡
+                =
               </span>
             ) : null}
-            <span className={hit > base ? "text-pos-500" : "text-mist-400"}>
+            <span className={hit > base ? "text-pos" : "text-dim"}>
               {(hit - base >= 0 ? "+" : "−") + Math.abs(hit - base).toFixed(1)}
               pp
             </span>
-          </span>
+          </>
         )}
       </td>
 
-      <td className="px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-1">
+      <td className="px-2.5 py-1">
+        <span className="flex flex-wrap items-center gap-1">
           <Badge tone={evidenceTone(entry.forecast_confidence)}>
             {entry.forecast_confidence === "INSUFFICIENT"
-              ? "None"
+              ? "none"
               : (entry.forecast_confidence ?? "—")}
           </Badge>
           <Badge tone={verdictTone(entry.critic_verdict)}>
             {entry.critic_verdict ?? "—"}
           </Badge>
-        </div>
+        </span>
       </td>
 
-      <td className="px-3 py-2.5">
-        <ScoreMeter value={entry.composite_score} />
+      <td className="px-2.5 py-1">
+        <Meter value={entry.composite_score} />
       </td>
     </tr>
   );

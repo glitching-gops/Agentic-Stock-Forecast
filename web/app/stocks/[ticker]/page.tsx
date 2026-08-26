@@ -6,11 +6,13 @@ import { SignalsPanel } from "@/components/stock/signals-panel";
 import { Tabs } from "@/components/tabs";
 import {
   Badge,
-  Callout,
-  Card,
   Empty,
+  Eyebrow,
+  Note,
+  Panel,
   Prose,
-  Stat,
+  Readout,
+  SectionHead,
   evidenceTone,
   verdictTone,
 } from "@/components/ui";
@@ -59,12 +61,31 @@ export async function generateStaticParams() {
 
 export const dynamicParams = true;
 
+/**
+ * Next hands back the route segment exactly as it appears in the URL, so a
+ * ticker carrying a character that had to be escaped arrives still escaped:
+ * `M&M.NS` comes back as `M%26M.NS`. Passing that to `encodeURIComponent` in
+ * the API client escapes the percent again and requests `M%2526M.NS`, which
+ * is a ticker that does not exist.
+ *
+ * Exactly one name in the NIFTY 100 contains such a character, which is
+ * precisely why this survived every manual check — 94 of 95 pages are correct.
+ */
+function decodeTicker(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    // A malformed escape sequence is not a ticker. Let the API 404 it.
+    return raw;
+  }
+}
+
 export async function generateMetadata({
   params,
 }: {
   params: Promise<{ ticker: string }>;
 }) {
-  const { ticker } = await params;
+  const ticker = decodeTicker((await params).ticker);
   const forecast = await soft(getForecast(ticker), null);
   if (!forecast) return { title: ticker };
   return {
@@ -78,7 +99,7 @@ export default async function StockPage({
 }: {
   params: Promise<{ ticker: string }>;
 }) {
-  const { ticker } = await params;
+  const ticker = decodeTicker((await params).ticker);
 
   let forecast: Forecast;
   try {
@@ -102,26 +123,42 @@ export default async function StockPage({
     forecast.benchmark_name ?? forecast.benchmark_ticker ?? "its benchmark";
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <Link
         href="/"
-        className="inline-flex items-center gap-1.5 text-sm text-mist-400 hover:text-brand-300"
+        className="inline-flex items-center gap-1.5 text-[0.7rem] uppercase tracking-[0.14em] text-dim hover:text-bright"
       >
-        ← Leaderboard
+        ← Board
       </Link>
 
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-mist-100">
+      {/*
+        The identity block is a terminal's instrument header: the name, the
+        machine-readable key, then the two verdicts that qualify every number
+        below it. The badges sit up here rather than beside the figures they
+        govern, because they govern all of them.
+      */}
+      <header className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3 border-b border-rule-hi pb-3">
+        <div className="min-w-0">
+          <h1 className="font-display text-[1.3rem] font-bold leading-none tracking-tight text-bright">
             {forecast.company ?? forecast.ticker}
           </h1>
-          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-sm text-mist-500">
-            <span className="font-mono">{forecast.ticker}</span>
-            {forecast.sector ? <span>· {forecast.sector}</span> : null}
-            <span>· NSE</span>
+          <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.68rem] uppercase tracking-[0.12em] text-dim">
+            <span className="text-mid">{forecast.ticker}</span>
+            <span aria-hidden className="text-rule-hi">
+              /
+            </span>
+            {forecast.sector ? (
+              <>
+                <span>{forecast.sector}</span>
+                <span aria-hidden className="text-rule-hi">
+                  /
+                </span>
+              </>
+            ) : null}
+            <span>NSE</span>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           <Badge tone={evidenceTone(grade)}>
             {grade === "INSUFFICIENT" ? "No evidence" : `${grade} evidence`}
           </Badge>
@@ -132,10 +169,10 @@ export default async function StockPage({
       </header>
 
       {forecast.critic_verdict === "REJECTED" ? (
-        <Callout tone="negative" title="Rejected by the critic.">
-          This forecast did not survive review. Read the Agent review tab before
+        <Note tone="neg" title="Rejected by the critic">
+          This forecast did not survive review. Read the agent review before
           taking anything on this page at face value.
-        </Callout>
+        </Note>
       ) : null}
 
       {grade !== "STRONG" ? (
@@ -177,14 +214,16 @@ export default async function StockPage({
           {
             id: "sentiment",
             label: "Sentiment",
-            content: <SentimentPanel ticker={forecast.ticker} headlines={headlines} />,
+            content: (
+              <SentimentPanel ticker={forecast.ticker} headlines={headlines} />
+            ),
           },
           {
             id: "review",
             label: "Agent review",
             badge:
               forecast.critic_flags.length > 0 ? (
-                <span className="nums rounded bg-neg-500/15 px-1.5 text-[0.65rem] font-semibold text-neg-500">
+                <span className="border border-neg/50 px-1 text-[0.6rem] font-semibold text-neg">
                   {forecast.critic_flags.length}
                 </span>
               ) : undefined,
@@ -193,7 +232,7 @@ export default async function StockPage({
         ]}
       />
 
-      <p className="text-xs text-mist-500">
+      <p className="text-[0.68rem] uppercase tracking-[0.1em] text-dim">
         Forecast written {timestamp(forecast.last_updated)}.
         {evaluation?.evaluated_at
           ? ` Evidence last measured ${timestamp(evaluation.evaluated_at)}.`
@@ -220,10 +259,10 @@ function Overview({
 
   const direction =
     forecast.direction === "OUTPERFORM"
-      ? { symbol: "▲", tone: "positive" as const }
+      ? { symbol: "▲", cls: "text-pos" }
       : forecast.direction === "UNDERPERFORM"
-        ? { symbol: "▼", tone: "negative" as const }
-        : { symbol: "–", tone: "muted" as const };
+        ? { symbol: "▼", cls: "text-neg" }
+        : { symbol: "–", cls: "text-dim" };
 
   const contradicts =
     excess !== null &&
@@ -246,29 +285,21 @@ function Overview({
 
   return (
     <div className="space-y-6">
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat
+      <div className="grid grid-cols-1 gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-4">
+        <Readout
           label="Current price"
           value={money(forecast.current_price)}
-          tone="neutral"
-          sub={`Random-walk baseline forecast: ${money(forecast.random_walk_price)}.`}
           help="The baseline this model has to beat on magnitude is simply repeating today's price."
+          sub={`Random-walk baseline forecast: ${money(forecast.random_walk_price)}.`}
         />
 
-        <Stat
+        <Readout
           label="Implied 30-session target"
+          help="Derived from the excess-return forecast. The model says nothing about where the index itself goes."
           value={
             <span className="flex flex-wrap items-baseline gap-2">
               {money(forecast.forecast_price)}
-              <span
-                className={
-                  direction.tone === "positive"
-                    ? "text-sm text-pos-500"
-                    : direction.tone === "negative"
-                      ? "text-sm text-neg-500"
-                      : "text-sm text-mist-500"
-                }
-              >
+              <span className={`font-mono text-[0.8rem] ${direction.cls}`}>
                 {direction.symbol} {signedPct(excess)}
               </span>
             </span>
@@ -284,18 +315,18 @@ function Overview({
               performance only.
             </>
           }
-          help="Derived from the excess-return forecast. The model says nothing about where the index itself goes."
         />
 
-        <Stat
+        <Readout
           label="P(outperform)"
           value={probability(forecast.prob_outperform)}
+          help="Calibrated on out-of-sample conformal residuals."
           tone={
             (forecast.prob_outperform ?? 0.5) > 0.55
-              ? "positive"
+              ? "pos"
               : (forecast.prob_outperform ?? 0.5) < 0.45
-                ? "negative"
-                : "muted"
+                ? "neg"
+                : "dim"
           }
           sub={
             <>
@@ -306,11 +337,11 @@ function Overview({
               . 50% is a coin flip.
             </>
           }
-          help="Calibrated on out-of-sample conformal residuals."
         />
 
-        <Stat
+        <Readout
           label="Held-out evidence"
+          help="From purged walk-forward folds the model never trained on."
           value={
             forecast.forecast_confidence === "INSUFFICIENT"
               ? "NONE"
@@ -318,10 +349,10 @@ function Overview({
           }
           tone={
             forecast.forecast_confidence === "STRONG"
-              ? "positive"
+              ? "pos"
               : forecast.forecast_confidence === "WEAK"
-                ? "warning"
-                : "negative"
+                ? "bar"
+                : "neg"
           }
           sub={
             <>
@@ -331,12 +362,11 @@ function Overview({
               {pctPoints(evaluation?.baseline_hit_rate)} baseline
             </>
           }
-          help="From purged walk-forward folds the model never trained on."
         />
       </div>
 
       {contradicts ? (
-        <Callout tone="warning" title="The model contradicts itself here.">
+        <Note tone="bar" title="The model contradicts itself here">
           The point forecast predicts underperformance while the calibrated
           probability sits above a coin flip. That combination means the model
           runs biased low on this ticker rather than that it likes the stock —
@@ -344,17 +374,15 @@ function Overview({
           {signedPct(excess !== null ? -excess : null)}, not an independent
           opinion. The composite refuses to rank on the cheerier half, so this
           stock scores zero.
-        </Callout>
+        </Note>
       ) : null}
 
-      <Card className="p-4">
-        <h2 className="mb-4 text-sm font-semibold text-mist-100">
-          Price and technical indicators
-        </h2>
+      <Panel className="p-4">
+        <SectionHead as="h3" title="Price and technical indicators" />
         <PriceChart data={points} />
-      </Card>
+      </Panel>
 
-      <p className="max-w-4xl text-xs leading-relaxed text-mist-500">
+      <p className="max-w-[88ch] font-prose text-[0.8rem] leading-relaxed text-dim">
         Performance figures come from purged walk-forward validation with a
         30-session embargo — folds the model never trained on — and are stated
         before transaction costs. The evaluation runs weekly, so the evidence
@@ -383,12 +411,12 @@ function EvidenceWarning({
     hit !== null && baseline !== null && Math.abs(hit - baseline) < 1e-6;
 
   return (
-    <Callout
-      tone={grade === "WEAK" ? "warning" : "negative"}
+    <Note
+      tone={grade === "WEAK" ? "bar" : "neg"}
       title={
         grade === "WEAK"
-          ? "Weak held-out evidence."
-          : "No held-out evidence of skill."
+          ? "Weak held-out evidence"
+          : "No held-out evidence of skill"
       }
     >
       {grade === "WEAK"
@@ -412,7 +440,7 @@ function EvidenceWarning({
           a view.
         </>
       ) : null}
-    </Callout>
+    </Note>
   );
 }
 
@@ -427,7 +455,7 @@ function SentimentPanel({
 }) {
   return (
     <div className="space-y-5">
-      <Callout tone="muted" title="Not scored.">
+      <Note tone="dim" title="Not scored">
         Headlines are collected but never scored — no sentiment model runs in
         this pipeline, and sentiment is not a model input either way. It was
         removed as a feature because it existed only for the current date: zero
@@ -435,34 +463,35 @@ function SentimentPanel({
         predicted, which is a train/serve mismatch at exactly the row that
         matters. A gauge parked at neutral would claim a measurement that was
         never taken, so there is no gauge.
-      </Callout>
+      </Note>
 
       <div>
-        <h3 className="mb-3 text-sm font-semibold text-mist-100">
-          Recent headlines for {ticker}
-        </h3>
+        <SectionHead
+          as="h3"
+          title={`Recent headlines — ${ticker}`}
+          count={headlines.length || undefined}
+        />
         {headlines.length === 0 ? (
           <Empty title="No headlines stored">
             Nothing has been collected for this ticker yet.
           </Empty>
         ) : (
-          <ul className="space-y-2">
+          <ul className="border-t border-rule">
             {headlines.map((item, index) => (
-              <Card as="li" key={`${item.headline}-${index}`} className="p-3">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <span className="min-w-0 flex-1 text-sm leading-relaxed text-mist-200">
-                    {item.headline}
+              <li
+                key={`${item.headline}-${index}`}
+                className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-rule px-1 py-2"
+              >
+                <span className="min-w-0 flex-1 font-prose text-[0.84rem] leading-relaxed text-text">
+                  {item.headline}
+                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  <Badge tone="dim">{item.sentiment_label ?? "unscored"}</Badge>
+                  <span className="text-[0.7rem] text-dim">
+                    {dateOnly(item.date)}
                   </span>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <Badge tone="muted">
-                      {item.sentiment_label ?? "unscored"}
-                    </Badge>
-                    <span className="nums text-xs text-mist-500">
-                      {dateOnly(item.date)}
-                    </span>
-                  </div>
                 </div>
-              </Card>
+              </li>
             ))}
           </ul>
         )}
@@ -478,25 +507,21 @@ function AgentReview({ forecast }: { forecast: Forecast }) {
 
   return (
     <div className="space-y-6">
-      <Card className="p-4">
-        <h3 className="text-[0.68rem] font-semibold uppercase tracking-[0.09em] text-brand-400">
-          Forecasting agent · signal narrative
-        </h3>
-        <p className="mt-2.5 max-w-3xl leading-relaxed text-mist-200">
+      <Panel className="p-4">
+        <Eyebrow as="h3">Forecasting agent · signal narrative</Eyebrow>
+        <p className="mt-2.5 max-w-[80ch] font-prose text-[0.86rem] leading-relaxed text-text">
           {forecast.signal_narrative ?? "No narrative was generated."}
         </p>
-        <p className="mt-3 text-xs text-mist-500">
+        <p className="mt-3 max-w-[80ch] font-prose text-[0.78rem] leading-relaxed text-dim">
           Written from the signal snapshot alone. The model is not shown the
           forecast, and it produces, adjusts and reviews no number.
         </p>
-      </Card>
+      </Panel>
 
       <div>
-        <h3 className="mb-3 text-sm font-semibold text-mist-100">
-          Critic review
-        </h3>
+        <SectionHead as="h3" title="Critic review" />
 
-        <div className="space-y-3 border-l-2 border-ink-500 pl-5">
+        <div className="space-y-3 border-l border-rule-hi pl-5">
           <div>
             <Badge tone={verdictTone(forecast.critic_verdict)}>
               Verdict: {forecast.critic_verdict ?? "none"}
@@ -504,41 +529,36 @@ function AgentReview({ forecast }: { forecast: Forecast }) {
           </div>
 
           {forecast.critic_reasoning ? (
-            <Card className="p-3.5">
-              <div className="text-[0.68rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
-                Reasoning
-              </div>
-              <p className="mt-1.5 whitespace-pre-line leading-relaxed text-mist-200">
+            <Panel className="p-3.5">
+              <Eyebrow>Reasoning</Eyebrow>
+              <p className="mt-1.5 max-w-[80ch] whitespace-pre-line font-prose text-[0.86rem] leading-relaxed text-text">
                 {forecast.critic_reasoning}
               </p>
-            </Card>
+            </Panel>
           ) : null}
 
           {forecast.critic_flags.length > 0 ? (
             <div>
-              <div className="mb-1.5 text-[0.68rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
-                Flags raised · −5 points each
-              </div>
+              <Eyebrow className="mb-1.5">Flags raised · −5 points each</Eyebrow>
               <ul className="space-y-1.5">
                 {forecast.critic_flags.map((flag) => (
-                  <Card
-                    as="li"
+                  <li
                     key={flag}
-                    className="border-l-4 border-l-neg-500 p-3 text-sm text-mist-200"
+                    className="border-y border-l-2 border-y-rule border-l-neg bg-shell px-3 py-2 font-prose text-[0.84rem] text-text"
                   >
                     {flag}
-                  </Card>
+                  </li>
                 ))}
               </ul>
             </div>
           ) : null}
 
-          <div className="text-xs text-mist-500">
-            <span className="uppercase tracking-[0.09em]">Verdict set by</span>{" "}
-            <Badge tone="warning" className="ml-1">
+          <div className="text-[0.7rem] text-dim">
+            <Eyebrow as="span">Verdict set by</Eyebrow>{" "}
+            <Badge tone="bar" className="ml-1">
               {forecast.critic_source ?? "evidence_gate"}
             </Badge>
-            <p className="mt-2 max-w-3xl leading-relaxed">
+            <p className="mt-2 max-w-[80ch] font-prose text-[0.8rem] leading-relaxed">
               The evidence gate is deterministic and driven entirely by held-out
               walk-forward metrics. The LLM review may add flags and downgrade a
               verdict; it can never raise one. It sees numbers it has no way to

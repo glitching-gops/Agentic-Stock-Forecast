@@ -3,8 +3,17 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 
-import { Badge, Callout, Card, Stat, evidenceTone } from "@/components/ui";
-import { cx, money, probability, signed, signedPct } from "@/lib/format";
+import {
+  Badge,
+  Empty,
+  Eyebrow,
+  Note,
+  Panel,
+  Readout,
+  SectionHead,
+  evidenceTone,
+} from "@/components/ui";
+import { cx, decimal, money, probability, signed, signedPct } from "@/lib/format";
 import type { LeaderboardEntry } from "@/lib/types";
 
 /**
@@ -63,7 +72,7 @@ export function PortfolioAllocator({ entries }: { entries: LeaderboardEntry[] })
 
   return (
     <div className="space-y-6">
-      <Callout tone="warning" title="This is a ranking, not a backtested strategy.">
+      <Note tone="bar" title="This is a ranking, not a backtested strategy">
         Nothing here is a portfolio simulation. No transaction costs (an Indian
         delivery round trip runs roughly 30–60 bps before market impact), no
         slippage, no liquidity limits, no T+1 settlement and no benchmark
@@ -72,13 +81,11 @@ export function PortfolioAllocator({ entries }: { entries: LeaderboardEntry[] })
         of the roadmap. Until it exists,{" "}
         <strong>nothing on this page has been shown to make money.</strong>{" "}
         <Link href="/methodology">What is actually measured →</Link>
-      </Callout>
+      </Note>
 
-      <Card className="flex flex-wrap items-end gap-6 p-4">
-        <label className="flex-1 min-w-64">
-          <span className="text-[0.65rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
-            Positions
-          </span>
+      <Panel className="flex flex-wrap items-end gap-x-8 gap-y-4 px-4 py-3">
+        <label className="min-w-64 flex-1">
+          <Eyebrow as="span">Positions</Eyebrow>
           <div className="mt-2 flex items-center gap-3">
             <input
               type="range"
@@ -87,11 +94,9 @@ export function PortfolioAllocator({ entries }: { entries: LeaderboardEntry[] })
               step={1}
               value={size}
               onChange={(e) => setSize(Number(e.target.value))}
-              className="h-1 flex-1 cursor-pointer appearance-none rounded-full bg-ink-500 accent-[var(--color-brand-500)]"
+              className="h-px flex-1 cursor-pointer appearance-none bg-rule-hi accent-[var(--color-bright)]"
             />
-            <span className="nums w-6 text-sm font-semibold text-mist-100">
-              {size}
-            </span>
+            <span className="w-6 text-[0.8rem] text-bright">{size}</span>
           </div>
         </label>
 
@@ -100,140 +105,118 @@ export function PortfolioAllocator({ entries }: { entries: LeaderboardEntry[] })
             type="checkbox"
             checked={includeUnranked}
             onChange={(e) => setIncludeUnranked(e.target.checked)}
-            className="mt-0.5 h-4 w-4 accent-[var(--color-brand-500)]"
+            className="mt-0.5 h-3.5 w-3.5 accent-[var(--color-bright)]"
           />
-          <span className="max-w-xs text-xs leading-relaxed text-mist-400">
-            Include reviewed stocks that score{" "}
-            <span className="nums">0.0</span> — they failed the evidence gate or
-            are not long candidates.
+          <span className="max-w-xs font-prose text-[0.78rem] leading-relaxed text-dim">
+            Include reviewed stocks that score <span>0.0</span> — they failed the
+            evidence gate or are not long candidates.
           </span>
         </label>
-      </Card>
+      </Panel>
 
       {holdings.length === 0 ? (
-        <Card className="px-6 py-10 text-center">
-          <div className="text-sm font-semibold text-mist-300">
-            No stock currently qualifies.
-          </div>
-          <p className="mx-auto mt-2 max-w-md text-sm text-mist-500">
-            Nothing clears the evidence gate with a positive forecast and a
-            passing critic verdict, so there is no allocation to make. Tick the
-            box above to see what an unfiltered top-{size} would have contained.
-          </p>
-        </Card>
+        <Empty title="No stock currently qualifies">
+          Nothing clears the evidence gate with a positive forecast and a
+          passing critic verdict, so there is no allocation to make. Tick the
+          box above to see what an unfiltered top-{size} would have contained.
+        </Empty>
       ) : (
         <>
           {holdings.length < size ? (
-            <Callout tone="muted">
+            <Note tone="dim">
               Only {holdings.length} of the requested {size} positions could be
               filled — the candidate pool is that small.
-            </Callout>
+            </Note>
           ) : null}
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <Stat
+          <div className="grid grid-cols-1 gap-x-6 gap-y-5 sm:grid-cols-2 xl:grid-cols-4">
+            <Readout
               label="Positions"
               value={holdings.length}
               sub={`Equal weight, ${weight.toFixed(1)}% each.`}
             />
-            <Stat
+            <Readout
               label="Weighted excess signal"
               value={signedPct(weightedExcess)}
-              tone={weightedExcess >= 0 ? "positive" : "negative"}
-              sub="Average predicted 30-session return relative to each stock's own benchmark. NOT an expected portfolio return."
+              tone={weightedExcess >= 0 ? "pos" : "neg"}
               help="Excludes market direction entirely, along with costs and slippage."
+              sub="Average predicted 30-session return relative to each stock's own benchmark. NOT an expected portfolio return."
             />
-            <Stat
+            <Readout
               label="Mean rank IC"
               value={signed(meanIc)}
-              tone={meanIc > 0 ? "positive" : "negative"}
+              tone={meanIc > 0 ? "pos" : "neg"}
               sub="Out-of-sample. 0 means no skill."
             />
-            <Stat
+            <Readout
               label="Strong evidence"
-              value={`${strong} of ${holdings.length}`}
-              tone={strong === 0 ? "muted" : "positive"}
+              value={`${strong} / ${holdings.length}`}
+              tone={strong === 0 ? "dim" : "pos"}
               sub="Passed all three held-out checks."
             />
           </div>
 
-          <div className="overflow-x-auto rounded-xl border border-ink-500/70">
-            <table className="w-full min-w-[840px] border-collapse text-sm">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[840px] border-collapse text-[0.76rem]">
               <thead>
-                <tr className="border-b border-ink-500/70 bg-ink-800/70 text-left">
-                  <th className="px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Stock
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Price
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Implied target
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Excess
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    P(out)
-                  </th>
-                  <th className="px-3 py-2.5 text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Evidence
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Score
-                  </th>
-                  <th className="px-3 py-2.5 text-right text-[0.68rem] font-semibold uppercase tracking-[0.07em] text-mist-500">
-                    Weight
-                  </th>
+                <tr className="bg-inset text-left">
+                  <Th>Stock</Th>
+                  <Th align="right">Price</Th>
+                  <Th align="right">Implied target</Th>
+                  <Th align="right">Excess</Th>
+                  <Th align="right">P(out)</Th>
+                  <Th>Evidence</Th>
+                  <Th align="right">Score</Th>
+                  <Th align="right">Weight</Th>
                 </tr>
               </thead>
               <tbody>
                 {holdings.map((holding) => (
                   <tr
                     key={holding.ticker}
-                    className="border-b border-ink-500/40 last:border-b-0 hover:bg-ink-600/40"
+                    className="border-b border-rule/70 hover:bg-raise"
                   >
-                    <td className="px-3 py-2.5">
+                    <td className="px-2 py-1.5">
                       <Link
                         href={`/stocks/${holding.ticker}`}
-                        className="font-medium text-mist-100 hover:text-brand-300"
+                        className="text-bright hover:underline"
                       >
                         {holding.company ?? holding.ticker}
                       </Link>
-                      <div className="text-xs text-mist-500">
+                      <div className="text-[0.68rem] text-dim">
                         {holding.sector ?? "—"}
                       </div>
                     </td>
-                    <td className="nums px-3 py-2.5 text-right text-mist-200">
+                    <td className="px-2 py-1.5 text-right text-text">
                       {money(holding.current_price)}
                     </td>
-                    <td className="nums px-3 py-2.5 text-right text-mist-300">
+                    <td className="px-2 py-1.5 text-right text-mid">
                       {money(holding.forecast_price)}
                     </td>
                     <td
                       className={cx(
-                        "nums px-3 py-2.5 text-right font-semibold",
+                        "px-2 py-1.5 text-right",
                         (holding.pred_excess_return ?? 0) >= 0
-                          ? "text-pos-500"
-                          : "text-neg-500",
+                          ? "text-pos"
+                          : "text-neg",
                       )}
                     >
                       {signedPct(holding.pred_excess_return)}
                     </td>
-                    <td className="nums px-3 py-2.5 text-right text-mist-200">
+                    <td className="px-2 py-1.5 text-right text-text">
                       {probability(holding.prob_outperform)}
                     </td>
-                    <td className="px-3 py-2.5">
+                    <td className="px-2 py-1.5">
                       <Badge tone={evidenceTone(holding.forecast_confidence)}>
                         {holding.forecast_confidence === "INSUFFICIENT"
                           ? "None"
                           : (holding.forecast_confidence ?? "—")}
                       </Badge>
                     </td>
-                    <td className="nums px-3 py-2.5 text-right text-mist-300">
-                      {(holding.composite_score ?? 0).toFixed(1)}
+                    <td className="px-2 py-1.5 text-right text-mid">
+                      {decimal(holding.composite_score ?? 0, 1)}
                     </td>
-                    <td className="nums px-3 py-2.5 text-right font-semibold text-mist-100">
+                    <td className="px-2 py-1.5 text-right text-bright">
                       {weight.toFixed(1)}%
                     </td>
                   </tr>
@@ -242,31 +225,48 @@ export function PortfolioAllocator({ entries }: { entries: LeaderboardEntry[] })
             </table>
           </div>
 
-          <Card className="p-4">
-            <h2 className="mb-3 text-sm font-semibold text-mist-100">
-              Sector allocation
-            </h2>
-            <ul className="space-y-2">
+          <section>
+            <SectionHead as="h2" title="Sector allocation" />
+            <ul className="space-y-1.5">
               {sectors.map(([sector, pct]) => (
                 <li key={sector} className="flex items-center gap-3">
-                  <span className="w-52 shrink-0 truncate text-xs text-mist-400">
+                  <span className="w-52 shrink-0 truncate text-[0.72rem] text-dim">
                     {sector}
                   </span>
-                  <div className="h-2 flex-1 overflow-hidden rounded-full bg-ink-600">
+                  <div className="h-[5px] flex-1 bg-inset">
                     <div
-                      className="h-full rounded-full bg-brand-500"
+                      className="h-full bg-bright"
                       style={{ width: `${pct}%` }}
                     />
                   </div>
-                  <span className="nums w-12 shrink-0 text-right text-xs font-semibold text-mist-200">
+                  <span className="w-12 shrink-0 text-right text-[0.72rem] text-text">
                     {pct.toFixed(1)}%
                   </span>
                 </li>
               ))}
             </ul>
-          </Card>
+          </section>
         </>
       )}
     </div>
+  );
+}
+
+function Th({
+  children,
+  align = "left",
+}: {
+  children: React.ReactNode;
+  align?: "left" | "right";
+}) {
+  return (
+    <th
+      className={cx(
+        "border-y border-rule px-2 py-1",
+        align === "right" ? "text-right" : "text-left",
+      )}
+    >
+      <Eyebrow as="span">{children}</Eyebrow>
+    </th>
   );
 }

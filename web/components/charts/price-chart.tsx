@@ -42,11 +42,46 @@ const WINDOWS = [
   { label: "1Y", sessions: 252 },
 ] as const;
 
+/*
+ * The chart is monochrome, and the series separate by DASH PATTERN and weight
+ * rather than by hue.
+ *
+ * That is a palette decision, not a stylistic one. Amber means "a threshold",
+ * jade and coral mean "a realised move up or down"; a moving average is none
+ * of those, so giving one a colour here would spend a reserved hue on a line
+ * that carries no such claim. Four greys plus four dash patterns separate
+ * cleanly at this line weight, and the legend prints the pattern rather than
+ * naming it.
+ */
 const SERIES = [
-  { key: "close", label: "Close", color: "var(--color-brand-400)", width: 2 },
-  { key: "sma_20", label: "SMA-20", color: "var(--color-warn-500)", width: 1.25 },
-  { key: "ema_21", label: "EMA-21", color: "var(--color-mist-300)", width: 1.25 },
-  { key: "ema_50", label: "EMA-50", color: "var(--color-mist-500)", width: 1.25 },
+  {
+    key: "close",
+    label: "Close",
+    color: "var(--color-bright)",
+    width: 1.75,
+    dash: undefined,
+  },
+  {
+    key: "sma_20",
+    label: "SMA-20",
+    color: "var(--color-mid)",
+    width: 1,
+    dash: "5 3",
+  },
+  {
+    key: "ema_21",
+    label: "EMA-21",
+    color: "var(--color-mid)",
+    width: 1,
+    dash: "1 3",
+  },
+  {
+    key: "ema_50",
+    label: "EMA-50",
+    color: "var(--color-dim)",
+    width: 1,
+    dash: "7 3 1 3",
+  },
 ] as const;
 
 export function PriceChart({ data }: { data: PricePoint[] }) {
@@ -56,19 +91,21 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
 
   if (view.length === 0) {
     return (
-      <p className="px-4 py-8 text-center text-sm text-mist-500">
+      <p className="px-4 py-8 text-center text-[0.78rem] text-dim">
         No price history is stored for this stock.
       </p>
     );
   }
 
-  const available = WINDOWS.filter((w, i) => i === 0 || data.length > w.sessions * 0.6);
+  const available = WINDOWS.filter(
+    (w, i) => i === 0 || data.length > w.sessions * 0.6,
+  );
 
   return (
     <div>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <Legend />
-        <div className="flex gap-1">
+        <div className="flex gap-px">
           {available.map((w) => {
             const index = WINDOWS.indexOf(w);
             return (
@@ -77,10 +114,10 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
                 type="button"
                 onClick={() => setWindowIndex(index)}
                 className={cx(
-                  "rounded-md px-2 py-1 text-xs font-semibold transition-colors",
+                  "px-2 py-0.5 text-[0.7rem] uppercase tracking-[0.1em] transition-colors",
                   index === windowIndex
-                    ? "bg-ink-600 text-mist-100"
-                    : "text-mist-500 hover:bg-ink-700 hover:text-mist-300",
+                    ? "inv font-semibold"
+                    : "text-dim hover:bg-raise hover:text-text",
                 )}
               >
                 {w.label}
@@ -92,14 +129,20 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
 
       <ResponsiveContainer width="100%" height={320}>
         <ComposedChart data={view} syncId="price" margin={CHART_MARGIN}>
-          <CartesianGrid stroke="var(--color-ink-500)" strokeOpacity={0.5} vertical={false} />
+          <CartesianGrid
+            stroke="var(--color-rule)"
+            strokeOpacity={0.8}
+            vertical={false}
+          />
           {/* Both panels share one x-axis via syncId; only the lower one labels it. */}
           <XAxis dataKey="date" {...X_AXIS} tick={false} height={0} />
           <YAxis
             {...Y_AXIS}
             domain={["auto", "auto"]}
             width={62}
-            tickFormatter={(v: number) => `₹${Math.round(v).toLocaleString("en-IN")}`}
+            tickFormatter={(v: number) =>
+              `₹${Math.round(v).toLocaleString("en-IN")}`
+            }
           />
           <Tooltip content={<PriceTooltip />} cursor={CURSOR} />
 
@@ -107,8 +150,8 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
           <Area
             dataKey="bb"
             stroke="none"
-            fill="var(--color-brand-500)"
-            fillOpacity={0.08}
+            fill="var(--color-rule-hi)"
+            fillOpacity={0.45}
             isAnimationActive={false}
             connectNulls
             activeDot={false}
@@ -122,7 +165,7 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
               name={series.label}
               stroke={series.color}
               strokeWidth={series.width}
-              strokeDasharray={series.key === "close" ? undefined : "4 3"}
+              strokeDasharray={series.dash}
               dot={false}
               isAnimationActive={false}
               connectNulls
@@ -131,7 +174,7 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
         </ComposedChart>
       </ResponsiveContainer>
 
-      <div className="mt-1 text-[0.68rem] font-semibold uppercase tracking-[0.09em] text-mist-500">
+      <div className="mt-1 text-[0.64rem] font-medium uppercase tracking-[0.16em] text-dim">
         On-balance volume
       </div>
       <ResponsiveContainer width="100%" height={96}>
@@ -151,10 +194,10 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
             type="monotone"
             dataKey="obv"
             name="OBV"
-            stroke="var(--color-mist-400)"
-            strokeWidth={1.25}
-            fill="var(--color-mist-400)"
-            fillOpacity={0.1}
+            stroke="var(--color-mid)"
+            strokeWidth={1}
+            fill="var(--color-mid)"
+            fillOpacity={0.09}
             isAnimationActive={false}
             connectNulls
             activeDot={false}
@@ -166,18 +209,18 @@ export function PriceChart({ data }: { data: PricePoint[] }) {
 }
 
 const CHART_MARGIN = { top: 8, right: 8, bottom: 0, left: 0 };
-const CURSOR = { stroke: "var(--color-ink-400)", strokeWidth: 1 };
+const CURSOR = { stroke: "var(--color-rule-hi)", strokeWidth: 1 };
 
 const X_AXIS = {
-  tick: { fill: "var(--color-mist-500)", fontSize: 11 },
+  tick: { fill: "var(--color-dim)", fontSize: 10 },
   tickLine: false,
-  axisLine: { stroke: "var(--color-ink-500)" },
+  axisLine: { stroke: "var(--color-rule)" },
   minTickGap: 48,
   tickFormatter: (value: string) => dateOnly(value),
 } as const;
 
 const Y_AXIS = {
-  tick: { fill: "var(--color-mist-500)", fontSize: 11 },
+  tick: { fill: "var(--color-dim)", fontSize: 10 },
   tickLine: false,
   axisLine: false,
 } as const;
@@ -195,10 +238,35 @@ function TooltipShell({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-lg border border-ink-500 bg-ink-800/95 px-3 py-2 text-xs shadow-xl">
-      <div className="mb-1.5 font-semibold text-mist-300">{label}</div>
+    <div className="border border-rule-hi bg-shell px-3 py-2 text-[0.72rem] shadow-2xl shadow-black/70">
+      <div className="mb-1.5 uppercase tracking-[0.12em] text-dim">{label}</div>
       {children}
     </div>
+  );
+}
+
+/** A legend swatch that draws the series' own dash pattern rather than a hue. */
+function Stroke({
+  color,
+  dash,
+  width,
+}: {
+  color: string;
+  dash?: string;
+  width: number;
+}) {
+  return (
+    <svg aria-hidden width="18" height="4" className="shrink-0 overflow-visible">
+      <line
+        x1="0"
+        y1="2"
+        x2="18"
+        y2="2"
+        stroke={color}
+        strokeWidth={width}
+        strokeDasharray={dash}
+      />
+    </svg>
   );
 }
 
@@ -208,23 +276,21 @@ function PriceTooltip({ active, payload }: TooltipProps) {
 
   return (
     <TooltipShell label={dateOnly(point.date)}>
-      <dl className="nums space-y-0.5">
+      <dl className="space-y-0.5">
         {SERIES.map((series) => (
           <div key={series.key} className="flex items-center gap-3">
-            <span
-              aria-hidden
-              className="h-0.5 w-3 shrink-0 rounded"
-              style={{ backgroundColor: series.color }}
+            <Stroke
+              color={series.color}
+              dash={series.dash}
+              width={series.width}
             />
-            <dt className="flex-1 text-mist-500">{series.label}</dt>
-            <dd className="font-medium text-mist-100">
-              {money(point[series.key])}
-            </dd>
+            <dt className="flex-1 text-dim">{series.label}</dt>
+            <dd className="text-bright">{money(point[series.key])}</dd>
           </div>
         ))}
         {point.bb ? (
-          <div className="flex items-center gap-3 pt-1 text-mist-500">
-            <span aria-hidden className="w-3 shrink-0" />
+          <div className="flex items-center gap-3 pt-1 text-dim">
+            <span aria-hidden className="w-[18px] shrink-0" />
             <dt className="flex-1">Bollinger</dt>
             <dd>
               {money(point.bb[0])} – {money(point.bb[1])}
@@ -241,11 +307,9 @@ function ObvTooltip({ active, payload }: TooltipProps) {
   if (!point) return null;
   return (
     <TooltipShell label={dateOnly(point.date)}>
-      <div className="nums flex gap-3">
-        <span className="text-mist-500">On-balance volume</span>
-        <span className="font-medium text-mist-100">
-          {compactNumber(point.obv)}
-        </span>
+      <div className="flex gap-3">
+        <span className="text-dim">On-balance volume</span>
+        <span className="text-bright">{compactNumber(point.obv)}</span>
       </div>
     </TooltipShell>
   );
@@ -253,22 +317,17 @@ function ObvTooltip({ active, payload }: TooltipProps) {
 
 function Legend() {
   return (
-    <ul className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-mist-400">
+    <ul className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.7rem] text-dim">
       {SERIES.map((series) => (
         <li key={series.key} className="flex items-center gap-1.5">
-          <span
-            aria-hidden
-            className="h-0.5 w-4 rounded"
-            style={{ backgroundColor: series.color }}
-          />
+          <Stroke color={series.color} dash={series.dash} width={series.width} />
           {series.label}
         </li>
       ))}
       <li className="flex items-center gap-1.5">
         <span
           aria-hidden
-          className="h-2.5 w-4 rounded-sm"
-          style={{ backgroundColor: "color-mix(in srgb, var(--color-brand-500) 20%, transparent)" }}
+          className="h-2.5 w-[18px] shrink-0 bg-rule-hi opacity-45"
         />
         Bollinger band
       </li>
