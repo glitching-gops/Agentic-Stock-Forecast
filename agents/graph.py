@@ -29,10 +29,8 @@ from sqlalchemy import bindparam, text
 from agents.critic_agent import critic_node
 from agents.external_data_agent import external_data_node
 from agents.forecasting_agent import forecasting_node
-from agents.state import AgentState
+from agents.state import EVIDENCE_MULTIPLIER, AgentState
 from agents.trading_data_agent import trading_data_node
-
-EVIDENCE_MULTIPLIER = {"STRONG": 1.0, "WEAK": 0.5, "INSUFFICIENT": 0.0}
 
 # Refuse to prune more of the leaderboard than this in one run. See
 # prune_leaderboard().

@@ -1,5 +1,15 @@
 from typing import Any, List, Optional, TypedDict
 
+# How much of a composite score survives each evidence grade.
+#
+# It lives HERE, rather than beside the scoring function that applies it,
+# because two things depend on it and they must not be able to disagree:
+# graph.compute_composite_score multiplies by it, and critic_node reads it to
+# decide whether the LLM review is worth making an API call for. A second copy
+# of "INSUFFICIENT means zero" would let one of them drift — the gate would keep
+# skipping names that had started to score, and nothing would raise.
+EVIDENCE_MULTIPLIER = {"STRONG": 1.0, "WEAK": 0.5, "INSUFFICIENT": 0.0}
+
 
 class AgentState(TypedDict, total=False):
     """

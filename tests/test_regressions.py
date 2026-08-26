@@ -857,6 +857,75 @@ def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
     }
 
 
+def test_the_llm_is_not_called_where_its_flags_cannot_change_anything():
+    """
+    95 Groq calls a day, 91 of them arithmetically incapable of moving a figure.
+
+    A flag reaches the leaderboard through exactly two paths and an INSUFFICIENT
+    grade closes both: the verdict downgrade only applies to APPROVED (which
+    needs STRONG, and the live board holds none), and the composite multiplies
+    by EVIDENCE_MULTIPLIER — 0.0 here — before deducting 5 points per flag.
+
+    So this is not a cost optimisation that trades accuracy for spend. It is
+    provably free, and the assertion below is the proof rather than a claim.
+    """
+    from agents import critic_agent as ca
+    from agents.graph import compute_composite_score
+
+    # The proof: for a grade that scores zero, flags are arithmetically inert.
+    for n_flags in (0, 1, 5, 100):
+        assert compute_composite_score(
+            pred_excess_return=0.05, evidence_grade="INSUFFICIENT",
+            prob_outperform=0.9, n_flags=n_flags) == 0.0
+
+    calls: list[str] = []
+
+    def _spy(state, ticker):
+        calls.append(ticker)
+        return ["SIGNAL CONFLICT"], "spy"
+
+    original_review = ca._llm_review
+    original_grade = ca.grade_evidence
+    ca._llm_review = _spy
+    try:
+        ca.grade_evidence = lambda st: ("INSUFFICIENT", ["no held-out evidence"])
+        skipped = ca.critic_node({"ticker": "NOSKILL.NS"})
+
+        ca.grade_evidence = lambda st: ("WEAK", ["ic and hit rate"])
+        reviewed = ca.critic_node({"ticker": "CANBK.NS"})
+    finally:
+        ca._llm_review = original_review
+        ca.grade_evidence = original_grade
+
+    assert calls == ["CANBK.NS"], (
+        f"the LLM must run only where a flag can change the row; called for "
+        f"{calls}")
+
+    # A skipped step that says nothing reads as a step that ran and found
+    # nothing wrong.
+    assert "skipped" in skipped["critic_reasoning"].lower()
+    assert skipped["critic_flags"] == []
+    assert skipped["critic_verdict"] == "REJECTED"
+
+    # And the reviewed row still takes the flags it was given.
+    assert reviewed["critic_flags"] == ["SIGNAL CONFLICT"]
+    assert reviewed["critic_source"] == "evidence_gate+llm_flags"
+
+
+def test_the_gate_and_the_score_read_the_same_multiplier():
+    """
+    Two copies of "INSUFFICIENT means zero" would be one untestable guard.
+
+    If the gate held its own literal, raising INSUFFICIENT's multiplier above
+    zero would start scoring those rows while the LLM silently kept skipping
+    them — a real change in what is published, with nothing raising.
+    """
+    from agents import critic_agent, graph, state
+
+    assert critic_agent.EVIDENCE_MULTIPLIER is state.EVIDENCE_MULTIPLIER
+    assert graph.EVIDENCE_MULTIPLIER is state.EVIDENCE_MULTIPLIER
+
+
 def test_weak_evidence_requires_two_independent_checks():
     """
     WEAK used to need ONE of three checks, so the +0.02 rank-IC floor alone

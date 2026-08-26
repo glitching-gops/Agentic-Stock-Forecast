@@ -17,7 +17,10 @@ Phase 0 splits the two jobs and makes both auditable:
                       raise it.
 
   ``critic_node``     The LLM reviews signal coherence and may add flags. Its
-                      flags are stored separately, and it can only downgrade.
+                      flags are stored separately, and it can only downgrade —
+                      so it is called only for grades that actually score. A
+                      flag on an INSUFFICIENT row cannot move anything: the
+                      composite multiplies by 0.0 before the deduction.
 
 That asymmetry is deliberate: the LLM sees numbers it has no way to verify, so
 it is allowed to raise doubt but never to certify.
@@ -36,7 +39,7 @@ import re
 from dotenv import load_dotenv
 
 from agents.llm import DEFAULT_GROQ_MODEL, groq_client
-from agents.state import AgentState
+from agents.state import EVIDENCE_MULTIPLIER, AgentState
 
 load_dotenv(override=True)
 
@@ -237,11 +240,40 @@ Respond ONLY with JSON:
 def critic_node(state: AgentState) -> dict:
     """
     Grades held-out evidence, then lets the LLM add flags that can only downgrade.
+
+    The LLM is called only where a flag could change the published row. See the
+    comment below for why that is arithmetic rather than an optimisation.
     """
     ticker = state["ticker"]
 
     grade, reasons = grade_evidence(dict(state))
-    flags, llm_reasoning = _llm_review(dict(state), ticker)
+
+    # THE LLM ONLY RUNS WHERE ITS OUTPUT CAN CHANGE A NUMBER.
+    #
+    # Flags reach the published leaderboard through exactly two paths, and both
+    # are closed for an INSUFFICIENT grade:
+    #
+    #   verdict   flags can only downgrade APPROVED, and APPROVED requires
+    #             STRONG. On 2026-08-25 the live board held 0 APPROVED and
+    #             4 FLAGGED against 91 REJECTED, so this branch was dead.
+    #   score     compute_composite_score multiplies by EVIDENCE_MULTIPLIER
+    #             before deducting 5 points per flag, and the multiplier is
+    #             0.0 for INSUFFICIENT. Zero times anything, less a deduction,
+    #             floored at zero, is zero however many flags are raised.
+    #
+    # So this was 95 Groq calls a day of which 91 were arithmetically incapable
+    # of moving a published figure. Skipping them changes no score — that is
+    # provable from the line above, not an empirical claim — and the gate reads
+    # the SAME multiplier the score uses, so the two cannot drift apart.
+    if EVIDENCE_MULTIPLIER.get(grade, 0.0) > 0.0:
+        flags, llm_reasoning = _llm_review(dict(state), ticker)
+    else:
+        # Recorded, not silent. A skipped step that says nothing reads as a step
+        # that ran and found nothing wrong.
+        flags = []
+        llm_reasoning = (f"LLM signal review skipped: evidence grade {grade} "
+                         f"scores zero, so no flag it raised could change this "
+                         f"row.")
 
     # Map evidence grade to a verdict, then apply LLM flags as a downgrade only.
     verdict = {"STRONG": "APPROVED", "WEAK": "FLAGGED", "INSUFFICIENT": "REJECTED"}[grade]
