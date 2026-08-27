@@ -103,11 +103,14 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--package", required=True)
     ap.add_argument("--model", default="NeoQuasar/Kronos-base")
-    ap.add_argument("--samples", type=int, default=8,
-                    help="sampled paths per row. NOT optional: one draw from a "
-                         "30-step autoregressive sampler is a path, not an "
-                         "estimate. Measured at 1 sample the predicted "
-                         "cross-sectional SD is ~2x the target's.")
+    ap.add_argument("--samples", type=int, default=2,
+                    help="sampled paths per row. One draw from a 30-step "
+                         "autoregressive sampler is a path, not an estimate - "
+                         "but MEASURED, the dispersion stops falling after 2: "
+                         "predicted cross-sectional SD 0.191 / 0.177 / 0.178 at "
+                         "1 / 2 / 4 paths against a target SD of 0.079. The "
+                         "spread is what Kronos predicts, not sampling noise "
+                         "being averaged away, so more paths buy nothing.")
     ap.add_argument("--batch-samples", type=int, default=2,
                     help="paths per forward batch. MEMORY scales with this: "
                          "measured 2.68 GiB for 90 series at context 512 with "
@@ -123,6 +126,13 @@ def main() -> int:
     ap.add_argument("--out", default="/kaggle/working/kronos_predictions.npz")
     ap.add_argument("--limit-dates", type=int, default=None,
                     help="smoke test: score only the first N rebalance dates")
+    ap.add_argument("--checkpoint-every", type=int, default=5,
+                    help="write the output file every N dates. A four-hour run "
+                         "that writes only at the end loses everything to a "
+                         "wall-clock kill; this project has already lost a "
+                         "two-hour comparator table exactly that way. Rows not "
+                         "yet reached stay NaN, and score_kronos drops them and "
+                         "reports the coverage rather than scoring them as 0.")
     ap.add_argument("--kronos-src", default=None,
                     help="directory containing the `model` package. Skips the "
                          "pinned clone; used to smoke-test this script locally "
@@ -178,6 +188,31 @@ def main() -> int:
     # log space — stays a decision made at home where it is under test.
     terminal = np.full((len(row_date), args.samples), np.nan, dtype=np.float64)
 
+    def save(dates_done: int) -> None:
+        """
+        Written to a temporary name and moved into place.
+
+        A kill part-way through a compressed write would otherwise leave a
+        truncated file where a valid partial one used to be — turning a
+        checkpoint into a way of losing MORE than not checkpointing at all.
+        """
+        tmp = args.out + ".partial.npz"
+        np.savez_compressed(
+            tmp,
+            terminal=terminal,
+            row_index=np.arange(len(row_date), dtype=np.int32),
+            run=np.array([json.dumps({
+                "model": args.model, "context": context,
+                "samples": args.samples, "batch_samples": args.batch_samples,
+                "seed": args.seed, "temperature": args.temperature,
+                "top_p": args.top_p, "chunks": chunks, "device": device,
+                "seconds": round(time.time() - started, 1),
+                "dates_scored": dates_done,
+                "dates_requested": len(unique_dates),
+                "package_meta": meta,
+            })], dtype=object))
+        os.replace(tmp, args.out)
+
     started = time.time()
     for step, as_of in enumerate(unique_dates):
         picked = np.flatnonzero(row_date == as_of)
@@ -212,27 +247,18 @@ def main() -> int:
                     float(frame["close"].iloc[-1])
             filled += chunk
 
-        if step % 5 == 0 or step == len(unique_dates) - 1:
-            done = step + 1
+        done = step + 1
+        if args.checkpoint_every and (done % args.checkpoint_every == 0
+                                      or done == len(unique_dates)):
+            save(done)
+
+        if step % 5 == 0 or done == len(unique_dates):
             rate = (time.time() - started) / done
             print(f"  {done}/{len(unique_dates)} dates | {rate:.1f} s/date | "
                   f"eta {rate * (len(unique_dates) - done) / 60:.0f} min",
                   flush=True)
 
-    np.savez_compressed(
-        args.out,
-        terminal=terminal,
-        row_index=np.arange(len(row_date), dtype=np.int32),
-        run=np.array([json.dumps({
-            "model": args.model, "context": context, "samples": args.samples,
-            "batch_samples": args.batch_samples, "seed": args.seed,
-            "temperature": args.temperature, "top_p": args.top_p,
-            "chunks": chunks, "device": device,
-            "seconds": round(time.time() - started, 1),
-            "dates_scored": len(unique_dates),
-            "package_meta": meta,
-        })], dtype=object),
-    )
+    save(len(unique_dates))
     print(f"\n  wrote {args.out} in {(time.time() - started) / 60:.1f} min")
     print("  Download it and run: python tools/score_kronos.py "
           f"--predictions <file> --package {os.path.basename(args.package)}")
