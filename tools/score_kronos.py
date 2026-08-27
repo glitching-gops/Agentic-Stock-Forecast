@@ -79,11 +79,39 @@ def load_run(path: str, package) -> tuple[pd.DataFrame, dict]:
     # with dispersion, which is the very quantity the sampling reduces. Each
     # column of `terminal` is one path's terminal price, repeated per chunk
     # member, so a plain mean over columns is already weighted correctly.
+    # NEVER ATTEMPTED IS NOT THE SAME AS ABSTAINED, AND THE DIFFERENCE MATTERS.
+    #
+    # The notebook initialises `terminal` to NaN and fills what it scores, so an
+    # ALL-NaN row is one it never reached — a truncated run, a --limit-dates
+    # smoke test, a session that hit the wall clock. Those rows are not part of
+    # the sample and are dropped.
+    #
+    # A row with finite samples whose forecast is unusable (a decode to a
+    # non-positive price, a non-positive anchor) IS part of the sample, and
+    # predicts no excess return — the same claim the `zero` floor makes, so it
+    # cannot flatter this comparator against the floor it is measured against.
+    #
+    # Filling both with 0.0 is the ChronosProbe defect in a new place: a run
+    # that scored 1 of 63 rebalances reported MAE 0.06705 against a floor of
+    # 0.06532, which reads as a genuine near-floor null and is 98% the zero
+    # prediction.
+    attempted = np.isfinite(terminal).any(axis=1)
+
     with np.errstate(divide="ignore", invalid="ignore"):
         log_terminal = np.where(terminal > 0, np.log(terminal), np.nan)
-    mean_log = np.nanmean(log_terminal, axis=1)
 
-    y_pred = mean_log - np.log(np.where(anchor > 0, anchor, np.nan))
+    # Summed explicitly rather than by nanmean, which warns "Mean of empty
+    # slice" on every abstention. A warning that fires routinely is a warning
+    # nobody reads.
+    usable = np.isfinite(log_terminal)
+    n_usable = usable.sum(axis=1)
+    total = np.where(usable, log_terminal, 0.0).sum(axis=1)
+
+    mean_log = np.where(n_usable > 0, total / np.maximum(n_usable, 1), np.nan)
+    mean_log = np.where(attempted, mean_log, np.nan)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        y_pred = mean_log - np.log(np.where(anchor > 0, anchor, np.nan))
 
     frame = pd.DataFrame({
         "date": [str(d) for d in package["row_date"][row_index]],
@@ -91,16 +119,18 @@ def load_run(path: str, package) -> tuple[pd.DataFrame, dict]:
         "fold": package["row_fold"].astype(int)[row_index],
         "y_true": package["row_target"].astype(float)[row_index],
         "y_pred": y_pred,
+        "attempted": attempted,
     })
 
-    dropped = int(frame["y_pred"].isna().sum())
-    if dropped:
-        # An abstention predicts no excess return, the same claim the `zero`
-        # floor makes, so it cannot flatter this comparator against the floor
-        # it is measured against. Counted, because a silent one is
-        # indistinguishable from a genuine null.
-        frame["y_pred"] = frame["y_pred"].fillna(0.0)
-    run["abstentions"] = dropped
+    not_scored = int((~frame["attempted"]).sum())
+    frame = frame[frame["attempted"]].drop(columns="attempted").reset_index(drop=True)
+
+    abstained = int(frame["y_pred"].isna().sum())
+    frame["y_pred"] = frame["y_pred"].fillna(0.0)
+
+    run["abstentions"] = abstained
+    run["not_scored"] = not_scored
+    run["rows_scored"] = len(frame)
     return frame, run
 
 
@@ -159,9 +189,26 @@ def main() -> int:
         print(f"  restricted to {len(keep_dates)} dates from "
               f"{os.path.basename(args.only_dates_from)}")
 
+    total_rows = len(package["row_date"])
     summary = []
     for path in args.predictions:
         frame, run = load_run(path, package)
+
+        if run["not_scored"]:
+            # Loud, and it names the shortfall as a COVERAGE fact rather than
+            # letting it be absorbed into the metrics below. A run that covered
+            # a fraction of the grid is not a weaker version of the full run —
+            # its rebalances sit wherever the run stopped, which on a
+            # walk-forward panel means a different set of folds.
+            covered = run["rows_scored"] / max(total_rows, 1)
+            print(f"\n  !! {path}: {run['not_scored']:,} of {total_rows:,} rows "
+                  f"were never attempted ({covered:.1%} of the grid covered). "
+                  f"Metrics below describe ONLY the rows the run reached.")
+            if covered < 0.9:
+                print("     That is a partial run. Do not put this row in the "
+                      "results table beside comparators scored on the full "
+                      "grid — the folds it covers are not the same folds.")
+
         label = (f"{run['model'].rsplit('/', 1)[-1]}@{run['context']} "
                  f"samples={run['samples']} seed={run['seed']} "
                  f"({run['seconds'] / 60:.0f} min"

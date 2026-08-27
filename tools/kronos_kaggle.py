@@ -66,7 +66,24 @@ import pandas as pd
 UPSTREAM = "https://github.com/shiyu-coder/Kronos"
 
 
-def ensure_kronos(commit: str, where: str = "/kaggle/working/kronos_src"):
+def ensure_kronos(commit: str, where: str = "/kaggle/working/kronos_src",
+                  local_src: str | None = None):
+    """
+    Put the pinned Kronos source on `sys.path`.
+
+    `local_src` skips the clone and uses a directory already holding the model
+    package — how this script is smoke-tested against the repo's own vendored
+    copy before a Kaggle session is spent on it. The clone path is what runs on
+    Kaggle, and it is PINNED: an unpinned clone is a dependency that can change
+    under a recorded result, which is the same reason the `timesfm` PyPI
+    package is refused in requirements-series.txt.
+    """
+    if local_src:
+        if local_src not in sys.path:
+            sys.path.insert(0, local_src)
+        print(f"  kronos source taken from {local_src} (clone skipped)")
+        return
+
     if not os.path.isdir(where):
         subprocess.run(["git", "clone", "--quiet", UPSTREAM, where], check=True)
     subprocess.run(["git", "-C", where, "checkout", "--quiet", commit],
@@ -100,6 +117,10 @@ def main() -> int:
     ap.add_argument("--out", default="/kaggle/working/kronos_predictions.npz")
     ap.add_argument("--limit-dates", type=int, default=None,
                     help="smoke test: score only the first N rebalance dates")
+    ap.add_argument("--kronos-src", default=None,
+                    help="directory containing the `model` package. Skips the "
+                         "pinned clone; used to smoke-test this script locally "
+                         "against the repo's vendored copy.")
     args = ap.parse_args()
 
     pkg = np.load(args.package, allow_pickle=True)
@@ -108,7 +129,7 @@ def main() -> int:
     horizon = int(meta["horizon"])
     input_cols = list(meta["input_cols"])
 
-    ensure_kronos(meta["vendored_commit"])
+    ensure_kronos(meta["vendored_commit"], local_src=args.kronos_src)
     import torch
     from model import Kronos, KronosPredictor, KronosTokenizer
 

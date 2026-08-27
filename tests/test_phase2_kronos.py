@@ -770,3 +770,66 @@ def test_the_scorer_reads_the_close_column_by_NAME_from_the_package():
     assert 'input_cols.index("close")' in source
     assert kf.INPUT_COLS.index("close") == 3, (
         "if this moved, the guard above is what keeps the scorer correct")
+
+
+def test_a_row_the_notebook_never_reached_is_excluded_not_scored_as_zero(tmp_path):
+    """
+    A truncated run must not look like a weak result.
+
+    The notebook initialises `terminal` to NaN and fills what it reaches, so an
+    all-NaN row is one it never got to — a wall-clock timeout, a --limit-dates
+    smoke test. Filling those with 0.0 puts the `zero` floor's own prediction
+    into the sample: a real run that covered 1 of 63 rebalances reported MAE
+    0.06705 against a floor of 0.06532, a plausible near-floor null that was 98%
+    the zero prediction. Scored over the rows it actually reached, the same run
+    was +209.9% worse than the floor.
+
+    This is the ChronosProbe landmine in a new place, and the fix is the same:
+    a cached or partial artifact must cover what is being scored, or say so.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "score_kronos", pathlib.Path("tools/score_kronos.py"))
+    score_kronos = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(score_kronos)
+
+    anchor = 0.5
+    # Row 0 was reached; rows 1 and 2 were not. Row 3 was reached but decoded
+    # to a non-positive price — an ABSTENTION, which is part of the sample.
+    terminal = np.array([[anchor * np.exp(0.05)],
+                         [np.nan],
+                         [np.nan],
+                         [-1.0]])
+
+    candles = np.zeros((1, 4, len(kf.INPUT_COLS)), dtype=np.float64)
+    candles[0, :, kf.INPUT_COLS.index("close")] = anchor
+    package = {
+        "candles": candles,
+        "tickers": np.array(["A.NS", "B.NS", "C.NS", "D.NS"], dtype=object),
+        "row_date": np.array(["2024-01-02"] * 4, dtype=object),
+        "row_ticker": np.arange(4, dtype=np.int16),
+        "row_end": np.zeros(4, dtype=np.int32),
+        "row_fold": np.zeros(4, dtype=np.int8),
+        "row_target": np.zeros(4, dtype=np.float32),
+        "meta": np.array([json.dumps({"input_cols": kf.INPUT_COLS})],
+                         dtype=object),
+    }
+    np.savez(tmp_path / "p.npz", terminal=terminal,
+             row_index=np.arange(4, dtype=np.int32),
+             run=np.array([json.dumps({"model": "m", "context": 512,
+                                       "samples": 1, "seed": 0,
+                                       "seconds": 1.0})], dtype=object))
+
+    frame, run = score_kronos.load_run(str(tmp_path / "p.npz"), package)
+
+    assert run["not_scored"] == 2, "rows never attempted must be dropped"
+    assert run["rows_scored"] == 2
+    assert list(frame["ticker"]) == ["A.NS", "D.NS"]
+
+    # The reached row keeps its forecast; the abstention predicts nothing.
+    assert frame["y_pred"].iloc[0] == pytest.approx(0.05, abs=1e-12)
+    assert frame["y_pred"].iloc[1] == 0.0
+    assert run["abstentions"] == 1, (
+        "a decode to a non-positive price IS part of the sample and abstains; "
+        "it must not be confused with a row the run never reached")
