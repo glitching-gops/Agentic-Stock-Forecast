@@ -108,9 +108,15 @@ def main() -> int:
                          "30-step autoregressive sampler is a path, not an "
                          "estimate. Measured at 1 sample the predicted "
                          "cross-sectional SD is ~2x the target's.")
-    ap.add_argument("--batch-samples", type=int, default=8,
-                    help="paths per forward batch. Memory scales with this; "
-                         "16 GB (T4/P100) takes 8 where a 6 GB card takes 2.")
+    ap.add_argument("--batch-samples", type=int, default=2,
+                    help="paths per forward batch. MEMORY scales with this: "
+                         "measured 2.68 GiB for 90 series at context 512 with "
+                         "one path, so 4 needs ~11 GiB and 8 needs ~21 GiB - "
+                         "past a 16 GB T4. And exceeding VRAM does not fail "
+                         "cleanly, it CRAWLS: at the limit on a 6 GB card the "
+                         "cost went 90.8 s/date to 1261 s/date for twice the "
+                         "paths. Raise it only while s/date stays roughly "
+                         "linear in it.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.9)
