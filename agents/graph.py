@@ -187,6 +187,7 @@ def save_forecast_to_db(state: dict) -> None:
         "benchmark_name": get_benchmark_name(benchmark) if benchmark else None,
         "benchmark_sector_specific": int(bool(state.get("benchmark_sector_specific"))),
         "eval_rank_ic": state.get("eval_rank_ic"),
+        "eval_rank_ic_t": state.get("eval_rank_ic_t"),
         "eval_hit_rate": state.get("eval_hit_rate"),
         "eval_baseline_hit_rate": state.get("eval_baseline_hit_rate"),
         "eval_beats_random_walk": int(bool(state.get("eval_beats_naive"))),
@@ -216,7 +217,7 @@ def save_forecast_to_db(state: dict) -> None:
         "critic_confidence_adjustment", "last_updated", "pred_excess_return",
         "pred_return", "interval_low", "interval_high", "interval_coverage",
         "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
-        "benchmark_sector_specific", "eval_rank_ic", "eval_hit_rate",
+        "benchmark_sector_specific", "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate",
         "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
         "universe_rule", "evaluated_at", "score_basis",
     ]
@@ -227,7 +228,7 @@ def save_forecast_to_db(state: dict) -> None:
         "directional_accuracy", "last_updated", "pred_excess_return", "interval_low",
         "interval_high", "interval_coverage", "prob_outperform", "random_walk_price",
         "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
-        "eval_rank_ic", "eval_hit_rate", "eval_baseline_hit_rate",
+        "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate", "eval_baseline_hit_rate",
         "eval_beats_random_walk", "model_version", "universe_rule", "evaluated_at",
         "score_basis",
     ]

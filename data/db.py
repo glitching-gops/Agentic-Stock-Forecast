@@ -349,6 +349,14 @@ def init_db():
             ("benchmark_name",       "TEXT"),
             ("benchmark_sector_specific", "INTEGER"),
             ("eval_rank_ic",         "REAL"),    # honest walk-forward metrics
+            # One THIRD of the evidence gate. grade_evidence checks rank IC,
+            # |IC t-stat| and the hit-rate edge; the t-stat was persisted to
+            # model_metadata but never onto the row it graded, so the exact
+            # WEAK/INSUFFICIENT decision behind a published score could not be
+            # recomputed from what the board itself carries. Recorded here for
+            # the same reason evaluated_at is: the evidence must travel with
+            # the claim it backs.
+            ("eval_rank_ic_t",       "REAL"),
             ("eval_hit_rate",        "REAL"),
             ("eval_baseline_hit_rate", "REAL"),
             ("eval_beats_random_walk", "INTEGER"),

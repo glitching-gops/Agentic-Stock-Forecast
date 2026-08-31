@@ -35,6 +35,7 @@ SORTABLE = {
     "pred_excess_return": False,
     "prob_outperform": False,
     "eval_rank_ic": False,
+    "eval_rank_ic_t": False,
     "eval_hit_rate": False,
 }
 

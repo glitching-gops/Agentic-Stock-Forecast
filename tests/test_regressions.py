@@ -2503,3 +2503,66 @@ def test_the_narrative_falls_back_without_crashing_when_the_llm_call_fails():
 
     assert isinstance(text, str) and text.strip(), \
         "a failed LLM call must still yield the deterministic narrative"
+
+
+def test_the_ic_t_stat_behind_a_published_grade_travels_with_the_row(tmp_path):
+    """
+    One third of the evidence gate was not recorded on the row it graded.
+
+    `grade_evidence` weighs three held-out checks — rank IC, |IC t-stat| and the
+    hit-rate edge. Two were written onto `forecasts` and `leaderboard`; the
+    t-statistic went only to `model_metadata`, so the exact WEAK vs INSUFFICIENT
+    decision behind a published composite could not be recomputed from what the
+    board carries. Same rule as `evaluated_at`: the evidence travels with the
+    claim it backs.
+
+    Asserting the value ARRIVES, through a real engine and a real round trip.
+    A test that checked membership of the column list would pass against a
+    schema missing the column, which is the half that actually failed here.
+    """
+    import sqlalchemy as sa
+    from agents import graph as graph_mod
+    from data import db as db_mod, tickers as tickers_mod
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'lb.db'}")
+    original = (db_mod.get_engine, tickers_mod.get_company,
+                tickers_mod.get_sector, tickers_mod.get_benchmark_name)
+    db_mod.get_engine = lambda: engine
+    tickers_mod.get_company = lambda t: "Test Co"
+    tickers_mod.get_sector = lambda t: "Test Sector"
+    tickers_mod.get_benchmark_name = lambda t: "NIFTY 50"
+    try:
+        db_mod.init_db()
+        graph_mod.save_forecast_to_db({
+            "ticker": "TEST.NS",
+            "forecast_available": True,
+            "current_price": 100.0,
+            "forecast_price": 101.5,
+            "forecast_direction": "OUTPERFORM",
+            "forecast_change_pct": 1.5,
+            "pred_excess_return": 0.015,
+            "prob_outperform": 0.61,
+            "benchmark_ticker": "^NSEI",
+            "eval_rank_ic": 0.0438,
+            # The sign is the point. The gate tests |t|, so a NEGATIVE t-stat
+            # of large magnitude passes a check while marking a ticker the
+            # model gets reliably wrong — four live tickers sit exactly there
+            # (MUTHOOTFIN, TRENT, HDFCAMC, LT, all IC <= -0.25, all t <= -2.0).
+            # A reader can only see that if the sign is on the row.
+            "eval_rank_ic_t": -2.17769,
+            "eval_hit_rate": 55.8298,
+            "eval_baseline_hit_rate": 52.9937,
+            "evidence_grade": "WEAK",
+            "critic_verdict": "FLAGGED",
+        })
+
+        with engine.connect() as conn:
+            for table in ("forecasts", "leaderboard"):
+                got = conn.execute(
+                    sa.text(f"SELECT eval_rank_ic_t FROM {table} WHERE ticker = 'TEST.NS'")
+                ).scalar()
+                assert got is not None, f"{table} dropped the t-statistic"
+                assert got == pytest.approx(-2.17769), f"{table} stored {got}"
+    finally:
+        (db_mod.get_engine, tickers_mod.get_company,
+         tickers_mod.get_sector, tickers_mod.get_benchmark_name) = original

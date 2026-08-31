@@ -44,6 +44,13 @@ class LeaderboardEntry(BaseModel):
         None, description="Evidence grade: STRONG / WEAK / INSUFFICIENT.")
 
     eval_rank_ic: Optional[float] = None
+    eval_rank_ic_t: Optional[float] = Field(
+        None, description="t-statistic of the out-of-sample rank IC. One of the "
+                          "three held-out checks behind forecast_confidence, and "
+                          "the only one that speaks to significance rather than "
+                          "size. Read it WITH the sign: the gate tests |t|, so a "
+                          "large negative value marks a ticker the model gets "
+                          "reliably WRONG, not one it gets right.")
     eval_hit_rate: Optional[float] = None
     eval_baseline_hit_rate: Optional[float] = None
     eval_beats_random_walk: Optional[bool] = None
