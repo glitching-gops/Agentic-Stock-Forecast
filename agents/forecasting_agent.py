@@ -200,7 +200,13 @@ Do not state a price target, a percentage move, or a buy/sell recommendation."""
             print(f"[{ticker}] narrative generation failed: {exc}")
             break
 
-    return _rule_based_narrative(ticker, signals, state.get("sentiment_score", 0.0))
+    # TWO arguments. The `sentiment` parameter was dropped from
+    # _rule_based_narrative and the two call sites above were updated; this
+    # one was not, and it is the ONLY site reachable when the Groq call
+    # fails. So it stayed green everywhere the LLM was absent (client is
+    # None takes the correct path above) and raised TypeError on every
+    # ticker the moment the model id went stale in production.
+    return _rule_based_narrative(ticker, signals)
 
 
 def _rule_based_narrative(ticker: str, signals: dict) -> str:

@@ -23,6 +23,7 @@
 import time
 import logging
 import os
+from collections import Counter
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 
@@ -40,6 +41,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+# Below this share of the universe forecasting successfully, the run publishes a
+# leaderboard that is mostly STALE rows and says nothing about it. See the
+# rationale at the check itself in run_pipeline_job.
+MIN_FORECAST_SUCCESS_RATE = 0.5
 
 
 class PipelineAbort(RuntimeError):
@@ -195,6 +202,13 @@ def run_pipeline_job():
         logger.info(f"[7/8] Forecasting {len(universe)} tickers "
                    f"(cached hyperparameters, no search)...")
         succeeded, failed = 0, 0
+        # WHY the reasons are collected and not merely logged. On 2026-08-26/27/28
+        # this loop failed 64 of 95 tickers with an identical TypeError, three
+        # runs running, and every run finished OK. The count reached
+        # experiment_runs; the REASON existed only in a workflow log that expires,
+        # so nothing on record could answer "failed at what?" — the same
+        # "non-fatal must not mean invisible" rule the baseline step obeys.
+        reasons: Counter[str] = Counter()
         for ticker in universe:
             try:
                 state = run_graph(ticker)
@@ -202,18 +216,37 @@ def run_pipeline_job():
                     succeeded += 1
                 else:
                     failed += 1
-                    logger.warning(f"[7/8] {ticker}: {state.get('forecast_error')}")
+                    detail = str(state.get("forecast_error"))
+                    reasons[detail[:120]] += 1
+                    logger.warning(f"[7/8] {ticker}: {detail}")
             except Exception as exc:                                # noqa: BLE001
                 failed += 1
+                reasons[f"{type(exc).__name__}: {exc}"[:120]] += 1
                 logger.error(f"[7/8] {ticker}: run_graph failed — {exc}")
         logger.info(f"[7/8] Forecasting complete: {succeeded} succeeded, {failed} failed")
+        for detail, n in reasons.most_common(5):
+            logger.warning(f"[7/8]   {n:>3} x {detail}")
 
-        # Every ticker failing is the same outcome as aborting — nothing was
-        # published — and used to report the same way aborting did: green.
-        if succeeded == 0:
+        # A RATE, not just the all-fail case. `succeeded == 0` was written for
+        # the total outage and is the weakest guard that could have been chosen:
+        # it passed a 67% failure rate for three consecutive days while the
+        # published board froze on rows a fortnight old, every one of them still
+        # carrying a superseded MODEL_VERSION. What a reader sees is a stale
+        # leaderboard indistinguishable from a fresh one, which is exactly the
+        # class of defect the validation gate calls FAIL.
+        #
+        # 0.5 is deliberately loose rather than tight: ~12 names carry too little
+        # history to forecast at all, so a healthy run sits near 87% and a gate
+        # at 90% would fire on ordinary universe churn. A gate that cries wolf
+        # gets switched off.
+        rate = succeeded / max(len(universe), 1)
+        if rate < MIN_FORECAST_SUCCESS_RATE:
+            top = "; ".join(f"{n}x {d}" for d, n in reasons.most_common(3))
             raise PipelineAbort(
-                f"All {failed} tickers failed to forecast; no leaderboard row "
-                f"was written. Not reporting this run as successful."
+                f"Only {succeeded} of {len(universe)} tickers forecast "
+                f"({rate:.0%}, floor {MIN_FORECAST_SUCCESS_RATE:.0%}). The "
+                f"leaderboard keeps stale rows for the other {failed}. "
+                f"Top reasons: {top}"
             )
 
         # Names that have left the index keep their last leaderboard row
@@ -236,6 +269,7 @@ def run_pipeline_job():
         finish_run(run_id, "OK", gate=gate, metrics={
             "forecasts_succeeded": succeeded,
             "forecasts_failed": failed,
+            "forecast_errors": dict(reasons.most_common(10)),
             "signals_skipped": signals_report.skipped,
             "signals_refused": signals_report.refused,
             "labelled_rows": labelled_after,

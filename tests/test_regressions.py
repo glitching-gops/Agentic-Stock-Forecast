@@ -2456,3 +2456,50 @@ def test_an_evaluation_from_another_model_version_is_not_used_as_evidence():
             "a current-version evaluation must still be used")
     finally:
         model.get_engine = original
+
+
+def test_the_narrative_falls_back_without_crashing_when_the_llm_call_fails():
+    """
+    The daily job reported OK while 64 of 95 tickers wrote no leaderboard row.
+
+    `_rule_based_narrative` lost its `sentiment` parameter and two of its three
+    call sites were updated. The third is the one reached only when a Groq call
+    RAISES — so every environment without an API key took a correct path
+    (`client is None` returns earlier) and the defect was invisible until the
+    model id `llama-3.1-8b-instant` was decommissioned and every call began
+    404ing. Then the TypeError propagated out of the LangGraph node, killed the
+    whole graph for that ticker, and the run counted it as a forecast failure.
+
+    The guard that should have caught it did not: `scheduler` aborts only when
+    `succeeded == 0`, so a 67% failure rate finished green for three days while
+    the published board froze on rows a fortnight old.
+
+    Asserting on BEHAVIOUR through a failing client, not on the signature — a
+    signature test passes the moment someone adds a third parameter back.
+    """
+    from agents import forecasting_agent as fa
+
+    class _Exploding:
+        """A live client whose call fails — the only path that reaches line 203."""
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    raise RuntimeError(
+                        "Error code: 404 - model `llama-3.1-8b-instant` does not exist")
+
+    original = fa._groq_client
+    fa._groq_client = lambda: _Exploding()
+    try:
+        # _deserves_a_written_narrative must be True, or the earlier (correct)
+        # call site is taken and this test proves nothing.
+        updates = {"eval_evaluated_at": "2026-08-01", "pred_excess_return": 0.03}
+        assert fa._deserves_a_written_narrative(updates) is True
+
+        text = fa._narrative({"ticker": "ABB.NS", "latest_signals": {"rsi": 55}},
+                             "ABB.NS", updates)
+    finally:
+        fa._groq_client = original
+
+    assert isinstance(text, str) and text.strip(), \
+        "a failed LLM call must still yield the deterministic narrative"
