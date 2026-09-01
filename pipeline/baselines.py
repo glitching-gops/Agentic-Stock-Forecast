@@ -16,11 +16,24 @@ scored under different conditions is not a comparator.
 
 Two of these deserve a note.
 
-``ZeroForecast`` is the one that matters most. The target is an excess return,
-so predicting zero is the claim "this stock will track its benchmark" — the
-random walk in this target space, and the floor a forecast has to clear before
-any of its other properties are worth discussing. It is trivially implemented
-and it is not trivially beaten.
+**THE FLOOR IS NO LONGER `zero`.** It was, and correctly, while the target was
+an excess return: predicting zero is the claim "this stock will track its
+benchmark", the label already had the market subtracted out of it, and beating
+zero therefore required saying something about the individual company.
+
+P1 moved the target to the ABSOLUTE 30-session return, and that breaks the
+argument in two places at once. 57.67% of absolute returns on this universe are
+positive, so a constant "up" beats a coin flip by nearly eight points; and
+32.8% of their variance is COMMON across stocks, so predicting the market alone
+explains a third of the target with no company-specific information at all. A
+comparator measured against `zero` on this target is being credited with drift
+and with beta.
+
+So the floors are ``market`` (the level, bounding MAE) and ``beta_market`` (the
+ordering, bounding rank IC) — see ``FLOORS``, and ``annotate_against_floors``
+for where a comparator is graded against them. ``zero`` and ``always_up`` stay
+in the table as the degenerate references: they are what shows how large the
+gift was.
 
 ``MajorityDirection`` is fitted on the TRAINING fold, unlike
 ``evaluation.majority_hit_rate``, which reads the majority off the test set.
@@ -46,13 +59,14 @@ from sklearn.linear_model import Ridge
 from pipeline.evaluation import (PurgedPanelWalkForward, oos_dates,
                                  panel_walk_forward)
 from pipeline.panel import (
+    EXCESS_TARGET,
     MIN_NAMES_PER_DATE,
     SCALE_FREE,
     TARGET,
     cross_sectional_zscore,
     load_panel,
     panel_coverage,
-    relative_price_frame,
+    price_frame,
     retarget_horizon,
 )
 from pipeline.series import (
@@ -177,6 +191,168 @@ class MajorityDirection:
         return np.full(len(X), self.sign_, dtype=float)
 
 
+class AlwaysUp:
+    """
+    Predicts a positive return for every stock, every day. THE DIRECTIONAL FLOOR.
+
+    Distinct from ``MajorityDirection``, which LEARNS its sign from the
+    training fold and would land on +1 here anyway. This one is pinned, so the
+    bar it sets cannot drift with the sample: on this universe 57.67% of
+    30-session absolute returns are positive, measured over 84 tickers and
+    205,973 windows, and any model whose directional accuracy is below that has
+    learned less than "shares tend to go up".
+
+    That is a materially higher bar than the excess target set. There the
+    majority baseline was ~52%, so a model at 55% looked like it had found
+    something; on absolute return the same 55% is three points WORSE than
+    saying nothing. Switching target without moving the floor would have
+    handed every model in the project roughly six free points.
+
+    Only its hit rate is meaningful. The magnitude is arbitrary, so its MAE and
+    RMSE are not comparable with anything, and its rank IC is undefined by
+    construction because a constant has no ordering.
+    """
+
+    name = "always_up"
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "AlwaysUp":
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.ones(len(X), dtype=float)
+
+
+class MarketForecast:
+    """
+    Predicts the training-period MARKET return for every stock. THE LEVEL FLOOR.
+
+    The market return on a date is the EQUAL-WEIGHTED cross-sectional mean of
+    the target, and this predicts the average of that over the training fold.
+    Equal-weighted per date and then averaged, rather than a flat mean over all
+    training rows: those differ whenever the panel is unbalanced, and it is —
+    tickers enter at different dates, so a plain row mean tilts toward whichever
+    names have the longest history.
+
+    WHY THIS EXISTS AT ALL. 32.8% of 30-session return variance on this panel is
+    common across stocks. A model that captured only that — no stock-specific
+    information whatsoever — would still explain a third of the target and post
+    an MAE far below `zero`. On the excess target that common component was
+    subtracted out by the label itself and `zero` was the honest floor; on the
+    absolute target it is not, and reporting against `zero` would credit every
+    comparator with the market.
+
+    A constant, so its rank IC is undefined. It bounds MAE, not ordering. For
+    the ordering floor see ``BetaMarket``.
+    """
+
+    name = "market"
+
+    def __init__(self) -> None:
+        self.mu_ = 0.0
+
+    @staticmethod
+    def _market_by_date(X: pd.DataFrame, y: pd.Series) -> pd.Series:
+        """Equal-weighted cross-sectional mean of the target, per date."""
+        frame = pd.DataFrame({
+            "date": X["date"].to_numpy() if "date" in X.columns else 0,
+            "y": pd.to_numeric(pd.Series(y).reset_index(drop=True),
+                               errors="coerce").to_numpy(),
+        })
+        return frame.dropna(subset=["y"]).groupby("date")["y"].mean()
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "MarketForecast":
+        by_date = self._market_by_date(X, y)
+        self.mu_ = float(by_date.mean()) if len(by_date) else 0.0
+        if not np.isfinite(self.mu_):
+            self.mu_ = 0.0
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.full(len(X), self.mu_, dtype=float)
+
+
+class BetaMarket:
+    """
+    Predicts ``beta_i * mu_market``. THE ORDERING FLOOR, and the important one.
+
+    ``beta_i`` is the OLS slope of ticker i's target on the market's, fitted on
+    the training fold; ``mu_market`` is the training-period mean market return.
+    Both quantities are contemporaneous in label space — the market return on a
+    date is the cross-section's mean 30-session forward return, the same window
+    the label spans — so no future information enters.
+
+    THIS IS THE COMPARATOR THE TARGET SWITCH MADE NECESSARY. Unlike ``market``
+    it is NOT constant within a date: it orders names by beta. And in a market
+    that drifted up over the training fold, mu_market is positive, so sorting
+    by beta produces a positive cross-sectional rank IC — from a quantity that
+    contains no view about any individual company. A model whose IC does not
+    exceed this one has demonstrated nothing except that it noticed which
+    stocks are volatile.
+
+    Beta is per-ticker and persistent, which puts this in the same family as the
+    valuation result the project already retired: a PERSISTENT per-ticker
+    feature earns a positive t-statistic from nothing, measured at a mean
+    rebalance t of +0.77 over 24 draws of random per-ticker constants. The
+    difference is that beta is not a placebo — it is the real mechanism, so it
+    belongs in the table rather than in a separate null.
+
+    A ticker unseen in training gets beta 1.0: the market's own forecast, which
+    is the least informative available answer rather than zero (which would
+    assert a view) or a skipped row (which would change the sample).
+    """
+
+    name = "beta_market"
+
+    def __init__(self, min_obs: int = 20) -> None:
+        self.min_obs = min_obs
+        self.mu_ = 0.0
+        self.beta_: dict[str, float] = {}
+
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "BetaMarket":
+        if "date" not in X.columns or "ticker" not in X.columns:
+            return self
+
+        frame = pd.DataFrame({
+            "date": X["date"].to_numpy(),
+            "ticker": X["ticker"].to_numpy(),
+            "y": pd.to_numeric(pd.Series(y).reset_index(drop=True),
+                               errors="coerce").to_numpy(),
+        }).dropna(subset=["y"])
+        if frame.empty:
+            return self
+
+        market = frame.groupby("date")["y"].mean().rename("mkt")
+        self.mu_ = float(market.mean())
+        if not np.isfinite(self.mu_):
+            self.mu_ = 0.0
+
+        joined = frame.join(market, on="date")
+        for ticker, group in joined.groupby("ticker", sort=False):
+            x = group["mkt"].to_numpy(dtype=float)
+            t = group["y"].to_numpy(dtype=float)
+            ok = np.isfinite(x) & np.isfinite(t)
+            # np.ptp guards the degenerate case a single training date
+            # produces: one market value, zero variance, and a slope that is
+            # either a divide-by-zero or an arbitrarily large number fitted to
+            # noise.
+            if ok.sum() < self.min_obs or np.ptp(x[ok]) == 0:
+                continue
+            var = float(np.var(x[ok]))
+            if var <= 0:
+                continue
+            beta = float(np.cov(x[ok], t[ok], bias=True)[0, 1] / var)
+            if np.isfinite(beta):
+                self.beta_[str(ticker)] = beta
+        return self
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if "ticker" not in X.columns:
+            return np.full(len(X), self.mu_, dtype=float)
+        betas = np.array([self.beta_.get(str(t), 1.0) for t in X["ticker"]],
+                         dtype=float)
+        return betas * self.mu_
+
+
 class SingleFactor:
     """
     Univariate OLS of the target on one column.
@@ -274,12 +450,42 @@ class LinearFactorModel:
 # is not earning its place.
 BASELINES: dict[str, callable] = {
     "zero":          ZeroForecast,
+    "always_up":     AlwaysUp,
     "train_mean":    TrainMeanForecast,
     "majority":      MajorityDirection,
+    "market":        MarketForecast,
+    "beta_market":   BetaMarket,
     "momentum_20d":  lambda: SingleFactor("sector_rel_20d"),
     "reversal_5d":   lambda: SingleFactor("lag5_ret"),
     "linear_factor": LinearFactorModel,
 }
+
+#: What a comparator has to beat before its number means anything. NOT `zero`.
+#:
+#: `zero` was the right floor for an excess return: predicting no excess return
+#: is the claim "this stock tracks its benchmark", the label already had the
+#: market subtracted out of it, and beating zero therefore required saying
+#: something about the individual company. On an absolute return none of that
+#: holds. 57.67% of the labels are positive and 32.8% of their variance is
+#: shared, so `zero` is beaten by drift alone and a comparator that clears it
+#: has shown only that it noticed the market goes up.
+#:
+#: Two floors, because they bound different things and a comparator can clear
+#: one while failing the other:
+#:
+#:   market       the LEVEL. A constant, so it has no ordering and its role is
+#:                MAE. Beating it means the forecast's magnitude carries
+#:                something beyond the average.
+#:   beta_market  the ORDERING. Ranks by beta, which is information-free about
+#:                any individual company, and scores a positive rank IC
+#:                whenever the training market drifted up. Beating it is what
+#:                separates stock-specific skill from beta.
+#:
+#: `zero` and `always_up` stay in the table and stay reported. They are the
+#: DEGENERATE references - the arithmetic floor and the directional floor - and
+#: dropping them would hide the size of the gift the target switch handed every
+#: model.
+FLOORS: tuple[str, ...] = ("market", "beta_market")
 
 
 def baseline_feature_columns(name: str) -> list[str]:
@@ -296,6 +502,12 @@ def baseline_feature_columns(name: str) -> list[str]:
         return ["sector_rel_20d"]
     if name.startswith("reversal"):
         return ["lag5_ret"]
+    if name in ("market", "beta_market"):
+        # Identifiers, not indicators - the same shape SeriesAdapter takes.
+        # `market` needs `date` to weight each cross-section equally rather
+        # than each row; `beta_market` needs both to regress a ticker's target
+        # on the market's.
+        return ["date", "ticker"]
     return []
 
 
@@ -341,7 +553,9 @@ class BaselineComparison:
         """
         keep = ("name", "n_oos", "folds", "daily_rank_ic", "rebalance_ic_t",
                 "hit_rate", "majority_hit_rate", "mae", "mae_naive_zero",
-                "beats_naive_mae", "alpha_vs_equal_weight", "alpha_t",
+                "beats_naive_mae", "mae_vs_market", "beats_market",
+                "beats_beta_ic", "clears_floor",
+                "alpha_vs_equal_weight", "alpha_t",
                 "n_rebalances")
         return {
             "panel_tickers": self.coverage.get("tickers", 0),
@@ -353,19 +567,39 @@ class BaselineComparison:
             "loadings": self.loadings,
         }
 
+    def floors(self) -> dict:
+        """The two numbers every comparator is measured against. See FLOORS."""
+        market = next((r for r in self.results if r["name"] == "market"), {})
+        beta = next((r for r in self.results if r["name"] == "beta_market"), {})
+        return {
+            "market_mae": market.get("mae"),
+            "beta_market_ic": beta.get("rebalance_ic"),
+            "beta_market_ic_t": beta.get("rebalance_ic_t"),
+        }
+
     def summary(self) -> str:
         if not self.ranked:
             return f"baselines: not scored - {self.note}"
         best = self.best()
-        floor = next((r for r in self.results if r["name"] == "zero"), {})
-        beat_floor = [r["name"] for r in self.results if r.get("beats_naive_mae")]
+        f = self.floors()
+        cleared = [r["name"] for r in self.results if r.get("clears_floor")]
+        # `zero` is reported beside them rather than as the floor. It is the
+        # degenerate reference now: on an absolute return it is beaten by drift,
+        # and a summary that led with it would overstate every comparator.
+        zero = next((r for r in self.results if r["name"] == "zero"), {})
+
+        def _fmt(value, spec):
+            return "n/a" if value is None or not np.isfinite(value) else format(value, spec)
+
         return (
             f"baselines: {len(self.results)} comparators over "
             f"{self.coverage.get('tickers', 0)} tickers; best daily IC "
             f"{best['name']} {best['daily_rank_ic']:+.4f} "
             f"(t {best.get('rebalance_ic_t', float('nan')):+.2f}); "
-            f"MAE floor {floor.get('mae', float('nan')):.5f}; "
-            f"beat the floor on MAE: {beat_floor or 'none'}"
+            f"floors market MAE {_fmt(f['market_mae'], '.5f')} / "
+            f"beta_market reb_IC {_fmt(f['beta_market_ic'], '+.4f')} "
+            f"(zero MAE {_fmt(zero.get('mae'), '.5f')}); "
+            f"cleared BOTH floors: {cleared or 'none'}"
         )
 
 
@@ -416,6 +650,60 @@ def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500,
     cols = list(columns) if columns else list(FACTORS)
     cols = [c for c in cols if c in train.columns]
     return LinearFactorModel(columns=cols).fit(train[cols], train[TARGET]).coefficients()
+
+
+def annotate_against_floors(results: list[dict]) -> list[dict]:
+    """
+    Adds each comparator's standing against `market` and `beta_market`.
+
+    Done HERE and not inside the per-comparator report, because a floor is a
+    relation between comparators and the report only ever sees one. That is
+    also why `beats_naive_mae` could be computed row by row: `zero`'s MAE is
+    just mean(|y|), knowable without running `zero` at all. The market's is not.
+
+    Three fields are added:
+
+      mae_vs_market   percentage by which this comparator's MAE exceeds the
+                      market's. NEGATIVE is better. Reported rather than
+                      thresholded because the size is the interesting part.
+      beats_market    MAE strictly below the market forecast's.
+      beats_beta_ic   rebalance IC strictly above beta_market's.
+      clears_floor    both of the above. THE P1 CRITERION.
+
+    A missing floor leaves the fields None rather than defaulting to False. A
+    run that did not score `market` cannot say whether anything beat it, and
+    False would read as "measured, and it lost".
+    """
+    def _finite(value):
+        return value is not None and np.isfinite(value)
+
+    by_name = {r["name"]: r for r in results}
+    market = by_name.get("market")
+    beta = by_name.get("beta_market")
+
+    market_mae = market.get("mae") if market else None
+    beta_ic = beta.get("rebalance_ic") if beta else None
+
+    for r in results:
+        r["mae_vs_market"] = (
+            float((r["mae"] / market_mae - 1.0) * 100.0)
+            if _finite(market_mae) and _finite(r.get("mae")) and market_mae > 0
+            else None
+        )
+        r["beats_market"] = (
+            bool(r["mae"] < market_mae)
+            if _finite(market_mae) and _finite(r.get("mae")) else None
+        )
+        r["beats_beta_ic"] = (
+            bool(r["rebalance_ic"] > beta_ic)
+            if _finite(beta_ic) and _finite(r.get("rebalance_ic")) else None
+        )
+        r["clears_floor"] = (
+            bool(r["beats_market"] and r["beats_beta_ic"])
+            if r["beats_market"] is not None and r["beats_beta_ic"] is not None
+            else None
+        )
+    return results
 
 
 def compare_baselines(
@@ -476,21 +764,22 @@ def compare_baselines(
         # returned six linear comparators reads as "it did not help".
         raise ValueError(
             "a foundation-model comparator requires with_series=True: "
-            "Chronos-2, TimesFM-2.5 and Kronos all rest on the relative-price "
-            "series — Kronos on a candle built from it — and with_series=False "
-            "switches off the coverage check that says the series exists"
+            "Chronos-2, TimesFM-2.5 and Kronos all rest on the price series "
+            "panel.price_frame builds for the current target — Kronos on a "
+            "candle derived from it — and with_series=False switches off the "
+            "check that says the series exists"
         )
 
     panel = load_panel(tickers=tickers, engine=engine, start=start)
     if panel.empty:
         return BaselineComparison(note="no signals rows in the database")
 
-    # The stored label is the 30-session excess return. Any other horizon is
-    # derived exactly from the relative-price identity - see
-    # panel.retarget_horizon. Done BEFORE coverage and z-scoring so every
-    # downstream statistic describes the horizon actually being scored.
+    # The stored label is the 30-session return. Any other horizon is derived
+    # exactly from the price-series identity - see panel.retarget_horizon. Done
+    # BEFORE coverage and z-scoring so every downstream statistic describes the
+    # horizon actually being scored.
     if horizon != HORIZON_SESSIONS:
-        panel = retarget_horizon(panel, horizon)
+        panel = retarget_horizon(panel, horizon, target=TARGET)
 
     # Valuation is the first information here that is not a transform of the
     # same OHLCV series. Restricting the panel to rows that CARRY it is the
@@ -534,8 +823,24 @@ def compare_baselines(
         embargo=horizon, min_train=min_train,
     )
 
+    # baseline_feature_columns, NOT a blanket FACTORS. That function has always
+    # existed and declared exactly this, and this line ignored it: every
+    # baseline received the full factor set regardless of what it asked for.
+    #
+    # It was invisible while every comparator either ignored X entirely (`zero`,
+    # `train_mean`, `majority`) or read one named column out of it (`momentum`,
+    # `reversal`) - a widened frame changes nothing for either. `market` and
+    # `beta_market` are the first comparators that need columns FACTORS does not
+    # contain, and the symptom was not an error: BetaMarket fitted no betas,
+    # defaulted every ticker to 1.0, emitted a constant, and was recorded with
+    # `n_dates_no_ordering` on every date and a blank rank IC. A floor that
+    # silently reports "no ordering" is a floor nothing can fail to clear.
+    #
+    # Same shape as the LinearFactorModel landmine: a comparator that does not
+    # receive the columns it needs produces a complete, plausible row.
     runs: list[tuple[str, object, list[str]]] = [
-        (name, factory, FACTORS) for name, factory in BASELINES.items()
+        (name, factory, baseline_feature_columns(name) or FACTORS)
+        for name, factory in BASELINES.items()
     ]
     if with_pooled_xgb:
         runs.append(("pooled_xgb", _pooled_xgb_factory, FACTORS))
@@ -556,22 +861,36 @@ def compare_baselines(
         if with_pooled_xgb:
             runs.append(("pooled_xgb+val", _pooled_xgb_factory, with_val))
 
-    # Series comparators read the relative-price series, not the feature
-    # matrix. They are added only when that series actually exists.
+    # Series comparators read a PRICE SERIES, not the feature matrix. They are
+    # added only when that series actually exists.
     #
     # A SeriesAdapter handed an all-NaN series does not fail — it declines every
     # ticker and predicts 0.0, which is the correct default for an abstention
     # and which would appear in this table as a row indistinguishable from
-    # `zero`. Rows written before benchmark_close was persisted have perfectly
-    # good targets and no reconstructible series, so a run against them would
-    # report three extra comparators that all silently measured nothing.
+    # `zero`. So a run whose series could not be built would report three extra
+    # comparators that all silently measured nothing.
+    #
+    # WHICH series is decided by the TARGET, never chosen here. `price_frame`
+    # returns log(close) for the absolute target and log(close / benchmark)
+    # for the excess one, and in both cases the h-session forward difference of
+    # what it returns IS the label being scored. Passing the relative series
+    # while scoring the absolute label is the failure this indirection exists
+    # to make unconstructable: it raises nothing, the table renders, the
+    # magnitudes look right, and the only symptom is a foundation model that
+    # inexplicably will not beat the floor.
+    #
+    # The benchmark-coverage gate therefore applies only to the excess target.
+    # The absolute series needs `close`, which every row has by construction,
+    # so the vendor outage that emptied eight of ten NSE sector indices cannot
+    # reach it.
     series_note = ""
     labelled = max(coverage.get("labelled_rows", 0), 1)
     level_coverage = coverage.get("rows_with_benchmark_close", 0) / labelled
+    needs_benchmark = TARGET == EXCESS_TARGET
 
     if not with_series:
         series_note = "series comparators disabled by the caller"
-    elif level_coverage < MIN_BENCHMARK_LEVEL_COVERAGE:
+    elif needs_benchmark and level_coverage < MIN_BENCHMARK_LEVEL_COVERAGE:
         series_note = (
             f"series comparators skipped: benchmark_close is present on "
             f"{level_coverage:.1%} of labelled rows, below the "
@@ -580,7 +899,7 @@ def compare_baselines(
             f"forecaster would abstain and report as `zero`. Recompute signals."
         )
     else:
-        series = relative_price_frame(panel)
+        series = price_frame(panel, TARGET)
         for name, cls in SERIES_BASELINES.items():
             runs.append((name, adapter_factory(cls, series, horizon=horizon),
                          ["date", "ticker"]))
@@ -633,9 +952,11 @@ def compare_baselines(
         # keeps the excess-return identity intact.
         if with_kronos:
             from pipeline.kronos_forecaster import (
-                adapter_factory as kronos_factory, load_relative_candles)
+                adapter_factory as kronos_factory, load_candles)
 
-            frames = load_relative_candles(panel, engine=engine)
+            # TARGET, not the relative candle: the basis must match the label
+            # being scored, or Kronos measures a quantity nobody asked for.
+            frames = load_candles(panel, engine=engine, target=TARGET)
             for model_id, ctx in kronos_models:
                 factory = kronos_factory(
                     frames, horizon=horizon, context=ctx, model_id=model_id,
@@ -709,7 +1030,7 @@ def compare_baselines(
 
     return BaselineComparison(
         coverage=coverage,
-        results=results,
+        results=annotate_against_floors(results),
         loadings=fit_factor_loadings(panel, min_train, horizon,
                                      FACTORS + fundamental_cols),
         note=series_note,

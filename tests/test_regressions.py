@@ -90,12 +90,54 @@ def test_sentiment_is_not_in_the_feature_list():
 
 # ── F8: the target must be a return, not a price level ────────────────────────
 
-def test_target_is_an_excess_return():
+def test_the_target_is_an_absolute_return_and_the_excess_label_is_kept():
+    """
+    P1 switched the target; it did not delete the previous one.
+
+    Keeping the excess label is not sentiment. Six foundation-model
+    configurations, a linear probe, LoRA, a ridge, an untuned tree and the
+    valuation experiment were all scored against it, and a result you cannot
+    re-measure is a result you cannot compare against. Dropping the column
+    would make every Phase 2 number in CLAUDE.md permanently unreadable.
+
+    Both must be COMPUTED, both must be STORED, and both must arrive on the
+    panel — a label that is written but never loaded is a label nobody can use.
+    """
     from pipeline.model import TARGET
+    from pipeline.panel import EXCESS_TARGET, TARGET as PANEL_TARGET, TARGETS
     from pipeline.signals import TARGET_COLS
 
-    assert TARGET == "target_excess_return"
-    assert "target_excess_return" in TARGET_COLS
+    assert TARGET == "target_return"
+    assert PANEL_TARGET == TARGET, (
+        "the per-ticker model and the panel harness must predict the SAME "
+        "quantity, or their metrics are not comparable and nothing says so")
+    assert EXCESS_TARGET == "target_excess_return"
+
+    for col in (TARGET, EXCESS_TARGET):
+        assert col in TARGET_COLS, f"{col} is not computed by pipeline.signals"
+        assert col in TARGETS, f"{col} is not loaded onto the panel"
+
+
+def test_the_model_version_moved_with_the_target():
+    """
+    A version bump is the only thing standing between a v2 evaluation and a v3
+    forecast.
+
+    Every eval_* metric, conformal calibration and cached hyperparameter
+    written before P1 describes the EXCESS return. Serving those beside an
+    absolute-return forecast is the quiet mislabelling the Phase 0 audit was
+    about — and it would be worse than the benchmark remap that first forced
+    this mechanism, because that changed the label for 36 tickers while this
+    changes it for all of them, hit-rate baseline included (~52% to 57.67%).
+    """
+    from pipeline.model import MODEL_VERSION
+
+    assert MODEL_VERSION not in ("phase0-excess-return-v1",
+                                 "phase1-benchmark-audited-v2"), (
+        "the target changed; a run before and after must be distinguishable "
+        "in experiment_runs and _load_persisted_evaluation must discard the "
+        "older evidence")
+    assert "absolute" in MODEL_VERSION
 
 
 def test_excess_return_target_is_computed_against_a_benchmark():
@@ -456,6 +498,86 @@ def test_the_board_is_renamed_and_its_rows_survive(tmp_path):
         db_mod.get_engine = original
 
 
+def test_the_write_boundary_protects_every_label(tmp_path):
+    """
+    F6 REAPPEARING THROUGH THE DOOR P1 OPENED, and closed at the same time.
+
+    Before P1 a dead benchmark meant a null target on every row, so
+    compute_signals_frame refused to build the frame at all and the ticker kept
+    what it had. That refusal is gone — target_return needs no index, and
+    keeping it would have frozen 55 tickers on stale signals for a vendor
+    outage that does not touch them.
+
+    Which puts the danger back at the writer. _upsert_signals DELETEs the
+    recomputed range before reinserting, so a recompute for a ticker whose
+    index has since gone dark now arrives with a FULL set of target_return
+    values and a column of NULL excess ones. A guard that counted only the
+    primary label would wave that straight through, and the DELETE would erase
+    every historical excess label the ticker had from before its index died.
+
+    That is exactly F6: a run that LOSES training data while reporting a
+    successful write. The counts are compared per label, before the delete,
+    which is the last moment the old rows still exist.
+    """
+    import sqlalchemy as sa
+
+    from pipeline.signals import LabelLossRefused, _upsert_signals
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'labels.db'}")
+    with engine.connect() as conn:
+        conn.execute(sa.text(
+            "CREATE TABLE signals (ticker TEXT, date TEXT, close REAL, "
+            "target_return REAL, target_excess_return REAL)"))
+        for i in range(10):
+            conn.execute(
+                sa.text("INSERT INTO signals VALUES ('T.NS', :d, 100.0, 0.01, 0.02)"),
+                {"d": f"2026-01-{i + 1:02d}"})
+        conn.commit()
+
+    # The dangerous frame: every absolute label present, every excess label
+    # gone. It LOOKS like a healthy write and is a net loss of ten rows of
+    # excess labels.
+    dangerous = pd.DataFrame({
+        "ticker": ["T.NS"] * 10,
+        "date": [f"2026-01-{i + 1:02d}" for i in range(10)],
+        "close": [100.0] * 10,
+        "target_return": [0.01] * 10,
+        "target_excess_return": [None] * 10,
+    })
+
+    with engine.connect() as conn:
+        with pytest.raises(LabelLossRefused, match="target_excess_return"):
+            _upsert_signals(conn, "T.NS", dangerous)
+
+    with engine.connect() as conn:
+        kept = conn.execute(sa.text(
+            "SELECT COUNT(*) FROM signals WHERE target_excess_return IS NOT NULL"
+        )).scalar()
+    assert kept == 10, "the refusal must happen BEFORE the delete, not after"
+
+    # A frame that keeps both labels is written normally — the guard must not
+    # be so eager that a healthy recompute can never land.
+    healthy = dangerous.assign(target_excess_return=[0.02] * 10)
+    with engine.connect() as conn:
+        written = _upsert_signals(conn, "T.NS", healthy)
+        conn.commit()
+    assert written == 10
+
+    # And a genuinely NEW listing, whose forward labels are all still in the
+    # future, must not be blocked: 0 is not less than 0. A null-frame test
+    # instead of a decrease test would refuse this one.
+    newcomer = pd.DataFrame({
+        "ticker": ["NEW.NS"] * 5,
+        "date": [f"2026-02-{i + 1:02d}" for i in range(5)],
+        "close": [50.0] * 5,
+        "target_return": [None] * 5,
+        "target_excess_return": [None] * 5,
+    })
+    with engine.connect() as conn:
+        assert _upsert_signals(conn, "NEW.NS", newcomer) == 5
+        conn.commit()
+
+
 # ── F15: bound SQL parameters ─────────────────────────────────────────────────
 
 def test_no_fstring_sql_interpolation_of_tickers():
@@ -528,17 +650,34 @@ def test_probability_is_monotonic_in_the_prediction():
     assert calibration.prob_positive(0.0) == pytest.approx(0.5, abs=0.1)
 
 
-def test_price_view_states_its_benchmark_assumption():
+def test_the_price_view_no_longer_needs_a_flat_benchmark():
     """
-    The implied rupee target only holds if the benchmark is flat. Shipping it
-    without that caveat would re-introduce the overclaiming Phase 0 removes.
+    The rupee target used to be conditional on something nobody believes.
+
+    While the model forecast an EXCESS return, a price could only be derived by
+    ASSUMING the index stayed flat over the horizon — so the headline number on
+    every stock page rested on an assumption the model had no view about, and
+    the caveat had to travel with it or the page overclaimed.
+
+    An absolute forecast implies a price directly. The assumption is gone
+    because the conditional is gone, not because the caveat was dropped, and
+    that is the distinction this pins: the field must still be present and must
+    still be honest about what the interval is for.
     """
     from pipeline.conformal import to_price_view
 
     view = to_price_view(1000.0, 0.02, None)
-    assert "assumption" in view
-    assert "flat" in view["assumption"].lower()
+    assert view["pred_return"] == 0.02
+    assert view["implied_price"] == pytest.approx(1000.0 * np.exp(0.02))
     assert view["random_walk_price"] == 1000.0
+    assert "assumption" in view
+    assert "flat" not in view["assumption"].lower(), (
+        "an absolute forecast is not conditional on the index")
+
+    # Unmeasured quantities stay null. A 0.0 for prob_up would be a POSITION —
+    # "this stock certainly falls" — not an absence.
+    assert view["prob_up"] is None
+    assert view["interval_low"] is None
 
 
 # ── Numpy scalars must never reach the database driver ────────────────────────
@@ -1196,45 +1335,70 @@ def test_default_groq_model_has_the_larger_free_tier_budget():
         assert "gpt-oss" not in source, f"{module} still hardcodes a model name"
 
 
-def test_narrative_is_written_only_for_tickers_that_can_rank():
+def test_the_narrative_gate_still_holds_and_its_rationale_no_longer_does():
     """
-    Without a gate the token cap chose which stocks got a written narrative by
-    arrival order — the tail of the alphabet logged "narrative generation
-    failed". A row cannot rank without a persisted evaluation and a positive
-    predicted excess return, and a narrative is only read beside a ranked row.
+    The gate is UNCHANGED and this test pins it as it stands, deliberately.
+
+    Why it exists: without a gate the token cap chose which stocks got a
+    written narrative by arrival order, and the tail of the alphabet logged
+    "narrative generation failed". The condition it settled on was "a row that
+    can rank" — a persisted evaluation, and a positive predicted return.
+
+    NEITHER HALF OF THAT RATIONALE SURVIVES P0 AND P1. Nothing ranks any more,
+    so "only read beside a ranked row" is false; and on an absolute target
+    `pred > 0` withholds the written analysis from exactly the stocks a reader
+    most needs it for, the ones forecast to FALL. The rebuild's P4 says every
+    stock gets an explanation including why it does not work, so this condition
+    has to be rewritten there.
+
+    It is left alone here on purpose: changing it multiplies LLM calls by ~6,
+    the configured model is decommissioned and 404s on every request, and the
+    replacement has not been chosen. Pinning current behaviour keeps the change
+    deliberate rather than incidental — the failure mode this project keeps
+    hitting is a rule whose justification quietly evaporated while the rule
+    stayed.
     """
     from agents.forecasting_agent import _deserves_a_written_narrative
 
-    rankable = {"eval_evaluated_at": "2026-08-15 17:02:11",
-                "pred_excess_return": 0.031}
-    assert _deserves_a_written_narrative(rankable) is True
+    written = {"eval_evaluated_at": "2026-08-15 17:02:11", "pred_return": 0.031}
+    assert _deserves_a_written_narrative(written) is True
 
-    # No evidence -> composite is gated to 0.0 regardless of the prediction.
+    # No persisted evaluation: the evidence gate grades this INSUFFICIENT.
     assert _deserves_a_written_narrative(
-        {"eval_evaluated_at": None, "pred_excess_return": 0.031}) is False
+        {"eval_evaluated_at": None, "pred_return": 0.031}) is False
 
-    # Predicted underperformer -> both score components floor at zero.
-    assert _deserves_a_written_narrative(
-        {"eval_evaluated_at": "2026-08-15 17:02:11",
-         "pred_excess_return": -0.02}) is False
-
+    # A predicted DECLINE. Still gated, and this is the half P4 must revisit.
     assert _deserves_a_written_narrative(
         {"eval_evaluated_at": "2026-08-15 17:02:11",
-         "pred_excess_return": None}) is False
+         "pred_return": -0.02}) is False
+
+    assert _deserves_a_written_narrative(
+        {"eval_evaluated_at": "2026-08-15 17:02:11",
+         "pred_return": None}) is False
 
 
-# ── A missing benchmark must never erase a ticker's labels ────────────────────
+# ── A missing benchmark costs the excess label and nothing else ───────────
 
-def test_missing_benchmark_skips_the_ticker_instead_of_nulling_its_target():
+def test_a_missing_benchmark_still_produces_the_absolute_label():
     """
-    The excess-return target is `stock return - benchmark return`, so an index
-    that resolves to nothing NULLs the target for every row of every stock
-    mapped to it — and _upsert_signals DELETEs the recomputed range before
-    reinserting, so writing that frame ERASES existing labels.
+    The single largest practical consequence of the P1 target switch.
 
-    On 2026-08-16 ^CNXAUTO, ^CNXINFRA and ^CNXREALTY came back unusable in a
-    single run and 22 tickers went from ~2,390 labelled rows to 0. All three
-    served full history again minutes later. Returning None keeps the old rows.
+    It used to skip the ticker outright, and that was correct: the target WAS
+    `stock return - benchmark return`, so an index resolving to nothing NULLed
+    every row, and because _upsert_signals DELETEs the recomputed range before
+    reinserting, writing that frame ERASED existing labels. On 2026-08-16
+    ^CNXAUTO, ^CNXINFRA and ^CNXREALTY came back unusable in one run and 22
+    tickers went from ~2,390 labelled rows to 0; all three served full history
+    minutes later. Returning None was what kept the old rows.
+
+    target_return asks the index nothing, so skipping now costs a label that
+    did not need to be lost. Eight of ten NSE sector indices stopped publishing
+    around 2026-07-20, which under the old rule froze 55 tickers on stale
+    signals indefinitely.
+
+    What must still hold is that the excess column is NULL rather than wrong.
+    The historical excess labels are protected at the write boundary instead —
+    see test_the_write_boundary_protects_every_label.
     """
     import pipeline.signals as sig
 
@@ -1258,9 +1422,17 @@ def test_missing_benchmark_skips_the_ticker_instead_of_nulling_its_target():
     finally:
         sig.get_benchmark_series = original
 
-    assert frame is None, (
-        "a frame whose target is null on every row must never reach the writer"
-    )
+    assert frame is not None, (
+        "a dead benchmark must no longer cost the ticker its absolute label")
+    assert frame["target_return"].notna().sum() > 0, (
+        "target_return depends on close alone and must survive a dead index")
+    assert frame["target_excess_return"].isna().all(), (
+        "with no benchmark the excess label must be NULL, never 0.0 — a zero "
+        "there is a POSITION (this stock tracked its index exactly) and is "
+        "indistinguishable downstream from a real measurement")
+    assert frame["benchmark_ticker"].notna().all(), (
+        "the MAPPING is configuration, not a fetch result; blanking it would "
+        "make a vendor outage look like an unmapped ticker")
 
 
 def test_benchmark_fetch_retries_and_reports_an_unusable_response():
@@ -1748,13 +1920,18 @@ def test_upsert_allows_a_first_write_with_no_labels_yet():
     assert _attempt_write(engine, _incoming_frame(labelled=0)) == 10
 
 
-def test_compute_signals_frame_skips_a_benchmark_that_does_not_align():
+def test_a_benchmark_that_does_not_align_degrades_like_a_missing_one():
     """
-    `benchmark.empty` catches a download that returned nothing. It does not
-    catch one that returned rows for the wrong dates -- a truncated history, or
-    a merge that misses -- which leaves benchmark_close entirely null after the
-    ffill and produces a frame with a null target on every row. The old code
-    took that branch silently via `else: benchmark_return = np.nan`.
+    Two failures, one outcome. `benchmark.empty` catches a download that
+    returned nothing; it does NOT catch one that returned rows for the wrong
+    dates -- a truncated history, or a merge that misses -- which leaves
+    benchmark_close entirely null after the ffill.
+
+    Before P1 the first case skipped the ticker and the second silently wrote
+    nulls through `else: benchmark_return = np.nan`. Both now land in the same
+    place: the absolute label is computed, the excess label is NULL, and the
+    ticker is not skipped. Pinned because two paths that LOOK equivalent and
+    are not is how the second one stayed invisible in the first place.
     """
     from pipeline import signals
 
@@ -1785,10 +1962,13 @@ def test_compute_signals_frame_skips_a_benchmark_that_does_not_align():
         signals.get_benchmark = original_map
         signals.compute_earnings_surprise = original_earnings
 
-    assert frame is None, (
-        "a benchmark that does not align must be skipped, not written as a "
-        "frame whose every target is null"
-    )
+    assert frame is not None, (
+        "a misaligned benchmark must not cost the ticker its absolute label")
+    assert frame["target_return"].notna().sum() > 0
+    assert frame["target_excess_return"].isna().all(), (
+        "a benchmark that did not align must produce NULL excess labels, not "
+        "labels computed against a forward-filled level from another era")
+    assert frame["benchmark_close"].isna().all()
 
 
 # ── An abort must fail the run, not report success ────────────────────────────
@@ -2067,40 +2247,43 @@ def test_weekly_job_raises_when_labels_would_regress(monkeypatch):
 # by the process that fitted the model. Whether a forecast published on a given
 # date to a given reader turned out to be right had never been measured at all.
 
-def _outcomes_fixture(pred=0.05, realised=0.04, realised_total=0.06,
+def _outcomes_fixture(tmp_path, pred=0.05, realised=0.06, realised_excess=0.04,
                       low=95.0, high=125.0, price=100.0,
                       forecast_benchmark="^CNXIT", label_benchmark="^CNXIT"):
-    """One published forecast and the matured label that resolves it."""
-    from sqlalchemy import create_engine, text
+    """
+    One published forecast and the matured label that resolves it.
 
-    engine = create_engine("sqlite://")          # single shared connection
+    THE SCHEMA COMES FROM init_db(), not from a CREATE TABLE written here.
+    The previous version carried its own DDL and was therefore blind to every
+    schema change the writer depended on: it went on passing while
+    forecast_outcomes lacked the pred_return column that P1 made the primary
+    one. Same lesson the fundamentals suite already records — a test with its
+    own CREATE TABLE passes happily while the real schema is wrong.
+
+    File-backed, because sqlite:///:memory: opens a fresh empty database per
+    connection and init_db would build the schema in one while the test wrote
+    to another.
+
+    `realised` is the ABSOLUTE realised return, which is what a forecast is now
+    scored against. `realised_excess` rides along and may legitimately be None.
+    """
+    import sqlalchemy as sa
+
+    import data.db as db_mod
+
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'outcomes.db'}")
+    original = db_mod.get_engine
+    db_mod.get_engine = lambda: engine
+    try:
+        db_mod.init_db()
+    finally:
+        db_mod.get_engine = original
+
     with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TABLE forecasts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT,
-                pred_excess_return REAL, interval_low REAL, interval_high REAL,
-                current_price REAL, benchmark_ticker TEXT, last_updated TEXT)
-        """))
-        conn.execute(text("""
-            CREATE TABLE signals (
-                ticker TEXT, date TEXT, close REAL, target_return REAL,
-                target_excess_return REAL, benchmark_return REAL,
-                benchmark_ticker TEXT)
-        """))
-        conn.execute(text("""
-            CREATE TABLE forecast_outcomes (
-                forecast_id INTEGER, ticker TEXT NOT NULL,
-                forecast_date TEXT NOT NULL, resolution_date TEXT,
-                pred_excess_return REAL, realised_excess_return REAL,
-                realised_return REAL, benchmark_return REAL,
-                direction_correct INTEGER, inside_interval INTEGER,
-                PRIMARY KEY (ticker, forecast_date))
-        """))
-
         conn.execute(
-            text("INSERT INTO forecasts (ticker, pred_excess_return, interval_low, "
-                 "interval_high, current_price, benchmark_ticker, last_updated) "
-                 "VALUES ('TEST.NS', :p, :lo, :hi, :px, :b, '2026-06-01 18:30:00')"),
+            sa.text("INSERT INTO forecasts (ticker, pred_return, interval_low, "
+                    "interval_high, current_price, benchmark_ticker, last_updated) "
+                    "VALUES ('TEST.NS', :p, :lo, :hi, :px, :b, '2026-06-01 18:30:00')"),
             {"p": pred, "lo": low, "hi": high, "px": price, "b": forecast_benchmark},
         )
 
@@ -2108,11 +2291,15 @@ def _outcomes_fixture(pred=0.05, realised=0.04, realised_total=0.06,
         sessions = pd.bdate_range("2026-06-01", periods=40).strftime("%Y-%m-%d")
         for i, day in enumerate(sessions):
             conn.execute(
-                text("INSERT INTO signals VALUES (:t, :d, :c, :tr, :te, :br, :b)"),
+                sa.text("INSERT INTO signals (ticker, date, close, target_return, "
+                        "target_excess_return, benchmark_return, benchmark_ticker) "
+                        "VALUES (:t, :d, :c, :tr, :te, :br, :b)"),
                 {"t": "TEST.NS", "d": day, "c": price + i,
-                 "tr": realised_total if i == 0 else None,
-                 "te": realised if i == 0 else None,
-                 "br": (realised_total - realised) if (i == 0 and realised is not None) else None,
+                 "tr": realised if i == 0 else None,
+                 "te": realised_excess if i == 0 else None,
+                 "br": (realised - realised_excess)
+                       if (i == 0 and realised is not None
+                           and realised_excess is not None) else None,
                  "b": label_benchmark},
             )
         conn.commit()
@@ -2127,52 +2314,87 @@ def _outcome_rows(engine):
                 conn.execute(text("SELECT * FROM forecast_outcomes"))]
 
 
-def test_matured_forecasts_are_resolved_into_outcomes():
+def test_matured_forecasts_are_resolved_into_outcomes(tmp_path):
     from pipeline.outcomes import resolve_due_forecasts
 
-    engine = _outcomes_fixture()
+    engine = _outcomes_fixture(tmp_path)
     report = resolve_due_forecasts(engine=engine)
 
     assert report.resolved == 1, f"nothing resolved: {report.summary()}"
     row = _outcome_rows(engine)[0]
     assert row["ticker"] == "TEST.NS"
     assert row["forecast_date"] == "2026-06-01"
+    assert row["realised_return"] == pytest.approx(0.06)
     assert row["realised_excess_return"] == pytest.approx(0.04)
     assert row["direction_correct"] == 1, (
-        "predicted +5% excess, realised +4% — same direction"
+        "predicted +5%, realised +6% — same direction"
     )
 
 
-def test_a_wrong_direction_is_recorded_as_wrong():
+def test_direction_is_scored_on_the_quantity_that_was_published(tmp_path):
+    """
+    An absolute forecast is scored against the absolute outcome.
+
+    THE FAILURE THIS PINS is subtle and would have looked like a model getting
+    worse. Before P1 the published claim was an EXCESS return and direction was
+    scored against the excess label, which was right. Keeping that after the
+    switch would mark a forecast WRONG whenever the market fell far enough to
+    drag a rising stock below its index — punishing the model for a quantity it
+    no longer claims to predict.
+
+    Here the stock rose 6% while its benchmark rose 9%: the absolute call was
+    correct, the excess one was not. The recorded outcome must follow the claim.
+    """
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture(tmp_path, pred=0.05,
+                               realised=0.06, realised_excess=-0.03)
+    resolve_due_forecasts(engine=engine)
+
+    row = _outcome_rows(engine)[0]
+    assert row["direction_correct"] == 1, (
+        "the stock rose and the model said it would; the benchmark rising "
+        "faster is not a miss on a claim that never mentioned the benchmark")
+    assert row["realised_excess_return"] == pytest.approx(-0.03), (
+        "the excess outcome is still recorded — it is just not what direction "
+        "is scored on")
+
+
+def test_a_wrong_direction_is_recorded_as_wrong(tmp_path):
     """The point of the table is that it can say no."""
     from pipeline.outcomes import resolve_due_forecasts
 
-    engine = _outcomes_fixture(pred=0.05, realised=-0.03)
+    engine = _outcomes_fixture(tmp_path, pred=0.05, realised=-0.03,
+                               realised_excess=-0.04)
     resolve_due_forecasts(engine=engine)
 
     assert _outcome_rows(engine)[0]["direction_correct"] == 0
 
 
-def test_interval_coverage_is_scored_against_the_realised_price():
+def test_interval_coverage_is_scored_against_the_realised_price(tmp_path):
     """
-    The published interval is a PRICE band, and the realised price follows from
-    the realised TOTAL return, not the excess one. Scoring it against the excess
-    return would flatter the interval whenever the benchmark moved.
+    The published interval is a PRICE band, so it resolves against the realised
+    PRICE. That is now the same quantity the point forecast is scored on, which
+    it was not before P1: the interval was always built from the total return
+    while the point forecast was excess.
     """
     from pipeline.outcomes import resolve_due_forecasts
 
-    # +6% total on 100.0 lands at ~106.2, inside [95, 125].
-    inside = _outcomes_fixture(realised_total=0.06, low=95.0, high=125.0)
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+
+    # +6% on 100.0 lands at ~106.2, inside [95, 125].
+    inside = _outcomes_fixture(a, realised=0.06, low=95.0, high=125.0)
     resolve_due_forecasts(engine=inside)
     assert _outcome_rows(inside)[0]["inside_interval"] == 1
 
-    # +60% total lands at ~182, outside the same band.
-    outside = _outcomes_fixture(realised_total=0.60, low=95.0, high=125.0)
+    # +60% lands at ~182, outside the same band.
+    outside = _outcomes_fixture(b, realised=0.60, low=95.0, high=125.0)
     resolve_due_forecasts(engine=outside)
     assert _outcome_rows(outside)[0]["inside_interval"] == 0
 
 
-def test_resolution_is_idempotent():
+def test_resolution_is_idempotent(tmp_path):
     """
     A resolved outcome is a record, not a running total. Re-running the job must
     not rewrite history — the table exists precisely so that a published claim
@@ -2180,7 +2402,7 @@ def test_resolution_is_idempotent():
     """
     from pipeline.outcomes import resolve_due_forecasts
 
-    engine = _outcomes_fixture()
+    engine = _outcomes_fixture(tmp_path)
     first = resolve_due_forecasts(engine=engine)
     second = resolve_due_forecasts(engine=engine)
 
@@ -2189,42 +2411,77 @@ def test_resolution_is_idempotent():
     assert len(_outcome_rows(engine)) == 1
 
 
-def test_a_forecast_is_not_resolved_under_a_different_benchmark():
+def test_a_benchmark_change_nulls_the_excess_half_and_keeps_the_rest(tmp_path):
     """
-    The realised excess return depends on which index the ticker was measured
-    against. A forecast published against NIFTY IT and resolved against NIFTY 50
-    is not a test of that forecast — it is a test of the remapping.
+    A remapped benchmark used to discard the whole resolution. It must not now.
+
+    That refusal was right while the published claim WAS an excess return: a
+    forecast made against NIFTY IT and resolved against NIFTY 50 tested the
+    remapping, not the forecast. The claim is now the stock's own return, which
+    no index enters, so discarding it would throw away a valid outcome — and
+    this table is the only measurement in the project taken on published output
+    rather than held-out folds.
+
+    What is dropped instead is the half that genuinely is invalid.
     """
     from pipeline.outcomes import resolve_due_forecasts
 
-    engine = _outcomes_fixture(forecast_benchmark="^CNXIT",
+    engine = _outcomes_fixture(tmp_path, forecast_benchmark="^CNXIT",
                                label_benchmark="^NSEI")
     report = resolve_due_forecasts(engine=engine)
 
-    assert report.resolved == 0
+    assert report.resolved == 1
     assert report.benchmark_changed == 1
-    assert _outcome_rows(engine) == []
+
+    row = _outcome_rows(engine)[0]
+    assert row["realised_return"] == pytest.approx(0.06)
+    assert row["direction_correct"] == 1
+    assert row["realised_excess_return"] is None, (
+        "the excess outcome was measured against an index this forecast was "
+        "never published against")
+    assert row["benchmark_return"] is None
 
 
-def test_an_open_forecast_is_not_resolved():
+def test_an_open_forecast_is_not_resolved(tmp_path):
     """A null label means the horizon has not closed, not that the forecast failed."""
     from pipeline.outcomes import resolve_due_forecasts
 
-    engine = _outcomes_fixture(realised=None)
+    engine = _outcomes_fixture(tmp_path, realised=None, realised_excess=None)
     report = resolve_due_forecasts(engine=engine)
 
     assert report.resolved == 0 and report.not_due == 1
 
 
-def test_realised_accuracy_distinguishes_zero_from_unmeasured():
+def test_a_missing_benchmark_does_not_block_resolution(tmp_path):
+    """
+    The absolute label resolves a forecast on its own.
+
+    Eight of ten NSE sector indices stopped publishing around 2026-07-20, so a
+    matured row with target_return set and target_excess_return NULL is an
+    ordinary state rather than a defect. Gating resolution on the excess label
+    would have frozen the only forward measurement in the project for exactly
+    the tickers the vendor outage touched.
+    """
+    from pipeline.outcomes import resolve_due_forecasts
+
+    engine = _outcomes_fixture(tmp_path, realised=0.06, realised_excess=None)
+    report = resolve_due_forecasts(engine=engine)
+
+    assert report.resolved == 1
+    row = _outcome_rows(engine)[0]
+    assert row["realised_return"] == pytest.approx(0.06)
+    assert row["realised_excess_return"] is None
+
+
+def test_realised_accuracy_distinguishes_zero_from_unmeasured(tmp_path):
     """
     A hit rate of 0.0 and "nothing has matured yet" are different statements.
-    composite_score already collapses several meanings into one value; the
+    The retired composite_score collapsed several meanings into one value; the
     realised metrics must not repeat that.
     """
     from pipeline.outcomes import realised_accuracy, resolve_due_forecasts
 
-    engine = _outcomes_fixture()
+    engine = _outcomes_fixture(tmp_path)
     assert realised_accuracy(engine=engine)["hit_rate"] is None
 
     resolve_due_forecasts(engine=engine)
@@ -2553,7 +2810,7 @@ def test_the_narrative_falls_back_without_crashing_when_the_llm_call_fails():
     try:
         # _deserves_a_written_narrative must be True, or the earlier (correct)
         # call site is taken and this test proves nothing.
-        updates = {"eval_evaluated_at": "2026-08-01", "pred_excess_return": 0.03}
+        updates = {"eval_evaluated_at": "2026-08-01", "pred_return": 0.03}
         assert fa._deserves_a_written_narrative(updates) is True
 
         text = fa._narrative({"ticker": "ABB.NS", "latest_signals": {"rsi": 55}},

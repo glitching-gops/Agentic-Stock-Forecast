@@ -147,10 +147,10 @@ export function daysAgo(value: string | null | undefined): number | null {
  * others is a column that can disagree with them.
  */
 export function evidenceState(forecast: {
-  pred_excess_return: number | null;
+  pred_return: number | null;
   forecast_confidence: string | null;
 }): EvidenceState {
-  if (forecast.pred_excess_return === null) return "NO_FORECAST";
+  if (forecast.pred_return === null) return "NO_FORECAST";
   const grade = forecast.forecast_confidence;
   if (grade === "STRONG" || grade === "WEAK") return grade;
   return "INSUFFICIENT";

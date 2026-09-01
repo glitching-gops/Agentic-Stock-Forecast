@@ -48,7 +48,7 @@ def _build(context=128, stride=1, n_dates=700, min_train=200, folds=2):
         col = wide[t].to_numpy()
         for i in range(len(col) - 30):
             lab.append({"date": str(wide.index[i]), "ticker": t,
-                        "target_excess_return": float(col[i + 30] - col[i])})
+                        "target_return": float(col[i + 30] - col[i])})
     labelled = pd.DataFrame(lab).sort_values(["date", "ticker"])
     labelled = labelled.reset_index(drop=True)
 
@@ -111,7 +111,7 @@ def test_target_comes_from_the_panel_not_recomputed():
     """
     (fold, split, tick, end, y), labelled, _, wide, t_index, d_index, _ = _build()
 
-    lookup = {(r.date, r.ticker): r.target_excess_return
+    lookup = {(r.date, r.ticker): r.target_return
               for r in labelled.itertuples()}
     dates = [str(x) for x in wide.index]
     tickers = list(wide.columns)

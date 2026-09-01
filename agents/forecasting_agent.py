@@ -51,11 +51,11 @@ def _failed_forecast(reason: str) -> dict:
         "forecast_price": None,
         "forecast_direction": "UNAVAILABLE",
         "forecast_change_pct": None,
-        "pred_excess_return": None,
+        "pred_return": None,
         "interval_low": None,
         "interval_high": None,
         "interval_coverage": None,
-        "prob_outperform": None,
+        "prob_up": None,
         "random_walk_price": None,
         "benchmark_ticker": None,
         "benchmark_sector_specific": None,
@@ -90,13 +90,16 @@ def forecasting_node(state: AgentState) -> dict:
         "forecast_available": True,
         "forecast_error": None,
         "forecast_price": view["implied_price"],
-        "forecast_direction": "OUTPERFORM" if view["pred_excess_return"] > 0 else "UNDERPERFORM",
+        # UP / DOWN, not OUTPERFORM / UNDERPERFORM. The forecast is the
+        # stock's own return since P1 and is not relative to anything, so the
+        # comparative words would name a comparison that is no longer made.
+        "forecast_direction": "UP" if view["pred_return"] > 0 else "DOWN",
         "forecast_change_pct": view["implied_change_pct"],
-        "pred_excess_return": view["pred_excess_return"],
+        "pred_return": view["pred_return"],
         "interval_low": view.get("interval_low"),
         "interval_high": view.get("interval_high"),
         "interval_coverage": view.get("interval_coverage"),
-        "prob_outperform": view.get("prob_outperform"),
+        "prob_up": view.get("prob_up"),
         "random_walk_price": view["random_walk_price"],
         "benchmark_ticker": forecast.benchmark_ticker,
         "benchmark_sector_specific": forecast.benchmark_sector_specific,
@@ -158,7 +161,7 @@ def _deserves_a_written_narrative(updates: dict) -> bool:
     if not updates.get("eval_evaluated_at"):
         return False
 
-    pred = updates.get("pred_excess_return")
+    pred = updates.get("pred_return")
     return pred is not None and pred > 0
 
 

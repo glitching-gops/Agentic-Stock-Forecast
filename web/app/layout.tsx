@@ -107,7 +107,7 @@ function SiteFooter() {
             ZeRO is a research project. Every performance figure here is
             out-of-sample and stated before transaction costs. As measured, the
             model does not beat a majority-class baseline on direction or a
-            zero-excess forecast on magnitude — the calibrated intervals hold
+            market forecast on magnitude — the calibrated intervals hold
             up, the point forecast does not.{" "}
             <Link
               href="/methodology"

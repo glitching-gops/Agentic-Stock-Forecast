@@ -21,7 +21,7 @@ class EvaluationEvidence(BaseModel):
         None, description="Majority-class baseline on the same window, percent. "
                           "hit_rate is only meaningful relative to this.")
     beats_random_walk: Optional[bool] = Field(
-        None, description="Whether mean absolute error beats forecasting zero excess return.")
+        None, description="Whether mean absolute error beats forecasting zero. NOT the floor on an absolute-return target — see pipeline.baselines.FLOORS, where the floors are the market forecast and beta times it.")
     model_version: Optional[str] = None
     evaluated_at: Optional[str] = Field(
         None, description="When this evidence was last measured (Lever 1: weekly, not "
@@ -35,8 +35,8 @@ class ForecastResponse(BaseModel):
     sector: Optional[str] = None
 
     # What the model actually predicts
-    pred_excess_return: Optional[float] = Field(
-        None, description="Predicted 30-session log return in excess of the benchmark.")
+    pred_return: Optional[float] = Field(
+        None, description="Predicted 30-session log return. ABSOLUTE, not in excess of a benchmark: the model predicts where this stock goes, not how it does against an index.")
     benchmark_ticker: Optional[str] = None
     benchmark_name: Optional[str] = None
     benchmark_sector_specific: Optional[bool] = Field(
@@ -46,10 +46,10 @@ class ForecastResponse(BaseModel):
     # The rupee view derived from it
     current_price: Optional[float] = None
     forecast_price: Optional[float] = Field(
-        None, description="Implied price ASSUMING THE BENCHMARK IS FLAT. The model "
-                          "forecasts relative performance and says nothing about "
-                          "where the index goes.")
-    direction: Optional[str] = Field(None, description="OUTPERFORM / UNDERPERFORM / UNAVAILABLE")
+        None, description="The model's point forecast of the price in 30 sessions. "
+                          "It needs no assumption about the index: the forecast is "
+                          "the stock's own return.")
+    direction: Optional[str] = Field(None, description="UP / DOWN / UNAVAILABLE")
     change_pct: Optional[float] = None
     random_walk_price: Optional[float] = Field(
         None, description="Baseline forecast: today's price.")
@@ -59,8 +59,8 @@ class ForecastResponse(BaseModel):
     interval_high: Optional[float] = None
     interval_coverage: Optional[float] = Field(
         None, description="Nominal conformal coverage, e.g. 0.80.")
-    prob_outperform: Optional[float] = Field(
-        None, description="Calibrated probability the excess return exceeds zero.")
+    prob_up: Optional[float] = Field(
+        None, description="Calibrated probability the 30-session return is positive. Read it against 0.577, the measured unconditional rate on this universe — NOT against 0.5. A value of 0.55 is BEARISH.")
 
     # Evidence and review
     evaluation: Optional[EvaluationEvidence] = None
@@ -90,7 +90,7 @@ class CurrentForecast(BaseModel):
     is more informative than placing it 47th.
 
     Every unmeasured quantity is null, never 0.0. A zero here is a POSITION —
-    "the model predicts no excess return" — and is not the same statement as
+    "the model predicts no change" — and is not the same statement as
     "nothing has been measured". Conflating the two is how a dead sentiment
     scorer displayed a confident neutral reading for months.
     """
@@ -101,20 +101,21 @@ class CurrentForecast(BaseModel):
 
     current_price: Optional[float] = None
     forecast_price: Optional[float] = Field(
-        None, description="Implied price assuming the benchmark is flat.")
+        None, description="The model's point forecast of the price in 30 sessions.")
     direction: Optional[str] = Field(
-        None, description="OUTPERFORM / UNDERPERFORM / UNAVAILABLE")
+        None, description="UP / DOWN / UNAVAILABLE")
     change_pct: Optional[float] = Field(
         None, description="Implied percentage change. Was `upside_pct`; renamed "
                           "because a forecast can point down and 'upside' asserted "
                           "otherwise.")
-    pred_excess_return: Optional[float] = Field(
-        None, description="Predicted 30-session log return in excess of the benchmark.")
+    pred_return: Optional[float] = Field(
+        None, description="Predicted 30-session log return. ABSOLUTE, not in excess of a benchmark: the model predicts where this stock goes, not how it does against an index.")
 
     interval_low: Optional[float] = None
     interval_high: Optional[float] = None
     interval_coverage: Optional[float] = None
-    prob_outperform: Optional[float] = None
+    prob_up: Optional[float] = Field(
+        None, description="Calibrated probability the 30-session return is positive. Read it against 0.577, the measured unconditional rate on this universe — NOT against 0.5. A value of 0.55 is BEARISH.")
     random_walk_price: Optional[float] = None
 
     benchmark_ticker: Optional[str] = None
@@ -153,8 +154,8 @@ class ForecastListResponse(BaseModel):
         default=(
             "One 30-session forecast per stock over a fixed universe of 84 NIFTY "
             "100 names, selected on data quality alone and never on measured "
-            "accuracy. Predictions are of return in excess of a sector benchmark; "
-            "the rupee price assumes the benchmark is flat. Every eval_* figure "
+            "accuracy. Predictions are of the stock's own 30-session return, "
+            "absolute rather than relative to an index. Every eval_* figure "
             "comes from purged walk-forward evaluation with a 30-session embargo, "
             "on folds the model never trained on. These forecasts are NOT ranked "
             "against each other: the evidence gate clears too few names for an "

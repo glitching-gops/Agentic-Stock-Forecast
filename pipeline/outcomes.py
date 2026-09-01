@@ -10,14 +10,14 @@ right. Those are different claims, and the audit exists because the first was
 mistaken for the second once already.
 
 HOW A FORECAST IS RESOLVED. Not by recomputing returns here — by reading the
-label. `signals.target_excess_return` at date D is, by construction, the forward
-HORIZON_SESSIONS log return from D in excess of the benchmark: exactly the
-quantity the model was trained to predict, computed by exactly the code that
-computes the training label. A forecast made on D is therefore resolved the
-moment that row's target stops being null, and predicted-versus-realised is a
-comparison of like with like. Reimplementing the arithmetic here would create a
-second definition of "excess return" that could drift from the first, which is
-the class of defect F8 and F13 both belong to.
+label. `signals.target_return` at date D is, by construction, the forward
+HORIZON_SESSIONS log return from D: exactly the quantity the model was trained
+to predict, computed by exactly the code that computes the training label. A
+forecast made on D is therefore resolved the moment that row's target stops
+being null, and predicted-versus-realised is a comparison of like with like.
+Reimplementing the arithmetic here would create a second definition of "return"
+that could drift from the first, which is the class of defect F8 and F13 both
+belong to.
 
 IDEMPOTENT AND APPEND-ONLY. `forecast_outcomes` is keyed (ticker,
 forecast_date) and written with ON CONFLICT DO NOTHING. Re-running resolves
@@ -25,11 +25,24 @@ only what is newly due; a resolved outcome is never rewritten, because the
 whole point of the table is to be a record that cannot be quietly improved
 after the fact.
 
-BENCHMARK DRIFT IS RECORDED, NOT HIDDEN. The realised excess return depends on
-which index the ticker was benchmarked against, and that mapping can change
-(tools/audit_benchmarks.py changed it for 36 tickers on 2026-08-19). A forecast
-published under one benchmark and resolved under another is not a fair test of
-the forecast, so the resolution is skipped and counted rather than scored.
+BENCHMARK DRIFT NO LONGER BLOCKS A RESOLUTION, and the change is a consequence
+of the P1 target switch rather than a relaxation.
+
+It used to. The published claim was an EXCESS return, so it depended entirely on
+which index the ticker was benchmarked against; that mapping can change
+(tools/audit_benchmarks.py moved 36 tickers on 2026-08-19), and a forecast
+published under one index and resolved under another was not a test of the
+forecast at all. Skipping it was correct.
+
+The published claim is now the stock's OWN return, which no index enters. A
+benchmark change cannot make that comparison unfair, so refusing to resolve
+would be discarding a valid outcome — and this table is the only measurement in
+the project taken on published output rather than held-out folds, so discarding
+one is expensive. The resolution proceeds; what is dropped instead is the
+benchmark-dependent HALF of the row, `realised_excess_return` and
+`benchmark_return`, which are nulled and counted. A null there says "the index
+this was measured against is not the index it was published against", which is
+the honest record, and it is a different statement from a zero.
 """
 from __future__ import annotations
 
@@ -60,7 +73,7 @@ class OutcomeReport(NamedTuple):
 _DUE_FORECASTS = """
     SELECT f.ticker,
            f.forecast_date,
-           f.pred_excess_return,
+           f.pred_return,
            f.interval_low,
            f.interval_high,
            f.current_price,
@@ -69,7 +82,7 @@ _DUE_FORECASTS = """
     FROM (
         SELECT ticker,
                {date_expr}                             AS forecast_date,
-               pred_excess_return,
+               pred_return,
                interval_low,
                interval_high,
                current_price,
@@ -80,7 +93,7 @@ _DUE_FORECASTS = """
                    ORDER BY last_updated DESC, id DESC
                )                                       AS rn
         FROM forecasts
-        WHERE pred_excess_return IS NOT NULL
+        WHERE pred_return IS NOT NULL
     ) AS f
     WHERE f.rn = 1
 """
@@ -93,7 +106,7 @@ def _date_expr(dialect: str) -> str:
     return "DATE(last_updated)"
 
 
-def resolve_due_forecasts(engine=None, horizon_label: str = "target_excess_return"
+def resolve_due_forecasts(engine=None, horizon_label: str = "target_return"
                           ) -> OutcomeReport:
     """
     Writes an outcome row for every published forecast whose horizon has closed.
@@ -110,10 +123,14 @@ def resolve_due_forecasts(engine=None, horizon_label: str = "target_excess_retur
     if forecasts.empty:
         return OutcomeReport(0, 0, 0, 0)
 
-    # The realised label, straight from the signals table.
+    # The realised label, straight from the signals table. `horizon_label` is
+    # the PRIMARY one and gates which rows are due; the excess label rides
+    # along and may be null, which since P1 is an ordinary state rather than a
+    # defect — eight of ten NSE sector indices stopped publishing in July 2026
+    # and the absolute label is unaffected by that.
     labels = pd.read_sql(
-        text(f"SELECT ticker, date AS forecast_date, {horizon_label} AS realised_excess, "
-             f"target_return AS realised_return, benchmark_return, "
+        text(f"SELECT ticker, date AS forecast_date, {horizon_label} AS realised, "
+             f"target_excess_return AS realised_excess, benchmark_return, "
              f"benchmark_ticker AS label_benchmark, close AS price_at_forecast "
              f"FROM signals WHERE {horizon_label} IS NOT NULL"),
         engine,
@@ -137,13 +154,16 @@ def resolve_due_forecasts(engine=None, horizon_label: str = "target_excess_retur
     due = forecasts.merge(labels, on=["ticker", "forecast_date"], how="inner")
     not_due = len(forecasts) - len(due)
 
-    # A forecast published against one index and resolved against another is
-    # not a test of the forecast. Skip and count it.
+    # A benchmark change invalidates the EXCESS half of the row and nothing
+    # else. Null that half and count it, rather than discarding an otherwise
+    # valid resolution of the absolute claim that was actually published.
     if not due.empty:
         same = (due["benchmark_ticker"].fillna("") == due["label_benchmark"].fillna("")) \
                | (due["benchmark_ticker"].fillna("") == "")
         changed = int((~same).sum())
-        due = due[same]
+        if changed:
+            due = due.copy()
+            due.loc[~same, ["realised_excess", "benchmark_return"]] = None
     else:
         changed = 0
 
@@ -158,18 +178,26 @@ def resolve_due_forecasts(engine=None, horizon_label: str = "target_excess_retur
 
     rows = []
     for r in due.itertuples(index=False):
-        pred, realised = r.pred_excess_return, r.realised_excess
+        pred, realised = r.pred_return, r.realised
+
+        # Direction is scored on the PUBLISHED claim against the SAME quantity
+        # realised: an absolute forecast against an absolute outcome. Scoring
+        # it against the excess label — which is what this did before P1, and
+        # was correct then — would now mark a forecast wrong for the market
+        # moving, which the model never claimed to predict.
         direction = None
         if pred is not None and pd.notna(pred) and pd.notna(realised) and pred != 0:
             direction = int((pred > 0) == (realised > 0))
 
-        # The published interval is a PRICE band. The realised price follows
-        # from the realised TOTAL return, not the excess one.
+        # The published interval is a PRICE band, so it resolves against the
+        # realised price. That is now the same quantity the point forecast is
+        # scored on, which it was not before: the interval was always built
+        # from the total return while the point forecast was excess.
         inside = None
         if (pd.notna(r.interval_low) and pd.notna(r.interval_high)
-                and pd.notna(r.realised_return) and pd.notna(r.price_at_forecast)):
+                and pd.notna(realised) and pd.notna(r.price_at_forecast)):
             import math
-            realised_price = float(r.price_at_forecast) * math.exp(float(r.realised_return))
+            realised_price = float(r.price_at_forecast) * math.exp(float(realised))
             inside = int(float(r.interval_low) <= realised_price <= float(r.interval_high))
 
         rows.append({
@@ -177,10 +205,12 @@ def resolve_due_forecasts(engine=None, horizon_label: str = "target_excess_retur
             "ticker": r.ticker,
             "forecast_date": r.forecast_date,
             "resolution_date": getattr(r, "resolution_date", None),
-            "pred_excess_return": float(pred) if pd.notna(pred) else None,
-            "realised_excess_return": float(realised) if pd.notna(realised) else None,
-            "realised_return": float(r.realised_return) if pd.notna(r.realised_return) else None,
-            "benchmark_return": float(r.benchmark_return) if pd.notna(r.benchmark_return) else None,
+            "pred_return": float(pred) if pd.notna(pred) else None,
+            "realised_return": float(realised) if pd.notna(realised) else None,
+            "realised_excess_return": (float(r.realised_excess)
+                                       if pd.notna(r.realised_excess) else None),
+            "benchmark_return": (float(r.benchmark_return)
+                                 if pd.notna(r.benchmark_return) else None),
             "direction_correct": direction,
             "inside_interval": inside,
         })
@@ -254,8 +284,8 @@ def realised_accuracy(engine=None, ticker: str | None = None) -> dict:
             SELECT COUNT(*)                          AS n,
                    AVG(CAST(direction_correct AS FLOAT)) AS hit_rate,
                    AVG(CAST(inside_interval AS FLOAT))   AS coverage,
-                   AVG(realised_excess_return)       AS mean_realised_excess,
-                   AVG(pred_excess_return)           AS mean_pred_excess
+                   AVG(realised_return)              AS mean_realised,
+                   AVG(pred_return)                  AS mean_pred
             FROM forecast_outcomes {where}
         """),
         engine, params=params,
@@ -264,13 +294,13 @@ def realised_accuracy(engine=None, ticker: str | None = None) -> dict:
     n = int(row.get("n") or 0)
     if n == 0:
         return {"n": 0, "hit_rate": None, "interval_coverage": None,
-                "mean_realised_excess": None, "mean_pred_excess": None}
+                "mean_realised": None, "mean_pred": None}
     return {
         "n": n,
         "hit_rate": _f(row.get("hit_rate")),
         "interval_coverage": _f(row.get("coverage")),
-        "mean_realised_excess": _f(row.get("mean_realised_excess")),
-        "mean_pred_excess": _f(row.get("mean_pred_excess")),
+        "mean_realised": _f(row.get("mean_realised")),
+        "mean_pred": _f(row.get("mean_pred")),
     }
 
 

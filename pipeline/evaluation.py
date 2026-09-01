@@ -303,8 +303,17 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     n_eff = effective_sample_size(len(yt), horizon)
     ic_t = float(ic * np.sqrt(max(n_eff - 1, 1))) if np.isfinite(ic) else float("nan")
 
-    # The naive forecast for an EXCESS return is zero: "this stock will track
-    # its benchmark". That is the random walk in this target space.
+    # mae_naive_zero is the MAE of predicting ZERO. It is knowable without
+    # running any comparator at all, which is the only reason it can live in a
+    # per-model report - every other floor is a relation BETWEEN comparators
+    # and the report only ever sees one.
+    #
+    # It is no longer THE floor, and reading it as one now overstates every
+    # model. On an excess return, zero was the random walk in target space and
+    # beating it meant saying something about the company. On the absolute
+    # return this now measures, zero is beaten by drift: 57.67% of these labels
+    # are positive. See pipeline.baselines.FLOORS - `market` bounds MAE and
+    # `beta_market` bounds ordering, and both need the full comparator set.
     mae_model = float(np.mean(np.abs(yt - yp)))
     mae_naive = float(np.mean(np.abs(yt)))
 
@@ -468,7 +477,7 @@ class PanelResult:
 
 
 def oos_dates(panel: pd.DataFrame, splitter: "PurgedPanelWalkForward",
-              target: str = "target_excess_return") -> np.ndarray:
+              target: str = "target_return") -> np.ndarray:
     """
     Every out-of-sample date the folds would score, pooled and sorted.
 
@@ -501,7 +510,7 @@ def panel_walk_forward(
     model_factory: Callable[[], object],
     splitter: PurgedPanelWalkForward | None = None,
     name: str = "",
-    target: str = "target_excess_return",
+    target: str = "target_return",
     rebalance_every: int = 30,
     score_dates: set | None = None,
 ) -> PanelResult:
@@ -805,7 +814,8 @@ def format_report(result: WalkForwardResult) -> str:
         f"  hit rate         {m.get('hit_rate', float('nan')):.2f}%   "
         f"majority baseline {m.get('majority_hit_rate', float('nan')):.2f}%",
         f"  MAE              {m.get('mae', float('nan')):.5f}   "
-        f"naive (zero excess) {zero.get('mae', float('nan')):.5f}",
-        f"  beats naive MAE  {m.get('beats_naive_mae', False)}",
+        f"zero forecast {zero.get('mae', float('nan')):.5f}",
+        f"  beats zero MAE   {m.get('beats_naive_mae', False)}  "
+        f"(NOT the floor - see pipeline.baselines.FLOORS)",
     ]
     return "\n".join(lines)

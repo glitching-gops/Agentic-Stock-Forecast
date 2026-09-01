@@ -62,12 +62,12 @@ export interface CurrentForecast {
   /** Implied percentage change. Was `upside_pct`; a forecast can point down. */
   change_pct: number | null;
   /** Predicted 30-session log return in excess of the benchmark. */
-  pred_excess_return: number | null;
+  pred_return: number | null;
 
   interval_low: number | null;
   interval_high: number | null;
   interval_coverage: number | null;
-  prob_outperform: number | null;
+  prob_up: number | null;
   random_walk_price: number | null;
 
   benchmark_ticker: string | null;
@@ -116,7 +116,7 @@ export interface Forecast {
   company: string | null;
   sector: string | null;
 
-  pred_excess_return: number | null;
+  pred_return: number | null;
   benchmark_ticker: string | null;
   benchmark_name: string | null;
   /** False when the stock falls back to NIFTY 50 for want of a sector index. */
@@ -131,7 +131,7 @@ export interface Forecast {
   interval_low: number | null;
   interval_high: number | null;
   interval_coverage: number | null;
-  prob_outperform: number | null;
+  prob_up: number | null;
 
   evaluation: EvaluationEvidence | null;
   forecast_confidence: EvidenceGrade | string | null;

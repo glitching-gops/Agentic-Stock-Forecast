@@ -47,13 +47,13 @@ class AgentState(TypedDict, total=False):
     forecast_available: bool
     forecast_error: Optional[str]
     forecast_price: Optional[float]          # implied, benchmark assumed flat
-    forecast_direction: str                  # OUTPERFORM / UNDERPERFORM / UNAVAILABLE
+    forecast_direction: str                  # UP / DOWN / UNAVAILABLE
     forecast_change_pct: Optional[float]
-    pred_excess_return: Optional[float]      # the model's actual output
+    pred_return: Optional[float]      # the model's actual output
     interval_low: Optional[float]
     interval_high: Optional[float]
     interval_coverage: Optional[float]
-    prob_outperform: Optional[float]
+    prob_up: Optional[float]
     random_walk_price: Optional[float]
     benchmark_ticker: Optional[str]
     benchmark_sector_specific: Optional[bool]

@@ -151,27 +151,33 @@ def calibration_curve(
 
 def to_price_view(
     current_price: float,
-    pred_excess_return: float,
+    pred_return: float,
     calibration: ConformalCalibration | None,
 ) -> dict:
     """
-    Converts a log excess-return forecast into the rupee view the dashboard shows.
+    Converts a log return forecast into the rupee view the dashboard shows.
 
-    IMPORTANT — the implied price assumes the benchmark is FLAT over the
-    horizon. The model forecasts performance *relative to* the benchmark, so it
-    has nothing to say about where the index goes. Presenting the implied target
-    without that caveat would re-introduce exactly the overclaiming Phase 0 is
-    removing, which is why ``assumption`` travels with the number.
+    ``pred_return`` is the ABSOLUTE 30-session log return since P1, so the
+    implied price is a plain price target and needs no caveat about the index.
+    That is a real simplification and worth stating: the previous version
+    forecast an EXCESS return, from which a rupee figure could only be derived
+    by ASSUMING the benchmark stayed flat - an assumption nobody believes, that
+    had to travel with every number, and that made the headline figure on every
+    stock page conditional on something the model had no view about.
+
+    ``prob_up`` is P(the stock rises), not P(it beats its benchmark). Read it
+    against 57.67%, the measured unconditional rate of a positive 30-session
+    return on this universe - NOT against 50%. A 0.55 here is BEARISH.
     """
-    implied = float(current_price * math.exp(pred_excess_return))
+    implied = float(current_price * math.exp(pred_return))
 
     view = {
         "current_price": float(current_price),
-        "pred_excess_return": float(pred_excess_return),
+        "pred_return": float(pred_return),
         "implied_price": implied,
         "implied_change_pct": float((implied / current_price - 1) * 100),
         "random_walk_price": float(current_price),
-        "assumption": "Implied price assumes the benchmark index is flat over the horizon.",
+        "assumption": "Implied price is the model's point forecast; the interval around it is the calibrated part.",
     }
 
     if calibration is None:
@@ -179,16 +185,16 @@ def to_price_view(
             "interval_low": None,
             "interval_high": None,
             "interval_coverage": None,
-            "prob_outperform": None,
+            "prob_up": None,
             "note": "Not enough out-of-sample residuals to calibrate an interval.",
         })
         return view
 
-    lo, hi = calibration.interval(pred_excess_return)
+    lo, hi = calibration.interval(pred_return)
     view.update({
         "interval_low": float(current_price * math.exp(lo)),
         "interval_high": float(current_price * math.exp(hi)),
         "interval_coverage": calibration.coverage,
-        "prob_outperform": calibration.prob_positive(pred_excess_return),
+        "prob_up": calibration.prob_positive(pred_return),
     })
     return view

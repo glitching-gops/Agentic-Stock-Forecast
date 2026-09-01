@@ -90,7 +90,7 @@ export async function generateMetadata({
   if (!forecast) return { title: ticker };
   return {
     title: `${forecast.company ?? forecast.ticker}`,
-    description: `Predicted 30-session excess return, held-out evidence and critic review for ${forecast.company ?? forecast.ticker} (${forecast.ticker}).`,
+    description: `Predicted 30-session return, held-out evidence and critic review for ${forecast.company ?? forecast.ticker} (${forecast.ticker}).`,
   };
 }
 
@@ -253,12 +253,12 @@ function Overview({
   benchmark: string;
   history: SignalRow[];
 }) {
-  const excess = forecast.pred_excess_return;
+  const excess = forecast.pred_return;
   const evaluation = forecast.evaluation;
   const coverage = forecast.interval_coverage;
 
   const direction =
-    forecast.direction === "OUTPERFORM"
+    forecast.direction === "UP"
       ? { symbol: "▲", cls: "text-pos" }
       : forecast.direction === "UNDERPERFORM"
         ? { symbol: "▼", cls: "text-neg" }
@@ -267,8 +267,8 @@ function Overview({
   const contradicts =
     excess !== null &&
     excess < 0 &&
-    forecast.prob_outperform !== null &&
-    forecast.prob_outperform > 0.5;
+    forecast.prob_up !== null &&
+    forecast.prob_up > 0.5;
 
   const points: PricePoint[] = history.map((row) => ({
     date: row.date,
@@ -295,7 +295,7 @@ function Overview({
 
         <Readout
           label="Implied 30-session target"
-          help="Derived from the excess-return forecast. The model says nothing about where the index itself goes."
+          help="The model's point forecast of the price in 30 sessions."
           value={
             <span className="flex flex-wrap items-baseline gap-2">
               {money(forecast.forecast_price)}
@@ -318,13 +318,13 @@ function Overview({
         />
 
         <Readout
-          label="P(outperform)"
-          value={probability(forecast.prob_outperform)}
+          label="P(up)"
+          value={probability(forecast.prob_up)}
           help="Calibrated on out-of-sample conformal residuals."
           tone={
-            (forecast.prob_outperform ?? 0.5) > 0.55
+            (forecast.prob_up ?? 0.5) > 0.55
               ? "pos"
-              : (forecast.prob_outperform ?? 0.5) < 0.45
+              : (forecast.prob_up ?? 0.5) < 0.45
                 ? "neg"
                 : "dim"
           }

@@ -403,16 +403,31 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     index_ticker, is_sector = get_benchmark(ticker)
     benchmark = get_benchmark_series(index_ticker)
 
-    # Without a benchmark there is no excess return, so every row's target
-    # would be NULL — and _upsert_signals DELETEs the recomputed range before
-    # reinserting, so writing that frame destroys whatever labels the ticker
-    # already had. Refusing to compute leaves the existing rows intact; a stale
-    # label is recoverable on the next run, an erased one is not.
+    # THE BENCHMARK IS NO LONGER REQUIRED FOR A LABEL, and this is the single
+    # largest practical consequence of the P1 target switch.
+    #
+    # It used to be. target_excess_return is the stock's return MINUS the
+    # index's, so a missing index NULLed every row's target — and because
+    # _upsert_signals DELETEs the recomputed range before reinserting, writing
+    # that frame destroyed whatever labels the ticker already had. Refusing
+    # outright was the correct response to that, and it is what kept 55 tickers
+    # frozen on stale signals after Yahoo stopped publishing eight of the ten
+    # NSE sector indices around 2026-07-20.
+    #
+    # target_return asks the index nothing. So a dead benchmark now costs the
+    # excess label and the benchmark columns, and nothing else: the primary
+    # target, every feature and every forecast survive. The vendor outage stops
+    # being a labelling problem and becomes exactly what it is, a gap in a
+    # secondary column.
+    #
+    # The refusal that replaced it lives at the write boundary and is stricter
+    # rather than looser: _upsert_signals now refuses a decrease in EITHER
+    # target's labelled count, so a run that would erase historical excess
+    # labels for a name whose index has since died is still blocked.
     if benchmark.empty:
-        print(f"[Signals] {ticker}: SKIPPED — benchmark {index_ticker} "
-              f"unavailable, refusing to overwrite existing labels with a "
-              f"null target.")
-        return None
+        print(f"[Signals] {ticker}: benchmark {index_ticker} unavailable — "
+              f"computing the absolute-return target only; the excess-return "
+              f"label and the benchmark columns will be NULL for this run.")
 
     df = compute_sector_momentum(df, benchmark)
     df = compute_earnings_surprise(ticker, df)
@@ -423,30 +438,46 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
 
     h = HORIZON_SESSIONS
     log_close = np.log(df["close"])
+
+    # THE PRIMARY LABEL, and it depends on nothing but this ticker's own close.
     df["target_return"] = log_close.shift(-h) - log_close
 
     # An index that downloads but does not ALIGN is the same failure wearing a
     # different hat: a truncated history, or dates that fail to merge, leaves
     # benchmark_close entirely null after the ffill, and the `benchmark.empty`
-    # check above cannot see it. The old code took that branch quietly and set
-    # benchmark_return to NaN, which is how a non-empty benchmark still
-    # produced a frame with a null target on every row.
-    if not df["benchmark_close"].notna().any():
-        print(f"[Signals] {ticker}: SKIPPED - benchmark {index_ticker} "
-              f"returned {len(benchmark)} rows, none aligned to this ticker's "
-              f"sessions; refusing to compute a null target.")
-        return None
+    # check above cannot see it. Both cases now degrade to the same place —
+    # the excess label is NULL and the absolute one is not — rather than one
+    # skipping the ticker and the other silently writing nulls.
+    aligned = ("benchmark_close" in df.columns
+               and bool(df["benchmark_close"].notna().any()))
 
-    log_bench = np.log(df["benchmark_close"])
-    df["benchmark_return"] = log_bench.shift(-h) - log_bench
-    df["target_excess_return"] = df["target_return"] - df["benchmark_return"]
-
-    df["benchmark_ticker"] = index_ticker
-    df["benchmark_sector_specific"] = 1 if is_sector else 0
+    if aligned:
+        log_bench = np.log(df["benchmark_close"])
+        df["benchmark_return"] = log_bench.shift(-h) - log_bench
+        df["target_excess_return"] = df["target_return"] - df["benchmark_return"]
+        df["benchmark_ticker"] = index_ticker
+        df["benchmark_sector_specific"] = 1 if is_sector else 0
+    else:
+        print(f"[Signals] {ticker}: benchmark {index_ticker} returned "
+              f"{len(benchmark)} rows, none aligned to this ticker's sessions "
+              f"— the excess-return label is NULL for this run; the "
+              f"absolute-return label is unaffected.")
+        df["benchmark_close"] = np.nan
+        df["benchmark_return"] = np.nan
+        df["target_excess_return"] = np.nan
+        # The MAPPING is recorded even when the series is missing. Which index
+        # this ticker is benchmarked against is a fact about the configuration,
+        # not about whether Yahoo answered today, and blanking it would make a
+        # vendor outage look like an unmapped ticker.
+        df["benchmark_ticker"] = index_ticker
+        df["benchmark_sector_specific"] = 1 if is_sector else 0
     df["ticker"] = ticker
 
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=FEATURE_COLS)
+
+    # A row with no benchmark still has close, every feature and the primary
+    # label. Dropping on the target columns here would undo the whole point.
 
     # benchmark_close is persisted alongside the targets, not as one of them.
     # It is an observation at date t, so unlike benchmark_return it is safe to
@@ -457,14 +488,31 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     return df[keep].reset_index(drop=True)
 
 
-def _labelled_rows_from(conn, ticker: str, start: str) -> int:
-    """Labelled rows this ticker already holds in the range about to be replaced."""
-    n = conn.execute(
-        text("SELECT COUNT(*) FROM signals WHERE ticker = :t AND date >= :start "
-             "AND target_excess_return IS NOT NULL"),
-        {"t": ticker, "start": start},
-    ).scalar()
-    return int(n or 0)
+#: Every label the write boundary protects. The primary target first.
+LABEL_COLS = ("target_return", "target_excess_return")
+
+
+def _labelled_rows_from(conn, ticker: str, start: str) -> dict[str, int]:
+    """
+    Labelled rows this ticker already holds in the range about to be replaced,
+    PER TARGET.
+
+    Both are counted, not just the primary one. Since P1 a dead benchmark index
+    costs only the excess label, so a recompute for such a ticker writes a full
+    set of target_return values and a column of NULL excess ones. Counting the
+    primary target alone would wave that through — and because the write is a
+    DELETE over the range, it would erase every historical excess label the
+    ticker had from before its index went dark. That is F6 exactly, reappearing
+    through the door the target switch opened.
+    """
+    counts = {}
+    for col in LABEL_COLS:
+        counts[col] = int(conn.execute(
+            text(f"SELECT COUNT(*) FROM signals WHERE ticker = :t "
+                 f"AND date >= :start AND {col} IS NOT NULL"),
+            {"t": ticker, "start": start},
+        ).scalar() or 0)
+    return counts
 
 
 def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
@@ -483,6 +531,9 @@ def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
     the delete and the write refused outright -- the last moment at which the
     existing labels still exist. See LabelLossRefused.
 
+    EVERY label is checked, not only the primary one -- see
+    _labelled_rows_from for why the target switch made that necessary.
+
     The comparison is a decrease check rather than a null-frame check on
     purpose. A null-frame check catches only total destruction, and would also
     wrongly block a genuinely new listing whose forward labels are all still in
@@ -496,17 +547,20 @@ def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
 
     start = df["date"].min()
     existing = _labelled_rows_from(conn, ticker, start)
-    incoming = int(df["target_excess_return"].notna().sum())
 
-    if incoming < existing:
-        raise LabelLossRefused(
-            f"{ticker}: this frame would drop labelled rows from {existing} to "
-            f"{incoming} over dates >= {start}. Refusing the write; the ticker "
-            f"keeps its existing labels and its signals go stale until the next "
-            f"clean run. The usual cause is a benchmark index that failed to "
-            f"download or failed to align, which NULLs the excess-return target "
-            f"for every stock mapped to it."
-        )
+    for col in LABEL_COLS:
+        incoming = (int(df[col].notna().sum()) if col in df.columns else 0)
+        if incoming < existing[col]:
+            raise LabelLossRefused(
+                f"{ticker}: this frame would drop {col} from {existing[col]} to "
+                f"{incoming} labelled rows over dates >= {start}. Refusing the "
+                f"write; the ticker keeps its existing labels and its signals go "
+                f"stale until the next clean run. The usual cause is a benchmark "
+                f"index that failed to download or failed to align, which NULLs "
+                f"target_excess_return for every stock mapped to it — note that "
+                f"target_return is unaffected by that, so a refusal naming the "
+                f"excess column alone is the outage and not a data defect."
+            )
 
     conn.execute(
         text("DELETE FROM signals WHERE ticker = :t AND date >= :start"),
@@ -583,17 +637,25 @@ def compute_and_store(single_ticker: str | None = None,
 
 def count_labelled_rows(ticker: str | None = None) -> int:
     """
-    Number of rows with a usable target. The F6 regression test asserts this
-    is non-decreasing across runs.
+    Number of rows carrying the PRIMARY target. The F6 regression test asserts
+    this is non-decreasing across runs.
+
+    Counts target_return since P1. The number it reports therefore JUMPS at the
+    switch — upward, and by a lot, because every row that had an excess label
+    also had an absolute one and 55 tickers had been blocked from writing any
+    label at all by a dead index. A jump is safe for the F6 guard, which only
+    ever refuses a DECREASE, but it means a count recorded before the switch is
+    not comparable with one recorded after. That is what MODEL_VERSION and
+    experiment_runs.data_hash exist to make visible.
     """
     engine = get_engine()
     if ticker:
         q = text("SELECT COUNT(*) AS n FROM signals "
-                 "WHERE ticker = :t AND target_excess_return IS NOT NULL")
+                 "WHERE ticker = :t AND target_return IS NOT NULL")
         df = pd.read_sql(q, engine, params={"t": ticker})
     else:
         df = pd.read_sql(
-            text("SELECT COUNT(*) AS n FROM signals WHERE target_excess_return IS NOT NULL"),
+            text("SELECT COUNT(*) AS n FROM signals WHERE target_return IS NOT NULL"),
             engine,
         )
     return int(df["n"].iloc[0]) if not df.empty else 0

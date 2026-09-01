@@ -70,7 +70,31 @@ MACRO_COLS = [
 
 FEATURES = FEATURE_COLS + MACRO_COLS
 
-TARGET = "target_excess_return"
+#: What the model predicts. ABSOLUTE 30-session log return since P1.
+#:
+#: The excess-return label is not deleted — it is still computed, still stored,
+#: and still loaded into every panel as EXCESS_TARGET. Dropping it would make
+#: every Phase 2 result permanently unreadable: six foundation-model
+#: configurations, a linear probe, LoRA, a ridge, a tree and the valuation
+#: experiment were all scored against it, and a number you cannot re-measure is
+#: a number you cannot compare against.
+#:
+#: THE SWITCH MAKES THE TARGET EASIER TO FAKE, and that is the thing to hold on
+#: to. Measured over 84 tickers and 205,973 windows: 57.67% of 30-session
+#: absolute returns are positive, against ~52% for excess return, so a model
+#: that always says "up" gains ~5.7 points of apparent accuracy over the excess
+#: target while learning nothing. And 32.8% of return variance is COMMON across
+#: stocks, so predicting the market captures a third of the target with zero
+#: stock-specific information. `zero` stops being the right floor the moment
+#: the target has drift in it — see baselines.always_up / market / beta_market,
+#: which exist for exactly this.
+TARGET = "target_return"
+
+#: The previous target, kept alongside. Loaded into every panel so a Phase 2
+#: comparison can be re-run on the label it was originally measured against.
+EXCESS_TARGET = "target_excess_return"
+
+TARGETS = (TARGET, EXCESS_TARGET)
 
 # Denominated in rupees or share counts, so their level differs between
 # tickers for reasons that have nothing to do with the forecast. See the
@@ -108,8 +132,13 @@ def load_panel(
     queries per ticker and cost ~200 sequential round trips per request, which
     is what made `/api/stocks` a 51-second call.
 
-    Returns columns: date, ticker, close, FEATURES..., target_excess_return,
-    benchmark_ticker — sorted by (date, ticker).
+    Returns columns: date, ticker, close, FEATURES..., target_return,
+    target_excess_return, benchmark_ticker — sorted by (date, ticker).
+
+    BOTH targets are loaded, always. The excess label is the only comparable
+    record of everything Phase 2 already tried, and a panel that carried only
+    the current target would make re-running any of it impossible without a
+    second loader.
     """
     engine = engine or get_engine()
 
@@ -124,8 +153,13 @@ def load_panel(
     optional = [c for c in ("benchmark_close", "benchmark_ticker")
                 if c in available]
 
+    # EXCESS_TARGET is optional for the same reason benchmark_close is: a
+    # database that predates the column should produce a panel without it and
+    # a note, not a hard failure of the whole comparison.
+    optional_targets = [c for c in (EXCESS_TARGET,) if c in available]
+
     cols = ", ".join(["date", "ticker", "close", *FEATURE_COLS, TARGET,
-                      *optional])
+                      *optional_targets, *optional])
     where, params = [], {}
     if start:
         where.append("date >= :start")
@@ -154,7 +188,11 @@ def load_panel(
         panel[col] = pd.to_numeric(panel[col], errors="coerce")
         panel[col] = panel[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    panel[TARGET] = pd.to_numeric(panel[TARGET], errors="coerce")
+    for col in TARGETS:
+        if col in panel.columns:
+            panel[col] = pd.to_numeric(panel[col], errors="coerce")
+        else:
+            panel[col] = np.nan
     return panel.sort_values(["date", "ticker"]).reset_index(drop=True)
 
 
@@ -243,42 +281,45 @@ def cross_sectional_zscore(
 
 
 def retarget_horizon(panel: pd.DataFrame, horizon: int,
-                     min_coverage: float = 0.90) -> pd.DataFrame:
+                     min_coverage: float = 0.90,
+                     target: str = TARGET) -> pd.DataFrame:
     """
-    Replaces ``TARGET`` with the excess return over `horizon` sessions.
+    Replaces `target` with the same quantity measured over `horizon` sessions.
 
-    Free, and exact, because of the identity in ``relative_price_frame``: the
-    h-session forward difference of ``log(close / benchmark_close)`` IS the
-    h-session excess return, for any h. Nothing has to be refetched and no
-    approximation is introduced — the stored 30-session label is simply one
-    value of h among many.
+    Free, and exact, because of the identity in ``price_frame``: the h-session
+    forward difference of that frame IS the h-session label, for any h.
+    Nothing has to be refetched and no approximation is introduced — the stored
+    30-session label is simply one value of h among many.
 
     This is what makes a horizon sweep affordable. The alternative would be
     recomputing labels through ``pipeline.signals`` at each horizon, which
     means refetching every benchmark and rewriting the signals table four
     times.
 
-    Refuses below `min_coverage`, because a ticker whose ``benchmark_close``
-    was never backfilled produces an all-NaN column here. Those tickers would
-    silently drop out of the labelled set, and the sweep would compare horizons
-    over different universes — which is exactly the confound it exists to
-    avoid.
+    The coverage refusal applies ONLY to the excess target, and that asymmetry
+    is the point rather than an oversight. The relative series needs
+    ``benchmark_close``, and a ticker whose level was never backfilled produces
+    an all-NaN column, drops silently out of the labelled set, and leaves the
+    sweep comparing horizons over different universes. The absolute series
+    needs only ``close``, which every row has by construction, so there is no
+    coverage question to ask.
     """
-    wide = relative_price_frame(panel)
+    wide = price_frame(panel, target)
     if wide.empty:
         raise ValueError(
-            "retarget_horizon needs benchmark_close, which is absent from this "
-            "panel. Recompute signals before sweeping horizons."
+            f"retarget_horizon found no usable price series for {target}. "
+            f"Recompute signals before sweeping horizons."
         )
 
-    labelled = int(pd.to_numeric(panel[TARGET], errors="coerce").notna().sum())
-    have_level = int(panel["benchmark_close"].notna().sum())
-    if labelled and have_level / labelled < min_coverage:
-        raise ValueError(
-            f"benchmark_close covers {have_level / labelled:.1%} of labelled "
-            f"rows, below {min_coverage:.0%}. Retargeting would drop the "
-            f"uncovered tickers and compare horizons over different universes."
-        )
+    if target == EXCESS_TARGET:
+        labelled = int(pd.to_numeric(panel[target], errors="coerce").notna().sum())
+        have_level = int(panel["benchmark_close"].notna().sum())
+        if labelled and have_level / labelled < min_coverage:
+            raise ValueError(
+                f"benchmark_close covers {have_level / labelled:.1%} of labelled "
+                f"rows, below {min_coverage:.0%}. Retargeting would drop the "
+                f"uncovered tickers and compare horizons over different universes."
+            )
 
     # Shifted WITHIN each ticker, never across the shared date grid.
     #
@@ -290,23 +331,66 @@ def retarget_horizon(panel: pd.DataFrame, horizon: int,
     # history is most irregular. Measured: it broke the identity by 4.8e-02
     # against a stored label that reproduces at 1e-15 when shifted per ticker.
     rel = panel[["date", "ticker"]].copy()
-    close = pd.to_numeric(panel["close"], errors="coerce")
-    bench = pd.to_numeric(panel["benchmark_close"], errors="coerce")
-    ratio = (close / bench).replace([np.inf, -np.inf], np.nan)
-    rel["_rel"] = np.log(ratio.where(ratio > 0))
+    rel["_rel"] = _log_price_basis(panel, target)
 
     rel = rel.sort_values(["ticker", "date"], kind="mergesort")
     grouped = rel.groupby("ticker", sort=False)["_rel"]
     rel["_retarget"] = grouped.shift(-horizon) - rel["_rel"]
 
-    out = panel.drop(columns=[TARGET]).merge(
+    out = panel.drop(columns=[target]).merge(
         rel[["date", "ticker", "_retarget"]], on=["date", "ticker"], how="left")
-    return out.rename(columns={"_retarget": TARGET})
+    return out.rename(columns={"_retarget": target})
+
+
+def _log_price_basis(panel: pd.DataFrame, target: str) -> pd.Series:
+    """
+    The log series whose h-session forward difference IS `target`.
+
+    Absolute: ``log(close)``. Excess: ``log(close / benchmark_close)``.
+
+    ONE function, because the two must not be able to disagree. A series model
+    handed the relative basis while being scored against the absolute label is
+    measuring a quantity nobody asked for, and it fails SILENTLY: the table
+    renders, the numbers are the right order of magnitude, and the only symptom
+    is a comparator that mysteriously will not beat the floor. Deriving the
+    basis from the target name makes that combination unconstructable.
+    """
+    close = pd.to_numeric(panel["close"], errors="coerce")
+    if target == TARGET:
+        return np.log(close.where(close > 0))
+    if target == EXCESS_TARGET:
+        bench = pd.to_numeric(panel["benchmark_close"], errors="coerce")
+        ratio = (close / bench).replace([np.inf, -np.inf], np.nan)
+        return np.log(ratio.where(ratio > 0))
+    raise ValueError(f"no price basis is defined for target {target!r}")
+
+
+def price_frame(panel: pd.DataFrame, target: str = TARGET) -> pd.DataFrame:
+    """
+    Wide log-price series per ticker, whose forward difference IS `target`.
+
+    Returned wide: index of dates, one column per ticker, sorted. A ticker with
+    no usable basis is all-NaN rather than absent, so a caller sees a gap
+    instead of silently scoring a smaller universe.
+    """
+    if panel.empty:
+        return pd.DataFrame()
+    if target == EXCESS_TARGET and "benchmark_close" not in panel.columns:
+        return pd.DataFrame()
+
+    frame = panel[["date", "ticker"]].assign(_rel=_log_price_basis(panel, target))
+    wide = frame.pivot_table(index="date", columns="ticker", values="_rel",
+                             aggfunc="last")
+    return wide.sort_index()
 
 
 def relative_price_frame(panel: pd.DataFrame) -> pd.DataFrame:
     """
     The log relative-price series per ticker: ``log(close / benchmark_close)``.
+
+    Retained as the EXCESS_TARGET case of ``price_frame`` because the identity
+    below is worth stating in full somewhere, and because it is what every
+    Phase 2 series result was measured on.
 
     THE POINT OF THIS FUNCTION IS AN EXACT IDENTITY. For a horizon h,
 
@@ -324,19 +408,14 @@ def relative_price_frame(panel: pd.DataFrame) -> pd.DataFrame:
 
     Returned wide: index of dates, one column per ticker, sorted. A ticker whose
     benchmark_close has not been backfilled yet is all-NaN rather than absent,
-    so a caller sees a gap instead of silently ranking a smaller universe.
+    so a caller sees a gap instead of silently scoring a smaller universe.
+
+    The absolute analogue is ``log(close)`` and needs no benchmark at all,
+    which is the second thing the target switch buys: eight of ten NSE sector
+    indices stopped publishing around 2026-07-20, and that outage cannot reach
+    a label that never asks an index anything.
     """
-    if panel.empty or "benchmark_close" not in panel.columns:
-        return pd.DataFrame()
-
-    close = pd.to_numeric(panel["close"], errors="coerce")
-    bench = pd.to_numeric(panel["benchmark_close"], errors="coerce")
-    ratio = (close / bench).replace([np.inf, -np.inf], np.nan)
-
-    frame = panel[["date", "ticker"]].assign(_rel=np.log(ratio.where(ratio > 0)))
-    wide = frame.pivot_table(index="date", columns="ticker", values="_rel",
-                             aggfunc="last")
-    return wide.sort_index()
+    return price_frame(panel, EXCESS_TARGET)
 
 
 def usable_dates(panel: pd.DataFrame, min_names: int = MIN_NAMES_PER_DATE) -> list[str]:

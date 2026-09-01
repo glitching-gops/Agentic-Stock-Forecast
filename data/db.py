@@ -359,7 +359,16 @@ def init_db():
             ("interval_low",         "REAL"),    # conformal lower bound, price
             ("interval_high",        "REAL"),    # conformal upper bound, price
             ("interval_coverage",    "REAL"),    # nominal coverage, e.g. 0.80
-            ("prob_outperform",      "REAL"),    # calibrated P(excess return > 0)
+            ("prob_outperform",      "REAL"),    # legacy: calibrated P(excess return > 0)
+            # P(the stock RISES), not P(it beats its benchmark). A separate
+            # column rather than a reinterpretation of the one above, because
+            # the two are read in opposite directions around the same number:
+            # the unconditional rate of a positive 30-session excess return is
+            # ~50%, so 0.55 there was mildly bullish, while the unconditional
+            # rate of a positive absolute return on this universe is 57.67%, so
+            # 0.55 here is BEARISH. Reusing the column would have silently
+            # inverted the reading of every value already on the table.
+            ("prob_up",              "REAL"),
             ("random_walk_price",    "REAL"),    # baseline: today's price
             ("benchmark_ticker",     "TEXT"),
             ("benchmark_name",       "TEXT"),
@@ -515,6 +524,21 @@ def init_db():
         # Without it, "the metrics moved" has no answer — the model, the
         # feature list, the universe rule and the labelled set can all change
         # between two runs and nothing recorded which of them did.
+        # P1 added the absolute-return prediction alongside the excess one.
+        # Both columns stay: an outcome resolved before the target switch
+        # carries pred_excess_return and one resolved after carries
+        # pred_return, and a reader has to be able to tell which claim was
+        # actually published. forecast_outcomes is APPEND-ONLY by design, so
+        # backfilling the new column from the old is not merely unnecessary,
+        # it would rewrite a record whose whole purpose is to be unrewritable.
+        for col in ("pred_return",):
+            try:
+                with conn.begin_nested():
+                    conn.execute(text(
+                        f"ALTER TABLE forecast_outcomes ADD COLUMN {col} REAL"))
+            except Exception:
+                pass  # Column already exists, skip
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS experiment_runs (
                 run_id         TEXT PRIMARY KEY,

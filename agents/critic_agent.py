@@ -190,8 +190,8 @@ def _llm_review(state: dict, ticker: str) -> tuple[list[str], str]:
 
 Stock: {state.get('company_name', ticker)} ({ticker})
 Benchmark: {state.get('benchmark_ticker')}
-Predicted excess return: {state.get('pred_excess_return')}
-Probability of outperformance: {state.get('prob_outperform')}
+Predicted excess return: {state.get('pred_return')}
+Calibrated probability the stock RISES (unconditional base rate on this universe is 0.577): {state.get('prob_up')}
 
 Signal snapshot:
 {state.get('latest_signals', {})}

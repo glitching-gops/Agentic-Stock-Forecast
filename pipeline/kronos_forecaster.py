@@ -281,29 +281,46 @@ def candle_frames(relative: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return {c: f.reindex(index=dates, columns=tickers) for c, f in frames.items()}
 
 
-def load_relative_candles(panel: pd.DataFrame, engine=None) -> dict[str, pd.DataFrame]:
+def load_candles(panel: pd.DataFrame, engine=None,
+                 target: str | None = None) -> dict[str, pd.DataFrame]:
     """
-    The five aligned frames, built from `ohlcv` and the panel's benchmark level.
+    The five aligned candle frames the multivariate path needs.
 
     The panel comes from `signals`, which carries `close` and `benchmark_close`
     but not open/high/low — those live in `ohlcv`. So this is the one place the
-    two tables meet, and it joins on (date, ticker) with an INNER join: a row
-    with candles and no benchmark level has no relative candle, and a row with a
-    level and no candles has nothing to draw.
+    two tables meet, and it joins on (date, ticker) with an INNER join.
 
-    The benchmark level is taken from the PANEL, not re-fetched. `signals` is
-    where `target_excess_return` was computed from, so using any other source
-    for the denominator would risk the identity holding on one series and not
-    on the one actually scored.
+    WHICH CANDLE IS DECIDED BY THE TARGET, never chosen by the caller, for the
+    same reason `panel.price_frame` derives its series from the target name.
+    Kronos is scored on the forward move of `close` in whatever basis it was
+    handed, so a relative candle scored against an absolute label measures a
+    quantity nobody asked for — and it fails silently: the decode succeeds, the
+    prices are plausible, and the only symptom is a comparator that will not
+    beat the floor.
+
+      absolute target   the RAW candle. `close` is the identity's series and no
+                        index is involved, so the synthetic construction below
+                        is not merely unnecessary, it would be wrong.
+      excess target     the synthetic relative candle, every price over the
+                        SAME-DAY benchmark_close.
+
+    The benchmark level is taken from the PANEL, not re-fetched, whenever it is
+    needed. `signals` is where `target_excess_return` was computed from, so
+    using any other source for the denominator would risk the identity holding
+    on one series and not on the one actually scored.
     """
     from sqlalchemy import text
 
     from data.db import get_engine
+    from pipeline.panel import EXCESS_TARGET, TARGET
 
-    if "benchmark_close" not in panel.columns:
+    target = target or TARGET
+    needs_benchmark = target == EXCESS_TARGET
+
+    if needs_benchmark and "benchmark_close" not in panel.columns:
         raise ValueError(
             "the panel carries no benchmark_close, so there is no relative "
-            "candle to build. Recompute signals — see panel.relative_price_frame."
+            "candle to build. Recompute signals — see panel.price_frame."
         )
 
     engine = engine or get_engine()
@@ -311,6 +328,20 @@ def load_relative_candles(panel: pd.DataFrame, engine=None) -> dict[str, pd.Data
         text("SELECT date, ticker, open, high, low, close, volume FROM ohlcv"),
         engine)
     ohlcv["date"] = ohlcv["date"].astype(str)
+
+    if not needs_benchmark:
+        # Restricted to the panel's own (date, ticker) rows so the scored grid
+        # is identical either way. Without this the absolute path would quietly
+        # score a WIDER set of rows than the relative one and the two would not
+        # be comparable — the confound `data_hash` exists to expose after the
+        # fact, reintroduced here before it.
+        keys = panel[["date", "ticker"]].copy()
+        keys["date"] = keys["date"].astype(str)
+        merged = ohlcv.merge(keys, on=["date", "ticker"], how="inner")
+        if merged.empty:
+            raise ValueError("no (date, ticker) rows are present in BOTH ohlcv "
+                             "and the panel; nothing can be scored")
+        return candle_frames(merged)
 
     level = panel[["date", "ticker", "benchmark_close"]].copy()
     level["date"] = level["date"].astype(str)
@@ -583,3 +614,12 @@ def adapter_factory(frames: dict[str, pd.DataFrame], horizon: int = 30,
         return KronosAdapter(forecaster=KronosForecaster(context=context, **kwargs),
                              frames=frames, horizon=horizon, context=context)
     return factory
+
+
+#: The pre-P1 name, when the only candle was the relative one. Kept so a Phase 2
+#: script that asked for a RELATIVE candle still gets one after the default
+#: moved, rather than silently receiving a raw candle under the old call.
+def load_relative_candles(panel: pd.DataFrame, engine=None) -> dict[str, pd.DataFrame]:
+    from pipeline.panel import EXCESS_TARGET
+
+    return load_candles(panel, engine=engine, target=EXCESS_TARGET)

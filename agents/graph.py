@@ -72,16 +72,23 @@ def save_forecast_to_db(state: dict) -> None:
         "forecast_price": state.get("forecast_price"),
         "direction": state.get("forecast_direction"),
         "change_pct": state.get("forecast_change_pct"),
-        "pred_excess_return": state.get("pred_excess_return"),
-        # Deliberately null: the model predicts an EXCESS return and has no
-        # view on the benchmark, so a total return cannot be derived from it.
-        # Copying the excess value into this column would mislabel it exactly
-        # the way the old xgb_mape column mislabelled its contents.
-        "pred_return": None,
+        "pred_return": state.get("pred_return"),
+        # THE TWO COLUMNS SWAPPED ROLES AT P1, and the comment inverts with
+        # them. The model used to predict an EXCESS return, so pred_return was
+        # deliberately null: no view on the benchmark means no total return can
+        # be derived, and copying the excess value across would have mislabelled
+        # it exactly the way the old xgb_mape column mislabelled its contents.
+        #
+        # It now predicts the ABSOLUTE return, so pred_return carries it and
+        # pred_excess_return is the one that must stay null: subtracting a
+        # benchmark forecast we do not have would be the same defect pointing
+        # the other way. The excess LABEL is still computed and still stored on
+        # `signals` - it is the forecast that no longer has an excess form.
+        "pred_excess_return": None,
         "interval_low": state.get("interval_low"),
         "interval_high": state.get("interval_high"),
         "interval_coverage": state.get("interval_coverage"),
-        "prob_outperform": state.get("prob_outperform"),
+        "prob_up": state.get("prob_up"),
         "random_walk_price": state.get("random_walk_price"),
         "benchmark_ticker": benchmark,
         "benchmark_name": get_benchmark_name(benchmark) if benchmark else None,
@@ -115,9 +122,9 @@ def save_forecast_to_db(state: dict) -> None:
         "ticker", "company", "sector", "current_price", "forecast_price", "direction",
         "change_pct", "mape", "directional_accuracy", "forecast_confidence",
         "signal_narrative", "critic_verdict", "critic_reasoning", "critic_flags",
-        "critic_confidence_adjustment", "last_updated", "pred_excess_return",
-        "pred_return", "interval_low", "interval_high", "interval_coverage",
-        "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
+        "critic_confidence_adjustment", "last_updated", "pred_return",
+        "pred_excess_return", "interval_low", "interval_high", "interval_coverage",
+        "prob_up", "random_walk_price", "benchmark_ticker", "benchmark_name",
         "benchmark_sector_specific", "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate",
         "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
         "universe_rule", "evaluated_at",
@@ -129,8 +136,8 @@ def save_forecast_to_db(state: dict) -> None:
     current_cols = [
         "ticker", "company", "sector", "current_price", "forecast_price", "direction",
         "change_pct", "critic_verdict", "forecast_confidence", "mape",
-        "directional_accuracy", "last_updated", "pred_excess_return", "interval_low",
-        "interval_high", "interval_coverage", "prob_outperform", "random_walk_price",
+        "directional_accuracy", "last_updated", "pred_return", "interval_low",
+        "interval_high", "interval_coverage", "prob_up", "random_walk_price",
         "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
         "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate", "eval_baseline_hit_rate",
         "eval_beats_random_walk", "model_version", "universe_rule", "evaluated_at",

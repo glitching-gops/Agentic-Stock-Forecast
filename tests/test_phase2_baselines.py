@@ -626,37 +626,120 @@ def test_compare_baselines_refuses_a_panel_too_thin_to_rank(monkeypatch):
 def test_compare_baselines_scores_a_panel_with_enough_breadth(monkeypatch):
     """The refusal must not be so eager that it never measures anything."""
     import pipeline.baselines
+    from pipeline.series import SERIES_BASELINES
 
     wide = make_panel(n_dates=800, n_tickers=25, seed=79)
     monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: wide)
 
     comparison = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
     assert comparison.ranked
-    assert {r["name"] for r in comparison.results} == set(B.BASELINES)
+    assert ({r["name"] for r in comparison.results}
+            == set(B.BASELINES) | set(SERIES_BASELINES))
     assert comparison.best() is not None
 
 
-def test_series_comparators_are_skipped_without_a_benchmark_level(monkeypatch):
+def test_every_comparator_is_graded_against_the_floors_not_against_zero(monkeypatch):
+    """
+    The P1 criterion, reported on every row.
+
+    `zero` was the right floor for an excess return: the label already had the
+    market subtracted out, so beating zero required saying something about the
+    company. On an absolute return it is beaten by drift alone — 57.67% of
+    these labels are positive and 32.8% of their variance is shared — so a
+    table measured against `zero` credits every comparator with the market.
+
+    Both floors have to be present, and they bound different things: `market`
+    is constant and bounds MAE, `beta_market` orders by beta and bounds rank
+    IC. A comparator can clear one and fail the other, which is exactly the
+    case worth seeing.
+    """
+    import pipeline.baselines
+
+    wide = make_panel(n_dates=800, n_tickers=25, seed=79)
+    monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: wide)
+
+    comparison = pipeline.baselines.compare_baselines(with_pooled_xgb=False,
+                                                      with_series=False)
+    by_name = {r["name"]: r for r in comparison.results}
+
+    assert "market" in by_name and "beta_market" in by_name, (
+        "the floors must be SCORED, not assumed")
+    assert set(B.FLOORS) == {"market", "beta_market"}
+
+    floors = comparison.floors()
+    assert floors["market_mae"] == pytest.approx(by_name["market"]["mae"])
+    assert floors["beta_market_ic"] == pytest.approx(
+        by_name["beta_market"]["rebalance_ic"], nan_ok=True)
+
+    for row in comparison.results:
+        assert "clears_floor" in row, f"{row['name']} was not graded"
+
+    # market is a CONSTANT within every date, so it has no ordering and its
+    # rank IC must be undefined rather than 0.0. The distinction is the one
+    # cross_sectional_report was rebuilt around: a comparator with no ordering
+    # must earn no ranking result.
+    assert not np.isfinite(by_name["market"]["rebalance_ic"])
+    assert by_name["market"]["beats_beta_ic"] is None
+
+    # beta_market is NOT constant: it ranks by beta, so it does have an
+    # ordering. That is the whole reason it is the floor.
+    assert np.isfinite(by_name["beta_market"]["rebalance_ic"])
+
+    # always_up is a constant too, and only its hit rate means anything.
+    assert not np.isfinite(by_name["always_up"]["rebalance_ic"])
+    assert np.isfinite(by_name["always_up"]["hit_rate"])
+
+    assert "floors" in comparison.summary()
+    assert "cleared BOTH floors" in comparison.summary()
+
+    # The whole reason beta_market is the ORDERING floor: on a panel with a
+    # common factor it out-ranks every real comparator while containing no
+    # view about any individual company.
+    assert by_name["beta_market"]["rebalance_ic"] > by_name["linear_factor"]["rebalance_ic"]
+    assert by_name["linear_factor"]["clears_floor"] is False
+
+
+def test_the_benchmark_gate_on_series_comparators_is_excess_only(monkeypatch):
     """
     A SeriesAdapter handed an all-NaN series does not fail. It declines every
     ticker and predicts 0.0 — the correct default for an abstention — which
-    would appear in the table as three extra rows indistinguishable from
-    `zero`. Rows written before benchmark_close was persisted have perfectly
-    good targets and no reconstructible series, so the comparison must skip
-    those comparators and say why rather than report them as measured.
+    would appear in the table as extra rows indistinguishable from `zero`. That
+    is why a missing benchmark level had to skip them.
+
+    IT APPLIES ONLY TO THE EXCESS TARGET, and getting that wrong is expensive
+    in both directions. Keep the gate on the absolute target and the series
+    comparators go dark for the 55 tickers whose sector index stopped
+    publishing, for a reason that does not apply to them: log(close) needs no
+    index. Drop it from the excess target and they silently score as `zero`.
+
+    Both branches are pinned on the same panel, which is what makes this a test
+    of the CONDITION rather than of one code path.
     """
     import pipeline.baselines
+    from pipeline.series import SERIES_BASELINES
 
     wide = make_panel(n_dates=800, n_tickers=20, seed=83)
     wide["close"] = 100.0
     wide["benchmark_close"] = np.nan
+    # A real panel carries both labels; the excess one is what the gate exists
+    # to protect, so it has to be present for the second half to mean anything.
+    wide[B.EXCESS_TARGET] = wide[B.TARGET]
     monkeypatch.setattr(pipeline.baselines, "load_panel", lambda **k: wide)
 
-    comparison = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
-    names = {r["name"] for r in comparison.results}
-    assert names == set(B.BASELINES)
-    assert not names & set(__import__("pipeline.series", fromlist=["x"]).SERIES_BASELINES)
-    assert "benchmark_close" in comparison.note
+    absolute = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
+    names = {r["name"] for r in absolute.results}
+    assert names >= set(SERIES_BASELINES), (
+        "log(close) needs no benchmark, so a dead index must not silence the "
+        "series comparators")
+    assert "benchmark_close" not in absolute.note
+
+    # The same panel, scored against the excess label: now the series cannot
+    # be built and the gate must fire.
+    monkeypatch.setattr(pipeline.baselines, "TARGET", B.EXCESS_TARGET)
+    excess = pipeline.baselines.compare_baselines(with_pooled_xgb=False)
+    names = {r["name"] for r in excess.results}
+    assert not names & set(SERIES_BASELINES)
+    assert "benchmark_close" in excess.note
 
 
 def test_series_comparators_are_scored_when_the_level_is_present(monkeypatch):
@@ -945,11 +1028,17 @@ def _price_panel_with_gaps(n_dates=700, n_tickers=14, horizon=30, seed=5):
     """
     A panel where tickers do NOT share every date.
 
-    The gaps are the point. `relative_price_frame` pivots onto the UNION of all
-    dates, so a ticker absent from a date another one trades gets a placeholder
-    row there. Shifting the wide frame steps that placeholder; shifting within
-    the ticker does not. A fixture where everyone trades every day cannot tell
-    the two apart.
+    The gaps are the point. `price_frame` pivots onto the UNION of all dates,
+    so a ticker absent from a date another one trades gets a placeholder row
+    there. Shifting the wide frame steps that placeholder; shifting within the
+    ticker does not. A fixture where everyone trades every day cannot tell the
+    two apart.
+
+    BOTH labels are built, from their own bases: target_return from log(close)
+    and target_excess_return from log(close / benchmark_close). A fixture that
+    carried one label computed from the other basis would make the identity
+    test vacuous in exactly the direction that matters — it would pass while
+    the code scored a relative series against an absolute label.
     """
     rng = np.random.default_rng(seed)
     dates = [f"D{i:05d}" for i in range(n_dates)]
@@ -966,16 +1055,20 @@ def _price_panel_with_gaps(n_dates=700, n_tickers=14, horizon=30, seed=5):
             keep[200 + k: 200 + k + 7] = False
 
         idx = np.flatnonzero(keep)
-        # The label is the ticker's OWN h-session forward move, which is what
-        # pipeline/signals.py computes.
+        # Each label is the ticker's OWN h-session forward move in its own
+        # basis, which is what pipeline/signals.py computes.
+        log_abs = np.log(close)
         target = np.full(len(idx), np.nan)
+        excess = np.full(len(idx), np.nan)
         if len(idx) > horizon:
-            target[:-horizon] = log_rel[idx][horizon:] - log_rel[idx][:-horizon]
+            target[:-horizon] = log_abs[idx][horizon:] - log_abs[idx][:-horizon]
+            excess[:-horizon] = log_rel[idx][horizon:] - log_rel[idx][:-horizon]
 
         for j, i in enumerate(idx):
             row = {"date": dates[i], "ticker": f"T{k:02d}.NS",
                    "close": close[i], "benchmark_close": bench[i],
-                   "benchmark_ticker": "^NSEI", P.TARGET: target[j]}
+                   "benchmark_ticker": "^NSEI",
+                   P.TARGET: target[j], P.EXCESS_TARGET: excess[j]}
             for c in P.FEATURE_COLS:
                 row[c] = float(rng.normal())
             rows.append(row)
@@ -984,7 +1077,7 @@ def _price_panel_with_gaps(n_dates=700, n_tickers=14, horizon=30, seed=5):
 
 def test_retargeting_at_the_stored_horizon_reproduces_the_stored_label():
     """
-    THE CALIBRATION CASE. Retargeting is exact by the relative-price identity,
+    THE CALIBRATION CASE. Retargeting is exact by the price-series identity,
     so asking for the horizon the label already uses must return the label
     itself. Anything else means the derivation is wrong, and every other
     horizon in a sweep is wrong with it.
@@ -1042,14 +1135,14 @@ def test_a_shorter_horizon_labels_more_rows():
     assert n[5] > n[30]
 
 
-def test_retargeting_refuses_without_a_benchmark_level():
+def test_retargeting_the_excess_label_refuses_without_a_benchmark_level():
     panel = _price_panel_with_gaps()
     panel["benchmark_close"] = np.nan
-    with pytest.raises(ValueError, match="benchmark_close"):
-        P.retarget_horizon(panel, 10)
+    with pytest.raises(ValueError, match="no usable price series"):
+        P.retarget_horizon(panel, 10, target=P.EXCESS_TARGET)
 
 
-def test_retargeting_refuses_on_thin_benchmark_coverage():
+def test_retargeting_the_excess_label_refuses_on_thin_benchmark_coverage():
     """
     Retargeting a partly-covered panel would drop the uncovered tickers, so a
     sweep would compare horizons over DIFFERENT universes — the exact confound
@@ -1059,7 +1152,68 @@ def test_retargeting_refuses_on_thin_benchmark_coverage():
     half = panel["ticker"].isin(panel["ticker"].unique()[:7])
     panel.loc[half, "benchmark_close"] = np.nan
     with pytest.raises(ValueError, match="below"):
-        P.retarget_horizon(panel, 10)
+        P.retarget_horizon(panel, 10, target=P.EXCESS_TARGET)
+
+
+def test_retargeting_the_absolute_label_needs_no_benchmark_at_all():
+    """
+    The coverage refusal is EXCESS-ONLY, and that asymmetry is deliberate.
+
+    It exists because the relative series needs benchmark_close, and a ticker
+    whose level was never backfilled becomes an all-NaN column, drops silently
+    out of the labelled set, and leaves the sweep comparing horizons over
+    different universes. The absolute series needs only `close`, which every
+    row carries by construction, so there is no coverage question to ask — and
+    applying the refusal anyway would block horizon sweeps for the 55 tickers
+    whose sector index stopped publishing, for a reason that does not apply to
+    them.
+    """
+    panel = _price_panel_with_gaps()
+    panel["benchmark_close"] = np.nan
+    panel[P.EXCESS_TARGET] = np.nan
+
+    back = P.retarget_horizon(panel, 30)
+
+    a = pd.to_numeric(panel[P.TARGET], errors="coerce")
+    b = pd.to_numeric(back[P.TARGET], errors="coerce")
+    both = a.notna() & b.notna()
+    assert both.sum() > 5_000
+    assert np.abs(a[both] - b[both]).max() < 1e-9
+
+
+def test_the_price_basis_follows_the_target_and_cannot_be_chosen():
+    """
+    A series model handed the wrong basis fails SILENTLY.
+
+    `price_frame` derives the series from the target name, so the combination
+    "relative series, absolute label" is unconstructable. Were it possible it
+    would raise nothing: the table renders, the magnitudes are the right order,
+    and the only symptom is a comparator that inexplicably will not beat the
+    floor. That is a week of debugging a model that was never wrong.
+
+    The check is the identity itself, in both directions.
+    """
+    panel = _price_panel_with_gaps()
+    horizon = 30
+
+    for target in (P.TARGET, P.EXCESS_TARGET):
+        wide = P.price_frame(panel, target)
+        stored = panel.set_index(["date", "ticker"])[target]
+
+        worst = 0.0
+        for ticker in wide.columns:
+            col = wide[ticker].dropna()
+            fwd = col.shift(-horizon) - col
+            for date, value in fwd.dropna().items():
+                want = stored.get((date, ticker))
+                if want is not None and np.isfinite(want):
+                    worst = max(worst, abs(float(value) - float(want)))
+        assert worst < 1e-9, f"{target} basis breaks its identity by {worst:.2e}"
+
+    assert P.price_frame(panel, P.TARGET).shape[1] == panel["ticker"].nunique()
+
+    with pytest.raises(ValueError, match="no price basis"):
+        P.price_frame(panel, "some_other_label")
 
 
 def test_the_horizon_reaches_the_splitter_and_the_rebalance_schedule(monkeypatch):

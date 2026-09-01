@@ -41,8 +41,8 @@ import type { CurrentForecast, EvidenceState } from "@/lib/types";
 
 const SORTS = {
   ticker: "Ticker",
-  pred_excess_return: "Excess return",
-  prob_outperform: "P(outperform)",
+  pred_return: "Return",
+  prob_up: "P(up)",
   eval_rank_ic: "Rank IC",
   eval_rank_ic_t: "IC t-stat",
   eval_hit_rate: "Hit rate",
@@ -379,25 +379,25 @@ function ForecastRows({ rows }: { rows: CurrentForecast[] }) {
             </Th>
             <Th
               align="right"
-              help="Implied price assuming the benchmark index is flat. The model forecasts relative performance and says nothing about where the index goes."
+              help="The model's point forecast of the price in 30 sessions. No assumption about the index is needed: the forecast is the stock's own return."
             >
               Target
             </Th>
             <Th
               align="right"
-              help="The model's actual output: predicted 30-session log return relative to the stock's benchmark index."
+              help="The model's actual output: the stock's predicted 30-session log return. Absolute, not relative to an index."
             >
-              Excess
+              Return
             </Th>
             <Th
               align="right"
-              help="Calibrated probability of beating the benchmark. 50% is a coin flip."
+              help="Calibrated probability that the stock rises. Read it against 57.7%, the measured unconditional rate on this universe — NOT against 50%. A value near 0.5 is bearish."
             >
-              P(out)
+              P(up)
             </Th>
             <Th
               align="right"
-              help="Out-of-sample Spearman correlation between predicted and realised excess return. 0 means no skill."
+              help="Out-of-sample Spearman correlation between predicted and realised return. 0 means no skill."
             >
               IC
             </Th>
@@ -454,7 +454,7 @@ function Th({
 }
 
 function Row({ forecast }: { forecast: CurrentForecast }) {
-  const excess = forecast.pred_excess_return;
+  const excess = forecast.pred_return;
   const hit = forecast.eval_hit_rate;
   const base = forecast.eval_baseline_hit_rate;
   const ict = forecast.eval_rank_ic_t;
@@ -469,8 +469,8 @@ function Row({ forecast }: { forecast: CurrentForecast }) {
   const contradicts =
     excess !== null &&
     excess < 0 &&
-    forecast.prob_outperform !== null &&
-    forecast.prob_outperform > 0.5;
+    forecast.prob_up !== null &&
+    forecast.prob_up > 0.5;
 
   /*
    * A hit rate that equals its baseline to four decimals is not a near miss —
@@ -534,12 +534,12 @@ function Row({ forecast }: { forecast: CurrentForecast }) {
         {contradicts ? (
           <span
             className="mr-1 text-bar"
-            title="The calibrated probability says up while the point forecast says down. The model is biased low for this ticker, and the two halves disagree."
+            title="The calibrated probability sits above a coin flip while the point forecast says down. The model runs biased low for this ticker, and the two halves disagree."
           >
             !
           </span>
         ) : null}
-        {probability(forecast.prob_outperform)}
+        {probability(forecast.prob_up)}
       </td>
 
       <td

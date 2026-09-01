@@ -61,7 +61,7 @@ if os.getcwd() not in sys.path:
 from pipeline.evaluation import PurgedPanelWalkForward, oos_dates   # noqa: E402
 from pipeline.kronos_forecaster import (INPUT_COLS,                 # noqa: E402
                                         TOKENIZERS, VENDORED_COMMIT,
-                                        load_relative_candles, usable_mask)
+                                        load_candles, usable_mask)
 from pipeline.panel import TARGET, load_panel                       # noqa: E402
 from pipeline.series import _block_ending_at                        # noqa: E402
 from pipeline.signals import HORIZON_SESSIONS                       # noqa: E402
@@ -82,7 +82,7 @@ def main() -> int:
 
     print("  loading panel ...")
     panel = load_panel()
-    frames = load_relative_candles(panel)
+    frames = load_candles(panel)
 
     index = frames["close"].index
     tickers = list(frames["close"].columns)

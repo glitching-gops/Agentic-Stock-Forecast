@@ -40,9 +40,10 @@ export default async function ForecastsPage() {
           One 30-session prediction per name across a{" "}
           <span className="text-text">fixed universe</span> of {summary.total}{" "}
           NIFTY 100 stocks, selected on data quality alone and never on measured
-          accuracy. Each forecast is a return{" "}
-          <span className="text-text">in excess of a sector benchmark</span>,
-          and each is shown with the held-out evidence behind it. These
+          accuracy. Each forecast is the stock&rsquo;s{" "}
+          <span className="text-text">own 30-session return</span>, not its
+          performance against an index, and each is shown with the held-out
+          evidence behind it. These
           forecasts are <span className="text-text">not ranked against each
           other</span>: too few clear the evidence gate for an ordering to mean
           anything, so every stock is read on its own terms.

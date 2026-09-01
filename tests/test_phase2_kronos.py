@@ -565,7 +565,7 @@ def test_score_dates_narrows_what_is_measured_not_what_is_trained_on():
     tickers = [f"T{i}.NS" for i in range(8)]
     panel = pd.DataFrame([
         {"date": d, "ticker": t, "f1": rng.normal(),
-         "target_excess_return": rng.normal(0, 0.07)}
+         "target_return": rng.normal(0, 0.07)}
         for d in dates for t in tickers])
 
     splitter = PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=400)
@@ -613,7 +613,7 @@ def test_sub_sampling_an_already_sub_sampled_grid_is_refused():
     from pipeline.evaluation import PurgedPanelWalkForward, panel_walk_forward
 
     panel = pd.DataFrame({"date": ["2020-01-01"], "ticker": ["A.NS"],
-                          "target_excess_return": [0.01]})
+                          "target_return": [0.01]})
     with pytest.raises(ValueError, match="rebalance_every=1"):
         panel_walk_forward(panel, ["date", "ticker"], lambda: None,
                            PurgedPanelWalkForward(), score_dates={"2020-01-01"})
@@ -634,12 +634,12 @@ def test_the_grid_is_built_from_LABELLED_rows_only():
     dates = pd.bdate_range("2018-01-01", periods=700).strftime("%Y-%m-%d")
     tickers = ["A.NS", "B.NS", "C.NS", "D.NS"]
     panel = pd.DataFrame([
-        {"date": d, "ticker": t, "target_excess_return": rng.normal(0, 0.07)}
+        {"date": d, "ticker": t, "target_return": rng.normal(0, 0.07)}
         for d in dates for t in tickers])
 
     # The real shape: the newest 30 sessions cannot have a 30-session label.
     unlabelled = set(dates[-30:])
-    panel.loc[panel["date"].isin(unlabelled), "target_excess_return"] = np.nan
+    panel.loc[panel["date"].isin(unlabelled), "target_return"] = np.nan
 
     splitter = PurgedPanelWalkForward(n_folds=3, horizon=30, min_train=400)
     grid = oos_dates(panel, splitter)

@@ -19,7 +19,16 @@ records into ``experiment_runs`` cannot drift from the table printed here.
 
 Read the output in this order:
 
-  1. ``zero`` is the floor. It is the random walk in excess-return space.
+  1. ``market`` and ``beta_market`` are THE FLOORS. Not ``zero``.
+     ``zero`` was the right floor while the target was an excess return - the
+     label had the market subtracted out, so beating zero meant saying
+     something about the company. The target is now the ABSOLUTE 30-session
+     return: 57.67% of those labels are positive and 32.8% of their variance
+     is shared, so ``zero`` is beaten by drift and beta before any model
+     opens its eyes. ``market`` bounds MAE; ``beta_market`` bounds ordering;
+     the ``floor`` column says whether a row cleared BOTH.
+     ``zero`` and ``always_up`` stay in the table as the degenerate
+     references - they show how big the gift was.
   2. ``daily_IC`` is the cross-sectional number, not ``IC``.
      The pooled IC can be moved by knowing which months were good and by
      knowing which fold a row came from; the daily one is computed within each
@@ -51,8 +60,11 @@ def render(results: list[dict]) -> str:
     def f(v, spec=".4f"):
         return "     -" if v is None or not np.isfinite(v) else format(v, spec)
 
+    def flag(value):
+        return "     -" if value is None else ("   yes" if value else "    no")
+
     head = (f"{'comparator':<18s} {'daily_IC':>9s} {'reb_IC':>8s} {'reb_t':>7s} {'pooledIC':>9s} "
-            f"{'hit%':>7s} {'maj%':>7s} {'MAE':>8s} {'<naive':>7s} "
+            f"{'hit%':>7s} {'maj%':>7s} {'MAE':>8s} {'vs mkt':>8s} {'floor':>6s} "
             f"{'alpha':>9s} {'alpha_t':>8s} {'L-S':>9s} {'n_reb':>6s} {'secs':>7s}")
     lines = [head, "-" * len(head)]
 
@@ -66,7 +78,8 @@ def render(results: list[dict]) -> str:
             f"{f(r['hit_rate'], '.2f'):>7s} "
             f"{f(r['majority_hit_rate'], '.2f'):>7s} "
             f"{f(r['mae'], '.5f'):>8s} "
-            f"{str(bool(r['beats_naive_mae'])):>7s} "
+            f"{f(r.get('mae_vs_market'), '+.1f'):>7s}% "
+            f"{flag(r.get('clears_floor')):>6s} "
             f"{f(r['alpha_vs_equal_weight'], '+.5f'):>9s} "
             f"{f(r['alpha_t'], '+.2f'):>8s} "
             f"{f(r['long_short_spread'], '+.5f'):>9s} "
@@ -288,6 +301,16 @@ def main() -> int:
     print("             no ranking information at all. Trust daily_IC.")
     print(f"  alpha_t  - from {HORIZON_SESSIONS}-session non-overlapping "
           f"rebalances. Below ~2 is not evidence.")
+    print("  vs mkt   - MAE against the `market` forecast, in percent. "
+          "NEGATIVE is better.")
+    print("  floor    - cleared BOTH floors: MAE below `market` AND reb_IC "
+          "above `beta_market`.")
+    print("             A dash means one of the floors was not scored, which "
+          "is not the same")
+    print("             as failing to clear it. `market` and `beta_market` "
+          "are constant-within-date")
+    print("             and beta-ordered respectively, so `market` has no "
+          "rank IC by construction.")
 
     if comparison.loadings:
         print("\nLinear factor loadings on the first training window "

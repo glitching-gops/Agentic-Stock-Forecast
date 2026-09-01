@@ -50,13 +50,26 @@ from pipeline.evaluation import (
 from pipeline.signals import FEATURE_COLS, HORIZON_SESSIONS
 from pipeline.tuning import tune, tune_and_cache
 
-# Bumped 2026-08-19: tools/audit_benchmarks.py moved four sectors (36 of 100
-# tickers) onto different benchmark indices. target_excess_return is the stock's
-# return MINUS its benchmark's, so those tickers' labels now mean something
-# different from every label written under v1, and an evaluation produced under
-# one is not comparable with one produced under the other. The version string is
-# what makes that visible on the published row instead of silent.
-MODEL_VERSION = "phase1-benchmark-audited-v2"
+# Bumped 2026-09-01 (v2 -> v3): THE TARGET ITSELF CHANGED. The model predicted
+# target_excess_return, the stock's 30-session log return MINUS its benchmark
+# index's; it now predicts target_return, the stock's own 30-session log return.
+# Not a rescaling of the same quantity - a different question, with a different
+# base rate (57.67% of absolute returns are positive against ~52% of excess
+# ones) and a different floor (the market, not zero). Every eval_* metric,
+# every conformal calibration and every cached hyperparameter written under v2
+# describes something the model is no longer predicting.
+#
+# _load_persisted_evaluation discards a version mismatch, so the whole universe
+# returns to INSUFFICIENT until the weekly job re-measures it. That is the
+# correct state and it is temporary. Serving v2 evidence beside a v3 forecast
+# would not be.
+#
+# The v2 note, still true of the benchmark mapping and still load-bearing for
+# the excess label that is kept alongside: tools/audit_benchmarks.py moved four
+# sectors (36 of 100 tickers) onto different indices on 2026-08-19, so those
+# tickers' excess labels mean something different from every excess label
+# written under v1.
+MODEL_VERSION = "rebuild-absolute-return-v3"
 
 FEATURES = FEATURE_COLS + [
     # Macro. `fii_net_flow` / `dii_net_flow` were scraped and stored by
@@ -66,7 +79,10 @@ FEATURES = FEATURE_COLS + [
     "fii_net_flow", "dii_net_flow",
 ]
 
-TARGET = "target_excess_return"
+#: What the per-ticker model predicts: the ABSOLUTE 30-session log return.
+#: pipeline.panel.EXCESS_TARGET is the previous label, still computed and still
+#: stored - see the note there for why it is kept and what the switch costs.
+TARGET = "target_return"
 
 MODELS_DIR = os.path.join(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), "models", "joblib"
@@ -303,11 +319,13 @@ def _load_persisted_evaluation(ticker: str) -> dict | None:
     r = row.iloc[0]
 
     # AN EVALUATION OF A DIFFERENT TARGET IS NOT EVIDENCE ABOUT THIS ONE.
-    # eval_* are measured against target_excess_return, which is defined
-    # relative to the ticker's benchmark index. When the benchmark mapping
-    # changes (tools/audit_benchmarks.py moved 36 of 100 tickers on
-    # 2026-08-19) the label changes meaning, and metrics computed under the old
-    # definition describe a quantity the model is no longer predicting.
+    # This has now fired twice for two different reasons, which is the argument
+    # for the mechanism rather than for either fix. On 2026-08-19 the benchmark
+    # mapping moved 36 of 100 tickers, so their excess labels changed meaning.
+    # On 2026-09-01 the target changed outright, from excess return to absolute
+    # return, so EVERY ticker's eval_* metrics now describe a quantity the
+    # model is no longer predicting - including the hit rate, whose baseline
+    # moved from ~52% to 57.67% at the same moment.
     #
     # Returning None puts the ticker back to INSUFFICIENT until the weekly job
     # re-measures it, which is the honest state: the evidence gate then refuses
@@ -511,13 +529,13 @@ def forecast_ticker_daily(ticker: str) -> TickerForecast | None:
         return None
 
     latest = _latest_row(df)
-    pred_excess = float(model.predict(latest[FEATURES])[0])
+    pred_return = float(model.predict(latest[FEATURES])[0])
     current_price = float(latest["close"].iloc[0])
     forecast_date = str(latest["date"].iloc[0])
 
     persisted = _load_persisted_evaluation(ticker)
     calibration = _reconstruct_calibration(persisted) if persisted else None
-    price_view = to_price_view(current_price, pred_excess, calibration)
+    price_view = to_price_view(current_price, pred_return, calibration)
 
     if persisted:
         evaluation = {
@@ -644,7 +662,7 @@ def train_and_forecast(single_ticker: str | None = None,
         ev = forecast.evaluation
         ic = ev.get("rank_ic")
         hit = ev.get("hit_rate")
-        print(f"[Model] {ticker}: excess={forecast.price_view['pred_excess_return']:+.4f} "
+        print(f"[Model] {ticker}: return={forecast.price_view['pred_return']:+.4f} "
               f"IC={'n/a' if ic is None else f'{ic:+.3f}'} "
               f"hit={'n/a' if hit is None else f'{hit:.1f}%'} "
               f"(evaluated_at={ev.get('evaluated_at') or 'never'})")
