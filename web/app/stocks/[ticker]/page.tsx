@@ -372,8 +372,9 @@ function Overview({
           runs biased low on this ticker rather than that it likes the stock —
           the calibrated probability is the share of residuals above{" "}
           {signedPct(excess !== null ? -excess : null)}, not an independent
-          opinion. The composite refuses to rank on the cheerier half, so this
-          stock scores zero.
+          opinion. Both halves are shown rather than reconciled: a model that
+          disagrees with itself about a stock is telling you something the
+          average of the two would hide.
         </Note>
       ) : null}
 
@@ -420,8 +421,8 @@ function EvidenceWarning({
       }
     >
       {grade === "WEAK"
-        ? "Two of three held-out checks passed. That is the minimum this system will grade at all, and it halves the composite score rather than endorsing the forecast."
-        : "This model failed its held-out checks, so its forecast is excluded from the ranking however large a move it predicts."}
+        ? "Two of three held-out checks passed. That is the minimum this system grades at all, and it is not an endorsement — the thresholds are low, and only one of the three checks tests significance."
+        : "This model failed at least two of its three held-out checks. The forecast below is still shown, because withholding it would be less informative than showing it with this said plainly — but there is no evidence the model forecasts this stock better than chance."}
       {hit !== null && baseline !== null ? (
         <>
           {" "}

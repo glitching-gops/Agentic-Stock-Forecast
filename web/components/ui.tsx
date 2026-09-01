@@ -290,45 +290,6 @@ export function Rail({
   );
 }
 
-/**
- * Horizontal 0–100 meter for the composite score.
- *
- * A zero fills the track in rule grey rather than drawing nothing, because an
- * empty track and a zero score look identical and 93 of 95 rows are zero.
- */
-export function Meter({
-  value,
-  className,
-}: {
-  value: number | null | undefined;
-  className?: string;
-}) {
-  const pct =
-    value === null || value === undefined || !Number.isFinite(value)
-      ? 0
-      : Math.max(0, Math.min(100, value));
-  const zero = pct === 0;
-
-  return (
-    <div className={cx("flex items-center gap-2", className)}>
-      <div className="h-[5px] w-full min-w-12 bg-inset">
-        <div
-          className={cx("h-full", zero ? "bg-rule" : "bg-bright")}
-          style={{ width: `${zero ? 100 : pct}%` }}
-        />
-      </div>
-      <span
-        className={cx(
-          "w-9 shrink-0 text-right text-[0.7rem]",
-          zero ? "text-dim" : "text-bright",
-        )}
-      >
-        {pct.toFixed(1)}
-      </span>
-    </div>
-  );
-}
-
 /* ── Prose ─────────────────────────────────────────────────────────────── */
 
 /**

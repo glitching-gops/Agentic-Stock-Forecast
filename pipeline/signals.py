@@ -9,8 +9,7 @@ Three Phase 0 changes:
   ~15% — and it capped every forecast at the maximum price seen in training,
   because gradient-boosted trees cannot extrapolate (measured: 51 of 53 stocks).
   The target is now the forward 30-session log return in EXCESS of the stock's
-  benchmark index, which is approximately stationary, bounded, and directly
-  answers the question the leaderboard is actually asking.
+  benchmark index, which is approximately stationary and bounded.
 
   BACKFILL (F6). ``compute_and_store`` inserted only dates absent from the
   table. Rows written today carry a null target for the trailing 30 sessions;

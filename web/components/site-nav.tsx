@@ -8,9 +8,8 @@ import { cx, daysAgo, timestamp } from "@/lib/format";
 import type { StockInfo } from "@/lib/types";
 
 const LINKS = [
-  { href: "/", label: "Board" },
+  { href: "/", label: "Forecasts" },
   { href: "/research", label: "Research" },
-  { href: "/portfolio", label: "Portfolio" },
   { href: "/methodology", label: "Method" },
   { href: "/about", label: "About" },
 ] as const;

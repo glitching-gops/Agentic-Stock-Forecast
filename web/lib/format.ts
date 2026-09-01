@@ -1,4 +1,4 @@
-import type { ScoreBasis } from "./types";
+import type { EvidenceState } from "./types";
 
 /**
  * Formatters. Every one of them takes `null | undefined` and returns an em
@@ -134,41 +134,58 @@ export function daysAgo(value: string | null | undefined): number | null {
 /* ── Domain vocabulary ─────────────────────────────────────────────────── */
 
 /**
- * `score_basis` is the single most load-bearing field on the leaderboard: 93 of
- * 95 rows score 0.0, and this is the only thing that distinguishes "we have no
- * forecast" from "the forecast is fine but points down".
+ * What is known about a forecast, and therefore how much weight it carries.
+ *
+ * This replaces `score_basis`, which existed to disambiguate a composite of
+ * 0.0. Three of its five values (RANKED, NOT_LONG, FLAGGED_OUT) described the
+ * ranking rather than the stock, and went with it. The remaining distinction
+ * — "no forecast at all" against "a forecast with no held-out support" — is
+ * real and is preserved here, because a reader who cannot tell those apart is
+ * being shown an absence dressed as a measurement.
+ *
+ * Derived, never sent. A server column duplicating a value computable from two
+ * others is a column that can disagree with them.
  */
-export const SCORE_BASIS_LABEL: Record<ScoreBasis, string> = {
-  RANKED: "Ranked",
-  NO_FORECAST: "No forecast produced",
-  NO_EVIDENCE: "No held-out evidence",
-  NOT_LONG: "Not a long candidate",
-  FLAGGED_OUT: "Zeroed by critic flags",
-};
-
-export const SCORE_BASIS_EXPLAINER: Record<ScoreBasis, string> = {
-  RANKED:
-    "Cleared the evidence gate, and the point forecast predicts outperformance.",
-  NO_FORECAST:
-    "The model produced no prediction at all for this stock, so there is nothing to score.",
-  NO_EVIDENCE:
-    "A forecast exists, but the model failed its held-out checks on purged walk-forward folds. Graded INSUFFICIENT, it is multiplied to zero however large the predicted move.",
-  NOT_LONG:
-    "Held-out evidence is in hand, but the prediction is flat to negative. This board ranks long candidates only, so a downward forecast floors at zero rather than ranking below one — including when the calibrated probability disagrees with it.",
-  FLAGGED_OUT:
-    "A genuine long signal with evidence behind it, driven to zero by the critic's flags at five points each.",
-};
-
-export function scoreBasisLabel(basis: string | null | undefined): string {
-  if (!basis) return "Not ranked";
-  return SCORE_BASIS_LABEL[basis as ScoreBasis] ?? basis;
+export function evidenceState(forecast: {
+  pred_excess_return: number | null;
+  forecast_confidence: string | null;
+}): EvidenceState {
+  if (forecast.pred_excess_return === null) return "NO_FORECAST";
+  const grade = forecast.forecast_confidence;
+  if (grade === "STRONG" || grade === "WEAK") return grade;
+  return "INSUFFICIENT";
 }
 
-export function scoreBasisExplainer(basis: string | null | undefined): string {
-  if (!basis) return "No score basis was recorded for this row.";
+export const EVIDENCE_STATE_LABEL: Record<EvidenceState, string> = {
+  STRONG: "Strong evidence",
+  WEAK: "Weak evidence",
+  INSUFFICIENT: "No held-out evidence",
+  NO_FORECAST: "No forecast produced",
+};
+
+export const EVIDENCE_STATE_EXPLAINER: Record<EvidenceState, string> = {
+  STRONG:
+    "All three held-out checks passed on purged walk-forward folds: rank IC, the IC t-statistic, and directional accuracy above the majority-class baseline. No ticker currently reaches this.",
+  WEAK:
+    "Two of the three held-out checks passed. That is the minimum this system grades at all, and it is not an endorsement: the thresholds are low, and only one of the three checks tests significance at all.",
+  INSUFFICIENT:
+    "A forecast exists, but the model failed at least two of its three held-out checks. Read the number as the model's output and nothing more — there is no evidence it forecasts this stock better than chance.",
+  NO_FORECAST:
+    "The pipeline produced no prediction for this stock at all, usually too little price history or a benchmark index that has stopped publishing. Nothing here is a view; it is an absence.",
+};
+
+export function evidenceStateLabel(state: string | null | undefined): string {
+  if (!state) return "Not measured";
+  return EVIDENCE_STATE_LABEL[state as EvidenceState] ?? state;
+}
+
+export function evidenceStateExplainer(
+  state: string | null | undefined,
+): string {
+  if (!state) return "Nothing was recorded about this row.";
   return (
-    SCORE_BASIS_EXPLAINER[basis as ScoreBasis] ??
-    "No description is recorded for this score basis."
+    EVIDENCE_STATE_EXPLAINER[state as EvidenceState] ??
+    "No description is recorded for this state."
   );
 }
 

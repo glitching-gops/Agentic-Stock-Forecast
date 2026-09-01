@@ -42,7 +42,6 @@ export async function POST(request: Request) {
 
   revalidatePath("/", "layout");
   revalidatePath("/");
-  revalidatePath("/portfolio");
   revalidatePath("/methodology");
 
   // Stock pages are per-ticker, so each path has to be named. Soft-failing

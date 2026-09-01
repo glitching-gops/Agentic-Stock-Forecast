@@ -338,10 +338,9 @@ class ChronosProbe:
     # choice to its own upper edge and hide that.
     alphas: tuple = (1.0, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10)
     # What the inner split optimises. "mse" is the conventional choice and the
-    # one ridge itself minimises; "ic" targets the criterion this project is
-    # actually judged on, since the product is a RANKED leaderboard and a
-    # forecast can rank correctly while being poorly scaled. They disagree
-    # here, so both are reported rather than one being chosen quietly.
+    # one ridge itself minimises; "ic" targets cross-sectional ORDERING, which
+    # a forecast can get right while being poorly scaled. They disagree here,
+    # so both are reported rather than one being chosen quietly.
     select_metric: str = "mse"
     horizon: int = 30
     inner_folds: int = 3

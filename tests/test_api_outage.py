@@ -3,14 +3,14 @@ A database outage must be reported as an outage, never as an empty result.
 
 On 2026-08-26 the live API could not reach Supabase and four read paths
 disagreed about what that meant. `/api/stocks` returned HTTP 200 with
-`total: 0` and `/api/leaderboard` returned HTTP 200 with `entries: []`, while
+`total: 0` and the forecast list returned HTTP 200 with no rows, while
 `/api/forecasts` and `/api/signals` returned 500. Nothing anywhere said the
 database was down, and the frontend — which caches read-through on a timer —
 replaced a good page with an empty board on the next revalidation.
 
 The cause was a bare `except Exception` in each of those paths. Every one had
 been written for a narrow case that genuinely should degrade: a fresh database
-has no `index_membership` table until the first sync, and some leaderboard
+has no `index_membership` table until the first sync, and some forecast_current
 columns are added lazily, so a query naming one of them must not 500. The
 guard was wider than its intent, and "the schema is behind" and "the database
 is gone" landed on the same branch.
@@ -25,6 +25,7 @@ from pandas.errors import DatabaseError as PandasDatabaseError
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import NoSuchTableError, OperationalError, ProgrammingError
 
+import api.routers.forecasts as forecasts_router
 from data.db import is_missing_relation
 
 
@@ -51,7 +52,7 @@ def _unreachable_database() -> OperationalError:
     which is the whole reason is_missing_relation exists.
     """
     return OperationalError(
-        "SELECT * FROM leaderboard",
+        "SELECT * FROM forecast_current",
         {},
         _Psycopg2Error("connection to server at \"db.abcdefgh.supabase.co\" "
                        "(10.24.0.7), port 5432 failed: FATAL: sorry, too many "
@@ -93,11 +94,11 @@ def test_a_missing_table_is_recognised_and_an_outage_is_not():
 def test_the_inspector_reports_an_absent_table_as_its_own_class():
     """
     `inspect(engine).get_columns` never reaches the driver, so it raises
-    NoSuchTableError whose str() is the bare table name — 'leaderboard'. That
+    NoSuchTableError whose str() is the bare table name — 'forecast_current'. That
     matches no message test, so keying the guard on the message alone would
-    make the leaderboard 500 on a fresh database instead of degrading.
+    make the forecast list 500 on a fresh database instead of degrading.
     """
-    assert is_missing_relation(NoSuchTableError("leaderboard"))
+    assert is_missing_relation(NoSuchTableError("forecast_current"))
 
 
 def test_postgres_sqlstate_is_read_through_the_pandas_wrapper():
@@ -109,10 +110,10 @@ def test_postgres_sqlstate_is_read_through_the_pandas_wrapper():
     Reading only the outermost exception finds nothing.
     """
     undefined_table = ProgrammingError(
-        "SELECT * FROM leaderboard", {},
-        _Psycopg2Error('relation "leaderboard" does not exist', pgcode="42P01"))
+        "SELECT * FROM forecast_current", {},
+        _Psycopg2Error('relation "forecast_current" does not exist', pgcode="42P01"))
     undefined_column = ProgrammingError(
-        "SELECT pred_excess_return FROM leaderboard", {},
+        "SELECT pred_excess_return FROM forecast_current", {},
         _Psycopg2Error('column "pred_excess_return" does not exist',
                        pgcode="42703"))
 
@@ -155,51 +156,42 @@ def test_index_members_degrades_only_when_the_table_is_absent(tmp_path):
         "the test must be raising on the outage, not on a missing table")
 
 
-# ── The leaderboard: two guards, and the outage has to pass both ─────────────
-
-def _leaderboard_engine():
-    engine = create_engine("sqlite://")
-    with engine.connect() as conn:
-        conn.execute(text("CREATE TABLE leaderboard "
-                          "(ticker TEXT, composite_score REAL)"))
-        conn.execute(text("INSERT INTO leaderboard VALUES ('CANBK.NS', 23.86)"))
-        conn.commit()
-    return engine
-
+# ── The forecast list: two guards, and the outage has to pass both ──────────
 
 def _call(engine, **kwargs):
     """
     Every argument is passed explicitly: FastAPI's Query() defaults are only
     resolved during a request, and calling a router function directly with
     them unresolved raises NotImplementedError instead of running the code.
-    """
-    import api.routers.leaderboard as lb
 
-    args = dict(sector=None, verdict=None, evidence=None,
-                sort_by="composite_score", limit=50)
+    The import is at module scope on purpose. Inside the helper it would be
+    caught by the `pytest.raises(Exception)` in every test below, so deleting
+    or renaming the router would make all three PASS — which is exactly what
+    happened when api/routers/leaderboard.py was removed and this file went on
+    reporting green for the two outage tests it still contained.
+    """
+    args = dict(sector=None, verdict=None, evidence=None, limit=50)
     args.update(kwargs)
 
-    original = lb.get_engine
-    lb.get_engine = lambda: engine
-    lb._leaderboard_columns.cache_clear()
+    original = forecasts_router.get_engine
+    forecasts_router.get_engine = lambda: engine
     try:
-        return lb.get_leaderboard(**args)
+        return forecasts_router.list_forecasts(**args)
     finally:
-        lb.get_engine = original
-        lb._leaderboard_columns.cache_clear()
+        forecasts_router.get_engine = original
 
 
-def test_leaderboard_degrades_when_the_table_has_not_been_created(tmp_path):
+def test_forecast_list_degrades_when_the_table_has_not_been_created(tmp_path):
     """The soft path the guard was written for, still working."""
     response = _call(create_engine("sqlite://"))
 
-    assert response.entries == []
+    assert response.forecasts == []
     assert response.total == 0
 
 
-def test_leaderboard_column_probe_propagates_an_outage(tmp_path):
+def test_forecast_list_column_probe_propagates_an_outage(tmp_path):
     """
-    The first guard. `_leaderboard_columns` asks the database what columns the
+    The first guard. `_current_columns` asks the database what columns the
     table has; when that question cannot be asked at all, the answer is not
     "no columns", and returning frozenset() short-circuits the endpoint into
     an empty 200 before the real query is ever attempted.
@@ -210,27 +202,23 @@ def test_leaderboard_column_probe_propagates_an_outage(tmp_path):
     assert not is_missing_relation(outage.value)
 
 
-def test_leaderboard_query_propagates_an_outage(tmp_path):
+def test_forecast_list_query_propagates_an_outage(tmp_path):
     """
     The second guard, reached only once the column probe has succeeded — so
     the probe is stubbed with a real column set and the query is left to fail.
-    An outage here used to be served as `entries: []` with HTTP 200, which the
+    An outage here used to be served as an empty list with HTTP 200, which the
     frontend cached as though it were the answer.
     """
-    import api.routers.leaderboard as lb
-
     def _columns():
-        return frozenset({"ticker", "composite_score", "last_updated"})
+        return frozenset({"ticker", "pred_excess_return", "last_updated"})
 
-    _columns.cache_clear = lambda: None      # the endpoint calls this on the
-                                             # missing-column path
-    original_columns = lb._leaderboard_columns
-    lb._leaderboard_columns = _columns
+    original_columns = forecasts_router._current_columns
+    forecasts_router._current_columns = _columns
     try:
         with pytest.raises(Exception) as outage:
             _call(_broken_engine(tmp_path))
     finally:
-        lb._leaderboard_columns = original_columns
+        forecasts_router._current_columns = original_columns
 
     assert not is_missing_relation(outage.value)
 
@@ -249,7 +237,7 @@ def test_an_outage_is_served_as_503_and_is_not_cacheable():
     503 plus no-store says "this is not an answer". A 200 with an empty list
     says "there are no stocks", and the frontend believes it — it revalidates
     on a timer and keeps whatever it last received, so a single revalidation
-    during an outage replaces a working leaderboard with an empty one and
+    during an outage replaces a working forecast list with an empty one and
     nothing recovers it until the next successful fetch.
     """
     import data.universe as universe

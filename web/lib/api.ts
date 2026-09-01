@@ -2,8 +2,8 @@ import "server-only";
 
 import type {
   Forecast,
+  ForecastListResponse,
   Headline,
-  LeaderboardResponse,
   SignalsResponse,
   StockList,
 } from "./types";
@@ -20,10 +20,10 @@ import type {
  *    last good render.
  *  - FastAPI's CORS allowlist needs no Vercel entry, because no browser origin
  *    ever calls it. Server-to-server requests carry no Origin header.
- *  - The leaderboard is 95 rows / ~66 KB. Filtering and sorting it in the
- *    browser over one already-fetched payload is cheaper *and* faster than a
- *    round trip per filter change, so the interactive surface costs zero
- *    additional upstream requests.
+ *  - The forecast list is 84 rows / ~60 KB. Filtering it in the browser over
+ *    one already-fetched payload is cheaper *and* faster than a round trip per
+ *    filter change, so the interactive surface costs zero additional upstream
+ *    requests.
  */
 
 const BASE = (process.env.API_BASE_URL ?? "http://localhost:8000").replace(
@@ -118,20 +118,28 @@ export function getStocks(): Promise<StockList> {
   return request<StockList>("/api/stocks");
 }
 
-export interface LeaderboardQuery {
+export interface ForecastQuery {
   sector?: string;
   verdict?: string;
   evidence?: string;
-  sortBy?: string;
   limit?: number;
 }
 
-export function getLeaderboard(
-  query: LeaderboardQuery = {},
-): Promise<LeaderboardResponse> {
+/**
+ * Every current forecast, in ticker order.
+ *
+ * There is no sort parameter. The endpoint this replaced took one and reached
+ * ORDER BY with it as an identifier, which cannot be a bind parameter, so it
+ * needed an allowlist acting as a SQL-injection boundary. Removing the ordering
+ * removed the boundary with it — and the ordering was the thing worth removing
+ * anyway: three of ninety-six tickers clear the evidence gate, which is what
+ * chance produces, so ranking the rest published a comparison nothing supports.
+ */
+export function getForecasts(
+  query: ForecastQuery = {},
+): Promise<ForecastListResponse> {
   const params = new URLSearchParams({
-    sort_by: query.sortBy ?? "composite_score",
-    // 200 is the API's own ceiling. The universe is 95, so one call is the
+    // 500 is the API's own ceiling. The universe is 84, so one call is the
     // whole table and the client can filter without touching the network.
     limit: String(query.limit ?? 200),
   });
@@ -139,7 +147,7 @@ export function getLeaderboard(
   if (query.verdict) params.set("verdict", query.verdict);
   if (query.evidence) params.set("evidence", query.evidence);
 
-  return request<LeaderboardResponse>(`/api/leaderboard?${params}`);
+  return request<ForecastListResponse>(`/api/forecasts?${params}`);
 }
 
 export function getForecast(ticker: string): Promise<Forecast> {
@@ -168,9 +176,10 @@ export function getHeadlines(ticker: string): Promise<Headline[]> {
  *
  * Use this only where a missing piece degrades the page rather than
  * invalidating it — headlines, the signal history behind a chart. Do NOT wrap
- * the leaderboard or a forecast: those throwing is what makes a build fail
- * loudly instead of publishing an empty dashboard, and what makes Next keep
- * serving the last good page instead of overwriting it with an error state.
+ * the forecast list or a single forecast: those throwing is what makes a build
+ * fail loudly instead of publishing an empty dashboard, and what makes Next
+ * keep serving the last good page instead of overwriting it with an error
+ * state.
  */
 export async function soft<T>(
   promise: Promise<T>,

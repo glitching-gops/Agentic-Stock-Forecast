@@ -39,7 +39,7 @@ industry. Three reasons they stay ineligible even when they score highest:
      weight in it. The excess return would subtract the stock from itself.
   2. Interpretability. The product's claim is "excess return versus sector". A
      figure computed against an ownership index does not support that sentence,
-     and the leaderboard would be quietly asserting something false.
+     and every published forecast would be quietly asserting something false.
   3. Instability. Style membership is reconstituted on rules unrelated to what
      a company does, so the label's meaning drifts invisibly to the model.
 

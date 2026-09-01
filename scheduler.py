@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 # Below this share of the universe forecasting successfully, the run publishes a
-# leaderboard that is mostly STALE rows and says nothing about it. See the
+# board that is mostly STALE rows and says nothing about it. See the
 # rationale at the check itself in run_pipeline_job.
 MIN_FORECAST_SUCCESS_RATE = 0.5
 
@@ -74,7 +74,7 @@ def run_pipeline_job():
     The final step runs agents.graph.run_graph() per ticker rather than
     calling pipeline.model.train_and_forecast() directly. This matters:
     train_and_forecast() only ever wrote to model_metadata — it never touched
-    the forecasts/leaderboard tables the dashboard actually reads. Only
+    the forecasts/forecast_current tables the dashboard actually reads. Only
     run_graph() (via its critic node, which computes the composite score and
     calls save_forecast_to_db) does that. That gap was latent since Phase 0 —
     nothing scheduled ever called run_graph, only the manual /run-all admin
@@ -102,7 +102,7 @@ def run_pipeline_job():
         from pipeline.macro import fetch_and_store as fetch_macro
         from pipeline.tracking import finish_run, start_run
         from pipeline.validation import FAIL, run_gate
-        from agents.graph import prune_leaderboard, run_graph
+        from agents.graph import prune_forecast_current, run_graph
 
         logger.info("[1/8] Syncing point-in-time universe...")
         sync_current_membership()
@@ -232,7 +232,7 @@ def run_pipeline_job():
         # it passed a 67% failure rate for three consecutive days while the
         # published board froze on rows a fortnight old, every one of them still
         # carrying a superseded MODEL_VERSION. What a reader sees is a stale
-        # leaderboard indistinguishable from a fresh one, which is exactly the
+        # forecast indistinguishable from a fresh one, which is exactly the
         # class of defect the validation gate calls FAIL.
         #
         # 0.5 is deliberately loose rather than tight: ~12 names carry too little
@@ -245,18 +245,17 @@ def run_pipeline_job():
             raise PipelineAbort(
                 f"Only {succeeded} of {len(universe)} tickers forecast "
                 f"({rate:.0%}, floor {MIN_FORECAST_SUCCESS_RATE:.0%}). The "
-                f"leaderboard keeps stale rows for the other {failed}. "
+                f"board keeps stale rows for the other {failed}. "
                 f"Top reasons: {top}"
             )
 
-        # Names that have left the index keep their last leaderboard row
-        # otherwise, and those rows carry pre-Phase-0 composite scores that
-        # outrank every evidence-gated score written today. See
-        # agents.graph.prune_leaderboard.
-        removed = prune_leaderboard(universe)
+        # Names outside the frozen universe keep their last row otherwise, and
+        # a stale row renders exactly like a live one. See
+        # agents.graph.prune_forecast_current.
+        removed = prune_forecast_current(universe)
         if removed:
-            logger.info(f"[7/8] Pruned {removed} leaderboard row(s) for tickers "
-                       f"no longer in the universe")
+            logger.info(f"[7/8] Pruned {removed} forecast_current row(s) for "
+                       f"tickers no longer in the universe")
 
         # Score the forecasts whose 30 sessions have now elapsed. This is the
         # only measurement in the system taken on PUBLISHED output rather than
@@ -274,7 +273,7 @@ def run_pipeline_job():
             "signals_refused": signals_report.refused,
             "labelled_rows": labelled_after,
             "outcomes_resolved": outcomes.resolved,
-            "leaderboard_pruned": removed,
+            "forecast_rows_pruned": removed,
         })
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
@@ -311,7 +310,7 @@ def run_weekly_evaluation_job():
 
     Nothing in the output distinguished "this ticker has no track record" from
     "this table was not ready yet", so an infrastructure race was reported as a
-    data-quality verdict, and the leaderboard sat on 33 evaluated names for a
+    data-quality verdict, and the board sat on 33 evaluated names for a
     week. Fetching and recomputing here costs minutes against an evaluation
     measured in hours, and makes the job's result depend on the database rather
     than on what ran before it — which is what the membership sync below
@@ -394,7 +393,7 @@ def run_weekly_evaluation_job():
     # The gate belongs here for the same reason it belongs in the daily job:
     # everything above has written to the database and nothing below has
     # published. The weekly job is the one that persists the evidence the
-    # leaderboard gates on, so a data defect reaching it is worse, not better —
+    # the evidence gate reads, so a data defect reaching it is worse, not better —
     # a corrupted evaluation stays on the board for a week.
     gate = run_gate(universe)
     for check in gate.checks:

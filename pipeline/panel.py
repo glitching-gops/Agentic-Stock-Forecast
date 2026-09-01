@@ -3,9 +3,15 @@ pipeline/panel.py — The cross-sectional panel.
 
 Everything before Phase 2 modelled one ticker at a time: 95 independent
 XGBoost models, each fitted on its own ~2,400 rows, each measured on its own
-walk-forward. That is not how the output is used. The leaderboard ranks
-tickers *against each other on the same day*, so the quantity that matters is
-cross-sectional ordering, and a per-ticker model is never trained on it.
+walk-forward. Phase 2 measures those models against each other on the SAME
+DAY, across the cross-section, because that is the only comparison in which a
+common market move cancels out. A per-ticker model is never trained on that
+ordering, so it has no reason to be good at it.
+
+(The product no longer ranks stocks — that layer is gone. The cross-sectional
+measurement stays, because it is still the right way to separate skill from
+beta: roughly a third of return variance is common across these names, and a
+per-ticker metric credits a model for capturing it.)
 
 This module builds the substrate for models that are: a long panel indexed by
 (date, ticker), loaded in one query, with the macro block aligned onto the
@@ -53,7 +59,7 @@ from pipeline.signals import FEATURE_COLS
 # the same USDINR and the same India VIX on a given date, so after
 # cross_sectional_zscore they are identically zero and carry no ranking
 # information whatsoever. They can only ever help a model that is timing the
-# market as a whole, which is not what the leaderboard is. They stay in
+# market as a whole, which is not what this measures. They stay in
 # FEATURES because the per-ticker models are fitted on time series and can use
 # them there; they are excluded from the pooled factor set for this reason and
 # not by oversight.

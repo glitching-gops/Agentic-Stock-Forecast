@@ -3,7 +3,7 @@
 
 import os
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import NoSuchTableError
 from dotenv import load_dotenv
 
@@ -65,8 +65,8 @@ def to_native_params(params: dict) -> dict:
 #
 # Several read paths fail soft to an empty result on purpose: a fresh
 # production database has no index_membership table until the first sync, and
-# data/db.py adds some leaderboard columns lazily, so a query naming one of
-# them must degrade rather than 500.
+# data/db.py adds some forecast_current columns lazily, so a query naming one
+# of them must degrade rather than 500.
 #
 # That intent is narrow and the guard was not. A bare `except Exception` around
 # those queries also catches "cannot connect to the database", and an outage
@@ -289,7 +289,7 @@ def init_db():
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_signals_ticker_date ON signals (ticker, date)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sentiment_ticker_date ON sentiment (ticker, date)"))
 
-        # Step 6: Create the forecasts and leaderboard tables
+        # Step 6: Create the forecasts and forecast_current tables
         # Use SERIAL PRIMARY KEY for PostgreSQL, INTEGER PRIMARY KEY AUTOINCREMENT for SQLite
         id_col_type = "INTEGER PRIMARY KEY AUTOINCREMENT" if _SQLITE_PATH in DATABASE_URL or DATABASE_URL.startswith("sqlite") else "SERIAL PRIMARY KEY"
         
@@ -316,15 +316,31 @@ def init_db():
             )
         """))
 
+        # `leaderboard` -> `forecast_current`. RENAMED, never dropped and
+        # recreated: the table holds the current forecast for every stock, and
+        # only three of its columns (composite_score, score_basis, and the
+        # window rank computed in the API) were the ranking. Dropping it would
+        # throw away the product to remove the packaging.
+        #
+        # The rename runs before the CREATE below, and is conditional on the
+        # destination not already existing, so this is idempotent on a fresh
+        # database, on the live one, and on a database that has already been
+        # migrated. Swallowing the failure is not enough on its own — if the
+        # rename silently failed while an empty forecast_current was created
+        # beside it, the API would serve zero forecasts with no error anywhere.
+        inspector = inspect(conn)
+        tables = set(inspector.get_table_names())
+        if "leaderboard" in tables and "forecast_current" not in tables:
+            conn.execute(text("ALTER TABLE leaderboard RENAME TO forecast_current"))
+            print("[db] renamed leaderboard -> forecast_current")
+
         conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS leaderboard (
+            CREATE TABLE IF NOT EXISTS forecast_current (
                 ticker                   TEXT PRIMARY KEY,
                 company                  TEXT,
                 sector                   TEXT,
                 current_price            REAL,
                 forecast_price           REAL,
-                upside_pct               REAL,
-                composite_score          REAL,
                 critic_verdict           TEXT,
                 forecast_confidence      TEXT,
                 mape                     REAL,
@@ -367,14 +383,22 @@ def init_db():
             # regenerated daily; the evidence backing it is only re-measured
             # weekly) — surfaced so staleness is visible, not implied away.
             ("evaluated_at",         "TEXT"),
-            # Why composite_score is what it is — chiefly, why it is zero.
-            # Most of the leaderboard scores 0.0, and that single value covers
-            # "never evaluated", "predicted to underperform" and "flagged out",
-            # which are very different statements. See
-            # agents.graph.classify_score_basis.
-            ("score_basis",          "TEXT"),
+            # forecast_current was created without these; forecasts has them
+            # in its own DDL, and ALTER-and-swallow makes the duplicate a
+            # no-op. `direction` and `change_pct` reach forecast_current only
+            # through here.
+            ("direction",            "TEXT"),
+            ("change_pct",           "REAL"),
+            ("signal_narrative",     "TEXT"),
         ]
-        for table in ["forecasts", "leaderboard"]:
+        # composite_score, score_basis and upside_pct are DELIBERATELY absent.
+        # They are the ranking layer, which the project no longer has. The
+        # existing columns are left in place on the live table rather than
+        # dropped: nothing writes them now, an unwritten column decays into
+        # obvious staleness, and a DROP COLUMN on a live Postgres table to
+        # remove data nobody reads is a worse trade than leaving it. They will
+        # go when the target switch (P1) forces a rebuild anyway.
+        for table in ["forecasts", "forecast_current"]:
             for col, coltype in forecast_extra:
                 try:
                     with conn.begin_nested():

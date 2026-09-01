@@ -25,7 +25,7 @@ from data.db import init_db
 
 logger = logging.getLogger(__name__)
 
-from api.routers import stocks, forecasts, leaderboard, admin, signals, sentiment
+from api.routers import stocks, forecasts, admin, signals, sentiment
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,7 +63,6 @@ app.add_middleware(
 
 app.include_router(stocks.router,     prefix="/api/stocks",     tags=["Stocks"])
 app.include_router(forecasts.router,  prefix="/api/forecasts",  tags=["Forecasts"])
-app.include_router(leaderboard.router,prefix="/api/leaderboard",tags=["Leaderboard"])
 app.include_router(admin.router,      prefix="/api/admin",      tags=["Admin"])
 app.include_router(signals.router,    prefix="/api/signals",    tags=["Signals"])
 app.include_router(sentiment.router,  prefix="/api/sentiment",  tags=["Sentiment"])

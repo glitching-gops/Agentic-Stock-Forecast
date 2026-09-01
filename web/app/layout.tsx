@@ -3,7 +3,7 @@ import { IBM_Plex_Mono, IBM_Plex_Sans, Martian_Mono } from "next/font/google";
 import Link from "next/link";
 
 import { SiteNav } from "@/components/site-nav";
-import { getLeaderboard, getStocks, soft } from "@/lib/api";
+import { getForecasts, getStocks, soft } from "@/lib/api";
 
 import "./globals.css";
 
@@ -46,7 +46,7 @@ export const metadata: Metadata = {
     template: "%s · ZeRO",
   },
   description:
-    "NIFTY 100 stocks ranked by predicted 30-session excess return against a sector benchmark, gated behind held-out evidence from purged walk-forward evaluation.",
+    "A 30-session forecast for every stock in a fixed NIFTY 100 universe, each carrying the held-out evidence behind it, from purged walk-forward evaluation.",
 };
 
 export default async function RootLayout({
@@ -59,15 +59,15 @@ export default async function RootLayout({
    * the switcher or the status line should not take the site down, and every
    * page fetches the data it actually needs for itself.
    *
-   * The leaderboard call is free in practice — the home page requests the same
-   * URL with the same options, so Next's fetch cache serves one upstream hit
-   * for both. Note that `soft` is deliberately NOT used on the page's own
+   * The forecast-list call is free in practice — the home page requests the
+   * same URL with the same options, so Next's fetch cache serves one upstream
+   * hit for both. Note that `soft` is deliberately NOT used on the page's own
    * copy: a failure there must break the build rather than publish an empty
    * dashboard.
    */
   const [{ stocks }, board] = await Promise.all([
     soft(getStocks(), { stocks: [], total: 0 }),
-    soft(getLeaderboard(), null),
+    soft(getForecasts(), null),
   ]);
 
   return (

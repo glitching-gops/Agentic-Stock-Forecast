@@ -12,7 +12,7 @@ placeholders = ",".join([f"'{t}'" for t in keep])
 
 tables_with_ticker = [
     "ohlcv", "signals", "sentiment", "forecasts",
-    "leaderboard", "model_metadata"
+    "forecast_current", "model_metadata"
 ]
 
 with engine.connect() as conn:

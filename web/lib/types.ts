@@ -16,16 +16,24 @@ export type Verdict = "APPROVED" | "FLAGGED" | "REJECTED";
 export type EvidenceGrade = "STRONG" | "WEAK" | "INSUFFICIENT";
 
 /**
- * Why `composite_score` is what it is — and in particular why it is zero.
- * Read this before reading a 0.0 as "no signal": the same value covers a stock
- * with no forecast at all and a stock whose forecast is fine but points down.
+ * What is known about a forecast, replacing the old `score_basis`.
+ *
+ * That field existed to disambiguate a composite of 0.0, which covered "never
+ * evaluated", "predicted to underperform" and "flagged out" at once. There is
+ * no composite now, so three of its five values described the ranking rather
+ * than the forecast and are gone with it. What remains is the evidence grade
+ * the API already publishes, plus the one case it cannot express: a stock the
+ * pipeline produced no prediction for at all.
+ *
+ * Derived on the client by `evidenceState`, never sent as a field — a second
+ * server column carrying a value derivable from two others is a column that
+ * can disagree with them.
  */
-export type ScoreBasis =
-  | "RANKED"
-  | "NO_FORECAST"
-  | "NO_EVIDENCE"
-  | "NOT_LONG"
-  | "FLAGGED_OUT";
+export type EvidenceState =
+  | "STRONG"
+  | "WEAK"
+  | "INSUFFICIENT"
+  | "NO_FORECAST";
 
 export interface StockInfo {
   ticker: string;
@@ -38,13 +46,11 @@ export interface StockList {
   total: number;
 }
 
-export interface LeaderboardEntry {
-  /**
-   * Competition rank on the applied sort key: tied rows SHARE a rank
-   * (1, 2, 3, 3, 3, ...). Null when the sort key is null. Never renumber this
-   * client-side — the API computes it over the full filtered set, before LIMIT.
-   */
-  rank: number | null;
+/**
+ * One stock's current forecast. NO RANK AND NO SCORE — the API publishes
+ * neither, and adding either here would invite a component to invent one.
+ */
+export interface CurrentForecast {
   ticker: string;
   company: string | null;
   sector: string | null;
@@ -52,7 +58,9 @@ export interface LeaderboardEntry {
   current_price: number | null;
   /** Implied price ASSUMING THE BENCHMARK IS FLAT. */
   forecast_price: number | null;
-  upside_pct: number | null;
+  direction: string | null;
+  /** Implied percentage change. Was `upside_pct`; a forecast can point down. */
+  change_pct: number | null;
   /** Predicted 30-session log return in excess of the benchmark. */
   pred_excess_return: number | null;
 
@@ -66,22 +74,27 @@ export interface LeaderboardEntry {
   benchmark_name: string | null;
   benchmark_sector_specific: boolean | null;
 
-  /** Ranking heuristic in [0,100]. NOT an expected return. */
-  composite_score: number | null;
-  score_basis: ScoreBasis | string | null;
   critic_verdict: Verdict | string | null;
   forecast_confidence: EvidenceGrade | string | null;
+  signal_narrative: string | null;
 
   eval_rank_ic: number | null;
+  /**
+   * Read WITH the sign. The gate tests |t|, so a large NEGATIVE value marks a
+   * ticker the model gets reliably wrong, not one it gets right.
+   */
+  eval_rank_ic_t: number | null;
   eval_hit_rate: number | null;
   eval_baseline_hit_rate: number | null;
   eval_beats_random_walk: boolean | null;
+  model_version: string | null;
   /** Measured weekly, so this may be older than `last_updated`. */
   evaluated_at: string | null;
+  last_updated: string | null;
 }
 
-export interface LeaderboardResponse {
-  entries: LeaderboardEntry[];
+export interface ForecastListResponse {
+  forecasts: CurrentForecast[];
   total: number;
   last_updated: string;
   filters_applied: Record<string, string>;

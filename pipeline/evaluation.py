@@ -646,7 +646,12 @@ def cross_sectional_report(
     quantiles: int = 5,
 ) -> dict:
     """
-    Evaluates the panel the way the leaderboard is actually used: as a ranking.
+    Scores the panel cross-sectionally: how well does it ORDER names on a date.
+
+    Not because the product ranks stocks — it no longer does — but because a
+    within-date ordering is invariant to whatever the market did that day, and
+    ~33% of 30-session return variance here is common across names. A metric
+    that is not within-date credits a model for the market.
 
     ``panel`` needs columns ``date``, ``ticker``, ``y_pred``, ``y_true``, all
     out-of-sample. Returns per-rebalance rank IC and quantile spreads with

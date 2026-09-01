@@ -65,20 +65,20 @@ if __name__ == "__main__":
         fetch_macro()
 
         universe = get_universe()
-        print(f"      Tradable universe after screening: {len(universe)}")
+        print(f"      Frozen forecasting universe: {len(universe)}")
 
         compute_and_store(tickers=universe)
         fetch_and_score(tickers=universe)
 
         # run_graph(), not pipeline.model.train_and_forecast(): only run_graph
-        # (via its critic node) populates forecasts/leaderboard. See
+        # (via its critic node) populates forecasts/forecast_current. See
         # scheduler.run_pipeline_job's docstring for why this matters.
         for ticker in universe:
             run_graph(ticker)
     else:
         print("[3/5] Database already contains data. Skipping initial fetch.")
         universe = get_universe()
-        print(f"      Tradable universe: {len(universe)}")
+        print(f"      Frozen forecasting universe: {len(universe)}")
 
     print("[4/5] Starting background scheduler...")
     from scheduler import start_scheduler

@@ -8,9 +8,9 @@ import {
   Readout,
   SectionHead,
 } from "@/components/ui";
-import { getLeaderboard, soft } from "@/lib/api";
+import { getForecasts, soft } from "@/lib/api";
 import { pctPoints, signed } from "@/lib/format";
-import type { LeaderboardEntry } from "@/lib/types";
+import type { CurrentForecast } from "@/lib/types";
 
 // Route segment config must be a literal — Next cannot statically analyse an
 // imported constant here. Keep in step with REVALIDATE_SECONDS in lib/api.ts.
@@ -26,8 +26,8 @@ export const metadata = {
 export default async function MethodologyPage() {
   // Soft: the prose is the point of this page and must render even if the
   // measured block cannot.
-  const data = await soft(getLeaderboard(), null);
-  const measured = data ? measure(data.entries) : null;
+  const data = await soft(getForecasts(), null);
+  const measured = data ? measure(data.forecasts) : null;
 
   return (
     <div className="max-w-5xl space-y-11">
@@ -36,7 +36,8 @@ export default async function MethodologyPage() {
           Methodology
         </h1>
         <p className="mt-2 max-w-[78ch] font-prose text-[0.86rem] leading-relaxed text-mid">
-          ZeRO ranks NSE stocks by their predicted 30-session return{" "}
+          ZeRO forecasts the 30-session return of every NSE stock in a fixed
+          universe,{" "}
           <span className="text-text">relative to a sector benchmark</span>.
           This page states how that is measured, what the measurement currently
           says, and what the system does not model. Every figure here is read
@@ -105,8 +106,8 @@ export default async function MethodologyPage() {
                 <Note tone="bar" title="Read these honestly">
                   A rank IC near 0.05 is a weak signal — real, but not a licence
                   to trade. Where the model does not beat a random walk on
-                  magnitude, the ranking is the output and the rupee target is
-                  illustrative only.
+                  magnitude, the rupee target is illustrative and the interval
+                  around it is the honest part.
                 </Note>
               )}
             </div>
@@ -118,8 +119,9 @@ export default async function MethodologyPage() {
                 against the nominal 80% every week and the two agree closely.
                 The uncertainty quantification works even though the point
                 forecast does not — which is why the interval and the
-                probability are shown on every stock page while the ranking is
-                gated behind evidence most stocks never produce. Realised
+                probability are shown on every stock page, and why the evidence
+                grade travels beside every number rather than being folded into
+                one. Realised
                 coverage is measured in the weekly job but is not yet persisted
                 anywhere the API can read, so it is described here rather than
                 displayed as a live figure.
@@ -270,84 +272,42 @@ export default async function MethodologyPage() {
         </div>
       </section>
 
-      {/* ── Composite ────────────────────────────────────────────────────── */}
+      {/* ── Why there is no ranking ─────────────────────────────── */}
       <section>
         <SectionHead
-          title="The composite score"
-          description="A ranking heuristic in [0, 100]. Not an expected return, and not a price target."
+          title="Why there is no ranking"
+          description="This used to publish a composite score in [0, 100] and order the universe by it. It does not any more, and the reason is arithmetic rather than editorial."
         />
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[620px] border-collapse text-[0.78rem]">
-            <thead>
-              <tr className="bg-inset text-left">
-                <th className="border-y border-rule px-2 py-1">
-                  <Eyebrow as="span">Component</Eyebrow>
-                </th>
-                <th className="border-y border-rule px-2 py-1">
-                  <Eyebrow as="span">Effect</Eyebrow>
-                </th>
-                <th className="border-y border-rule px-2 py-1">
-                  <Eyebrow as="span">Description</Eyebrow>
-                </th>
-              </tr>
-            </thead>
-            <tbody className="text-mid">
-              {[
-                [
-                  "Signal",
-                  "0–60 pts",
-                  "Predicted 30-session excess return, saturating at +10% so one extreme forecast cannot dominate the board.",
-                ],
-                [
-                  "Conviction",
-                  "0–40 pts",
-                  "How far P(outperform) sits from a coin flip — counted only where the point forecast also predicts an upward move.",
-                ],
-                [
-                  "Evidence grade",
-                  "×1.0 / ×0.5 / ×0",
-                  "STRONG / WEAK / INSUFFICIENT from purged walk-forward folds. A model that failed its held-out checks scores zero however large a move it predicts.",
-                ],
-                [
-                  "Critic flags",
-                  "−5 pts each",
-                  "Contradictions raised by the LLM signal review, floored at zero.",
-                ],
-              ].map(([component, effect, description]) => (
-                <tr key={component} className="border-b border-rule/70">
-                  <td className="px-2 py-1.5 text-bright">{component}</td>
-                  <td className="whitespace-nowrap px-2 py-1.5">{effect}</td>
-                  <td className="px-2 py-1.5 font-prose leading-relaxed">
-                    {description}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-
-        <Prose className="mt-5">
+        <Prose>
           <p>
-            Both components floor at zero, which makes the composite a{" "}
-            <strong>long-only</strong> ranking: a confidently predicted
-            underperformer scores exactly the same as a confidently predicted
-            flat one. That is why the leaderboard groups its zeros by{" "}
-            <code>score_basis</code> instead of numbering them off — one value
-            covers five unrelated situations, and sorting on it alone conflates
-            &ldquo;no view&rdquo; with &ldquo;negative view&rdquo;.
+            Ranking eighty-four names requires eighty-four comparable numbers.
+            The evidence gate produces three. Its checks pass at rates of{" "}
+            <strong>0.385</strong>, <strong>0.042</strong> and{" "}
+            <strong>0.042</strong> across the universe, so under independence
+            the expected number clearing two of three is{" "}
+            <strong>3.12</strong> — and three is what is observed, at a Poisson
+            p of 0.60. The output of the gate is indistinguishable from
+            eighty-four draws of noise.
           </p>
           <p>
-            Conviction used to be computed independently of the point forecast,
-            and that was not long-only at all. PNB ranked{" "}
-            <strong>third</strong> on the live board on 2026-08-17 while
-            forecasting a 1.69% underperformance: the signal component floored
-            to 0.00 as intended, but conviction still collected 10.75 points
-            from a calibrated probability of 0.567. The two inputs disagreed and
-            the score quietly sided with the cheerier one. They disagree for a
-            real reason — the calibrated probability is the share of residuals
-            above the negated forecast, so a value over 0.5 means the model runs
-            biased low for that ticker — but that is a statement that the model
-            contradicts itself, not a ranking signal. It now ranks nowhere.
+            A ranked table over that is not merely uninformative, it is
+            misleading in a specific way: it puts two or three names above a
+            long tail and invites the reader to treat the ordering as a finding.
+            The names on top were on top because their rows happened to be
+            stale. So each stock now carries its own forecast and its own
+            evidence, and the page says which of the two it is showing you.
+          </p>
+          <p>
+            One structural hole in the gate is worth stating plainly, because
+            fixing it would make the page more conservative rather than less.
+            The only check that tests <em>significance</em> is the IC
+            t-statistic, and it is applied as an absolute value. Every ticker
+            that currently passes it has a strongly <strong>negative</strong>{" "}
+            IC — MUTHOOTFIN at −2.00, TRENT at −2.33, HDFCAMC at −2.18, LT at
+            −2.08 — which means the check is passed exclusively by stocks the
+            model gets reliably wrong. No ticker anywhere has a positive IC
+            t-statistic of 2; the maximum over ninety-six is +1.84. The table
+            marks these rows rather than hiding them.
           </p>
         </Prose>
       </section>
@@ -409,7 +369,7 @@ export default async function MethodologyPage() {
               <strong>Degenerate direction on some models.</strong> Roughly a
               fifth of tickers emit a single predicted direction for every row,
               which matches the majority-class baseline exactly without having a
-              view. Those rows are marked on the leaderboard.
+              view. Those rows are marked in the forecast table.
             </li>
             <li>
               <strong>No transaction costs.</strong> Indian delivery round trips
@@ -554,7 +514,7 @@ function StackCard({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-function measure(entries: LeaderboardEntry[]) {
+function measure(entries: CurrentForecast[]) {
   const mean = (values: number[]) =>
     values.length === 0
       ? Number.NaN

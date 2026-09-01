@@ -77,3 +77,90 @@ class ForecastResponse(BaseModel):
     forecast_error: Optional[str] = None
     universe_rule: Optional[str] = None
     last_updated: Optional[str] = None
+
+
+class CurrentForecast(BaseModel):
+    """
+    One stock's current forecast, as carried on the forecast_current table.
+
+    NO RANK, NO SCORE. This replaces LeaderboardEntry, which carried `rank`,
+    `composite_score` and `score_basis`. The evidence fields survive unchanged
+    and are what a reader should judge a row by: a forecast whose
+    forecast_confidence is INSUFFICIENT has no held-out support, and saying so
+    is more informative than placing it 47th.
+
+    Every unmeasured quantity is null, never 0.0. A zero here is a POSITION —
+    "the model predicts no excess return" — and is not the same statement as
+    "nothing has been measured". Conflating the two is how a dead sentiment
+    scorer displayed a confident neutral reading for months.
+    """
+
+    ticker: str
+    company: Optional[str] = None
+    sector: Optional[str] = None
+
+    current_price: Optional[float] = None
+    forecast_price: Optional[float] = Field(
+        None, description="Implied price assuming the benchmark is flat.")
+    direction: Optional[str] = Field(
+        None, description="OUTPERFORM / UNDERPERFORM / UNAVAILABLE")
+    change_pct: Optional[float] = Field(
+        None, description="Implied percentage change. Was `upside_pct`; renamed "
+                          "because a forecast can point down and 'upside' asserted "
+                          "otherwise.")
+    pred_excess_return: Optional[float] = Field(
+        None, description="Predicted 30-session log return in excess of the benchmark.")
+
+    interval_low: Optional[float] = None
+    interval_high: Optional[float] = None
+    interval_coverage: Optional[float] = None
+    prob_outperform: Optional[float] = None
+    random_walk_price: Optional[float] = None
+
+    benchmark_ticker: Optional[str] = None
+    benchmark_name: Optional[str] = None
+    benchmark_sector_specific: Optional[bool] = None
+
+    critic_verdict: Optional[str] = None
+    forecast_confidence: Optional[str] = Field(
+        None, description="Evidence grade: STRONG / WEAK / INSUFFICIENT.")
+    signal_narrative: Optional[str] = None
+
+    eval_rank_ic: Optional[float] = None
+    eval_rank_ic_t: Optional[float] = Field(
+        None, description="t-statistic of the out-of-sample rank IC. One of the "
+                          "three held-out checks behind forecast_confidence, and "
+                          "the only one that speaks to significance rather than "
+                          "size. Read it WITH the sign: the gate tests |t|, so a "
+                          "large negative value marks a ticker the model gets "
+                          "reliably WRONG, not one it gets right.")
+    eval_hit_rate: Optional[float] = None
+    eval_baseline_hit_rate: Optional[float] = None
+    eval_beats_random_walk: Optional[bool] = None
+    model_version: Optional[str] = None
+    evaluated_at: Optional[str] = Field(
+        None, description="When the evidence behind this row was last measured "
+                          "(weekly, not daily) — may be older than last_updated.")
+    last_updated: Optional[str] = None
+
+
+class ForecastListResponse(BaseModel):
+    forecasts: list[CurrentForecast]
+    total: int
+    last_updated: str
+    filters_applied: dict
+    methodology: str = Field(
+        default=(
+            "One 30-session forecast per stock over a fixed universe of 84 NIFTY "
+            "100 names, selected on data quality alone and never on measured "
+            "accuracy. Predictions are of return in excess of a sector benchmark; "
+            "the rupee price assumes the benchmark is flat. Every eval_* figure "
+            "comes from purged walk-forward evaluation with a 30-session embargo, "
+            "on folds the model never trained on. These forecasts are NOT ranked "
+            "against each other: the evidence gate clears too few names for an "
+            "ordering to mean anything, so each row is presented with its own "
+            "evidence and read on its own terms. A null is 'not measured', which "
+            "is a different statement from a zero."
+        ),
+        description="How to read these numbers.",
+    )

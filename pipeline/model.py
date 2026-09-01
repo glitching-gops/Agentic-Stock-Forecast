@@ -21,7 +21,7 @@ skill" is a slow-moving property that doesn't need daily re-measurement.
 A forecast's evidence grade can therefore be up to a week stale relative to
 its price. That staleness is surfaced (``evaluated_at``, distinct from
 ``last_updated``) rather than hidden — see agents/critic_agent.py and the
-``evaluated_at`` column on the forecasts/leaderboard tables.
+``evaluated_at`` column on the forecasts/forecast_current tables.
 
 Nothing on the daily path runs Optuna. tests/test_scheduling.py asserts this.
 """
@@ -55,7 +55,7 @@ from pipeline.tuning import tune, tune_and_cache
 # return MINUS its benchmark's, so those tickers' labels now mean something
 # different from every label written under v1, and an evaluation produced under
 # one is not comparable with one produced under the other. The version string is
-# what makes that visible on the leaderboard instead of silent.
+# what makes that visible on the published row instead of silent.
 MODEL_VERSION = "phase1-benchmark-audited-v2"
 
 FEATURES = FEATURE_COLS + [
@@ -610,12 +610,12 @@ def train_and_forecast(single_ticker: str | None = None,
     hyperparameters, no Optuna search. model_metadata.last_trained is updated
     by forecast_ticker_daily() itself (_record_daily_fit), not here.
 
-    IMPORTANT: this does NOT populate the forecasts/leaderboard tables — only
+    IMPORTANT: this does NOT populate the forecasts/forecast_current tables — only
     agents.graph.run_graph() does that (it runs the critic evidence gate and
     computes the composite score, which this function has no part of). This
     was a real, previously-latent gap: scheduler.run_pipeline_job() used to
     call this function directly and nothing scheduled ever touched
-    forecasts/leaderboard, which is why the dashboard sat on a months-old row
+    forecasts/forecast_current, which is why the dashboard sat on a months-old row
     even while this function ran successfully every day. The daily job now
     calls run_graph() per ticker instead (see scheduler.py); this function
     remains for programmatic/tool use where only model_metadata matters.

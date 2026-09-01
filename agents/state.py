@@ -1,13 +1,15 @@
 from typing import Any, List, Optional, TypedDict
 
-# How much of a composite score survives each evidence grade.
+# How much weight an evidence grade carries. The single definition of
+# "INSUFFICIENT means nothing survives".
 #
-# It lives HERE, rather than beside the scoring function that applies it,
-# because two things depend on it and they must not be able to disagree:
-# graph.compute_composite_score multiplies by it, and critic_node reads it to
-# decide whether the LLM review is worth making an API call for. A second copy
-# of "INSUFFICIENT means zero" would let one of them drift — the gate would keep
-# skipping names that had started to score, and nothing would raise.
+# It was a MULTIPLIER on the composite score, and it lived here rather than
+# beside that function so the score and critic_node's LLM gate could not hold
+# different copies of the rule. The score is gone with the rest of the ranking
+# layer; critic_node still reads this to decide whether an LLM review can
+# change anything, so the constant stays and the values keep their meaning.
+# Nothing multiplies by it any more — the name is kept because the ordering
+# STRONG > WEAK > INSUFFICIENT = 0 is what callers actually depend on.
 EVIDENCE_MULTIPLIER = {"STRONG": 1.0, "WEAK": 0.5, "INSUFFICIENT": 0.0}
 
 

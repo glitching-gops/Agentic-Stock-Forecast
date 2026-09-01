@@ -300,23 +300,160 @@ def test_grade_is_insufficient_when_no_forecast_exists():
     assert grade == "INSUFFICIENT"
 
 
-def test_composite_score_is_gated_by_evidence():
-    """
-    The old score gave 75 of 100 points from leaked metrics that barely varied.
-    A model that failed its held-out checks must now score zero regardless of
-    how large a move it predicts.
-    """
-    from agents.graph import compute_composite_score
+# ── The universe is frozen, and must stay a file rather than a query ───────
 
-    strong = compute_composite_score(0.05, "STRONG", 0.70)
-    weak = compute_composite_score(0.05, "WEAK", 0.70)
-    insufficient = compute_composite_score(0.05, "INSUFFICIENT", 0.70)
+def test_the_universe_is_a_file_and_touches_no_database():
+    """
+    get_universe() must answer from data/frozen_universe.py alone.
 
-    assert strong > weak > insufficient
-    assert insufficient == 0.0
-    assert compute_composite_score(0.50, "INSUFFICIENT", 0.99) == 0.0
-    assert compute_composite_score(-0.05, "STRONG", 0.30) == 0.0
-    assert 0.0 <= strong <= 100.0
+    A universe recomputed at run time changes the row set underneath a
+    measurement. The old screen read the ohlcv table, so a partial yfinance
+    response produced a SHORTER universe rather than an error — and a result
+    measured over 46 names is not comparable with one measured over 95, which
+    is the confound data_hash exists to expose only AFTER the fact.
+
+    Asserted by handing it an engine that raises on any use. A test that merely
+    compared the return value against the frozen list would pass just as
+    happily against a screen that queried the database and happened to agree
+    today, which is the version that rots.
+    """
+    import data.db as db_mod
+    import data.universe as uni
+    from data.frozen_universe import FROZEN_UNIVERSE
+
+    def _explode():
+        raise AssertionError("get_universe() queried the database")
+
+    original = db_mod.get_engine
+    db_mod.get_engine = _explode
+    try:
+        assert uni.get_universe() == list(FROZEN_UNIVERSE)
+        # The signature is retained for the ~25 existing call sites, and the
+        # arguments must be INERT: a universe that varied with as_of would not
+        # be frozen.
+        assert uni.get_universe(as_of="2019-01-01") == list(FROZEN_UNIVERSE)
+    finally:
+        db_mod.get_engine = original
+
+
+def test_every_frozen_ticker_is_fetched_even_after_leaving_the_index():
+    """
+    get_ingest_universe() must union the frozen list with current membership.
+
+    Fetching membership alone rots the freeze: a name dropped from the NIFTY
+    100 would stop being fetched while still being forecast, so its ohlcv would
+    end on the day it left, the forecast would be built on a stale last price,
+    and nothing anywhere would say so. Committing to a fixed universe is
+    committing to feed it.
+    """
+    import data.universe as uni
+    from data.frozen_universe import FROZEN_UNIVERSE
+
+    original = uni.get_index_members
+    uni.get_index_members = lambda as_of, index_name: ["NEWCOMER.NS"]
+    try:
+        ingest = set(uni.get_ingest_universe())
+    finally:
+        uni.get_index_members = original
+
+    assert set(FROZEN_UNIVERSE) <= ingest, (
+        "a frozen ticker that has left the index must still be fetched")
+    assert "NEWCOMER.NS" in ingest, (
+        "a new index member must be fetched too, or tools/audit_universe.py "
+        "has no data to screen it on and drift becomes invisible")
+
+
+def test_the_universe_was_not_selected_on_measured_skill():
+    """
+    Selection is on data quality only. This is F4 restated.
+
+    The pre-audit universe came from tools/select_top_50.py, which ranked by
+    composite score — a function of the model's own reported accuracy — so
+    every metric averaged over the survivors was biased upward by construction.
+
+    The check that bites: DMART, PNB and UNIONBANK are the only three tickers
+    currently clearing the evidence gate, and DMART carries 2,337 sessions
+    against a 2,400 floor. It is therefore ABSENT. If a future edit quietly
+    admits it while the floor still reads 2,400, the universe has started
+    tracking the outcome.
+    """
+    from data.frozen_universe import (
+        FROZEN_MEASUREMENTS, FROZEN_UNIVERSE, MIN_SESSIONS)
+
+    assert len(FROZEN_UNIVERSE) == len(set(FROZEN_UNIVERSE)), "duplicate ticker"
+    assert len(FROZEN_MEASUREMENTS) == len(FROZEN_UNIVERSE)
+
+    for ticker, sessions, _first, _holes, adv_cr in FROZEN_MEASUREMENTS:
+        assert sessions >= MIN_SESSIONS, f"{ticker} is below the history floor"
+        assert adv_cr >= 25.0, f"{ticker} is below the liquidity floor"
+
+    assert "DMART.NS" not in FROZEN_UNIVERSE, (
+        "DMART clears the evidence gate and fails the history floor at 2,337 "
+        "sessions. Admitting it would be selecting on the outcome.")
+
+
+def test_the_board_is_renamed_and_its_rows_survive(tmp_path):
+    """
+    `leaderboard` becomes `forecast_current` by RENAME, never by drop-and-create.
+
+    The ranking lived in three of that table's columns. The table itself holds
+    the current forecast for every stock — price, predicted excess return,
+    conformal interval, calibrated probability, every eval_* figure — which is
+    the product. Recreating it empty would throw away the deliverable to remove
+    the packaging, and on the live database there is no undo.
+
+    Three things are pinned, because each fails differently:
+
+      1. the rows come across;
+      2. the columns forecast_current never had in its own DDL (`direction`,
+         `change_pct`, `signal_narrative`) arrive through the shared migration
+         — without them save_forecast_to_db inserts into columns that do not
+         exist, and only in production, since a fresh test database gets them
+         from the same code path either way;
+      3. running init_db twice is a no-op, so a redeploy against an
+         already-migrated database does not fail or rename something else.
+    """
+    import sqlalchemy as sa
+
+    import data.db as db_mod
+
+    # A FILE-backed sqlite, not ":memory:". An in-memory URL opens a fresh
+    # empty database per connection, so the rename would run against one
+    # database and be inspected in another — a green test proving nothing.
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
+    with engine.connect() as conn:
+        conn.execute(sa.text(
+            "CREATE TABLE leaderboard (ticker TEXT PRIMARY KEY, "
+            "composite_score REAL, score_basis TEXT, upside_pct REAL)"))
+        conn.execute(sa.text(
+            "INSERT INTO leaderboard VALUES ('CANBK.NS', 23.86, 'RANKED', 1.5)"))
+        conn.commit()
+
+    original = db_mod.get_engine
+    db_mod.get_engine = lambda: engine
+    try:
+        db_mod.init_db()
+        tables = set(sa.inspect(engine).get_table_names())
+        assert "forecast_current" in tables
+        assert "leaderboard" not in tables, (
+            "the old name must not survive beside the new one — two tables "
+            "means half the writes land somewhere nobody reads")
+
+        with engine.connect() as conn:
+            kept = conn.execute(sa.text(
+                "SELECT ticker FROM forecast_current")).scalar()
+        assert kept == "CANBK.NS", "the rename dropped the rows"
+
+        columns = {c["name"] for c in
+                   sa.inspect(engine).get_columns("forecast_current")}
+        for needed in ("direction", "change_pct", "signal_narrative",
+                       "pred_excess_return", "eval_rank_ic_t"):
+            assert needed in columns, f"{needed} never reached forecast_current"
+
+        db_mod.init_db()        # idempotent: a redeploy must not re-rename
+        assert "forecast_current" in set(sa.inspect(engine).get_table_names())
+    finally:
+        db_mod.get_engine = original
 
 
 # ── F15: bound SQL parameters ─────────────────────────────────────────────────
@@ -547,13 +684,12 @@ def test_persisted_evaluation_loader_returns_no_numpy_scalars():
 
 # ── Departed tickers must not outrank the live universe ───────────────────────
 
-def test_prune_leaderboard_removes_only_tickers_outside_the_universe():
+def test_prune_removes_only_tickers_outside_the_frozen_universe():
     """
     save_forecast_to_db upserts and never deletes, so a name that leaves the
-    index keeps its last row — carrying a pre-Phase-0 composite score with no
-    evidence gate, which outranks every gated score written today. The live
-    leaderboard was still headed by IDEA.NS and SAIL.NS months after both left
-    the NIFTY 100.
+    universe keeps its last row, dated whenever it was last forecast, and
+    renders exactly like a live one. The live board was still headed by IDEA.NS
+    and SAIL.NS months after both left the NIFTY 100.
     """
     import agents.graph as graph_mod
     import data.db as db_mod
@@ -567,11 +703,11 @@ def test_prune_leaderboard_removes_only_tickers_outside_the_universe():
     try:
         # 2 of 4 rows leave, which exceeds the default 25% guard, so this call
         # states its own tolerance rather than relying on the default.
-        removed = graph_mod.prune_leaderboard(
+        removed = graph_mod.prune_forecast_current(
             ["RELIANCE.NS", "WIPRO.NS"], max_fraction=1.0)
-        # An empty universe must never trigger a delete — that would wipe the
-        # whole leaderboard on a bad universe fetch.
-        empty = graph_mod.prune_leaderboard([], max_fraction=1.0)
+        # An empty universe must never trigger a delete — that would wipe
+        # every forecast on a bad universe fetch.
+        empty = graph_mod.prune_forecast_current([], max_fraction=1.0)
     finally:
         db_mod.get_engine = original
 
@@ -580,17 +716,16 @@ def test_prune_leaderboard_removes_only_tickers_outside_the_universe():
     assert _tickers(engine) == ["RELIANCE.NS", "WIPRO.NS"]
 
 
-def test_prune_leaderboard_refuses_to_delete_most_of_the_table():
+def test_prune_refuses_to_delete_most_of_the_table():
     """
     A short universe is not evidence of a mass delisting.
 
-    get_universe() applies a liquidity floor and a listing-history floor over
-    freshly fetched OHLCV, so a partial yfinance response or a half-written
-    ohlcv table produces a SHORT universe rather than an empty one. Guarding
-    only against the empty case leaves the far likelier failure wide open:
-    every healthy name missing from a truncated universe looks exactly like a
-    departure, and the prune would delete the live leaderboard on the strength
-    of a bad download.
+    The universe is frozen now, so it cannot shrink because a download was
+    short — the failure this guard was written for. It is kept because the
+    frozen list is edited by hand, and a typo in a checked-in file deletes rows
+    exactly as effectively as a truncated yfinance response did. A universe
+    change of any size is deliberate and re-runnable; a quarter of the table
+    vanishing unnoticed is not.
     """
     import agents.graph as graph_mod
     import data.db as db_mod
@@ -602,7 +737,7 @@ def test_prune_leaderboard_refuses_to_delete_most_of_the_table():
     db_mod.get_engine = lambda: engine
     try:
         # Only 3 of 20 names survive the screen — 85% of the table would go.
-        removed = graph_mod.prune_leaderboard(universe[:3])
+        removed = graph_mod.prune_forecast_current(universe[:3])
     finally:
         db_mod.get_engine = original
 
@@ -611,15 +746,15 @@ def test_prune_leaderboard_refuses_to_delete_most_of_the_table():
 
 
 def _leaderboard_fixture(tickers):
-    """An in-memory leaderboard table holding one row per ticker."""
+    """An in-memory forecast_current table holding one row per ticker."""
     from sqlalchemy import create_engine, text
 
     engine = create_engine("sqlite://")          # single shared connection
     with engine.connect() as conn:
-        conn.execute(text("CREATE TABLE leaderboard "
-                          "(ticker TEXT PRIMARY KEY, composite_score REAL)"))
+        conn.execute(text("CREATE TABLE forecast_current "
+                          "(ticker TEXT PRIMARY KEY, pred_excess_return REAL)"))
         for i, ticker in enumerate(tickers):
-            conn.execute(text("INSERT INTO leaderboard VALUES (:t, :s)"),
+            conn.execute(text("INSERT INTO forecast_current VALUES (:t, :s)"),
                          {"t": ticker, "s": float(i)})
         conn.commit()
     return engine
@@ -630,115 +765,100 @@ def _tickers(engine):
 
     with engine.connect() as conn:
         return sorted(r[0] for r in
-                      conn.execute(text("SELECT ticker FROM leaderboard")))
+                      conn.execute(text("SELECT ticker FROM forecast_current")))
 
 
-def test_daily_job_prunes_the_leaderboard_after_forecasting():
+def test_daily_job_prunes_stale_forecasts_after_forecasting():
     import scheduler
 
     source = inspect.getsource(scheduler.run_pipeline_job)
-    assert "prune_leaderboard(universe)" in source
+    assert "prune_forecast_current(universe)" in source
 
 
-def test_leaderboard_total_counts_matches_not_page_size():
+def test_forecast_list_total_counts_matches_not_page_size():
     """
     `total` must report how many rows matched, not how many were returned.
-    Returning len(entries) made it a restatement of `limit`, hiding the
-    difference between a leaderboard holding 5 rows and one holding 500.
+    Returning len(rows) made it a restatement of `limit`, hiding the difference
+    between a table holding 5 rows and one holding 500.
 
     Asserted through the endpoint rather than by grepping its source: the
     previous version of this test pinned the literal line `total_matching =
     len(df)`, which passed for the right reason exactly once and then failed
     the moment the count moved into SQL without the behaviour changing at all.
     """
-    rows = [("CANBK.NS", 23.86, "RANKED", "Financial Services"),
-            ("ADANIPOWER.NS", 13.64, "RANKED", "Power")]
-    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "Power") for i in range(30)]
-    engine = _leaderboard_api_fixture(rows)
+    rows = [("CANBK.NS", 0.0295, "WEAK", "Financial Services"),
+            ("ADANIPOWER.NS", 0.0136, "WEAK", "Power")]
+    rows += [(f"Z{i}.NS", 0.0, "INSUFFICIENT", "Power") for i in range(30)]
+    engine = _forecast_api_fixture(rows)
 
-    page = _call_leaderboard(engine, limit=5)
+    page = _call_forecast_list(engine, limit=5)
 
-    assert len(page.entries) == 5, "the page must still be capped by limit"
+    assert len(page.forecasts) == 5, "the page must still be capped by limit"
     assert page.total == 32, (
         f"total must count the 32 matching rows, not the 5 returned; "
         f"got {page.total}")
 
 
-def test_leaderboard_filters_and_ranks_the_full_match_set_not_the_page():
+def test_forecast_list_filters_over_the_full_match_set_not_the_page():
     """
-    Filtering, counting and ranking must all happen over the matched set
-    before the page is sliced. Ranking within the page would restart the
-    numbering on every request, so the same stock would carry a different
-    rank depending on the caller's `limit`.
+    Filtering and counting must both happen over the matched set before the
+    page is sliced.
     """
-    rows = [("CANBK.NS", 23.86, "RANKED", "Financial Services"),
-            ("ADANIPOWER.NS", 13.64, "RANKED", "Power")]
-    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "Power") for i in range(30)]
-    engine = _leaderboard_api_fixture(rows)
+    rows = [("CANBK.NS", 0.0295, "WEAK", "Financial Services"),
+            ("ADANIPOWER.NS", 0.0136, "WEAK", "Power")]
+    rows += [(f"Z{i}.NS", 0.0, "INSUFFICIENT", "Power") for i in range(30)]
+    engine = _forecast_api_fixture(rows)
 
-    power = _call_leaderboard(engine, sector="Power", limit=5)
+    power = _call_forecast_list(engine, sector="Power", limit=5)
 
     assert power.total == 31, "the filter must be applied before the count"
     assert power.filters_applied == {"sector": "Power"}
-    assert [e.ticker for e in power.entries][0] == "ADANIPOWER.NS"
-    assert [e.rank for e in power.entries] == [1, 2, 2, 2, 2], (
-        "CANBK is filtered out, so ADANIPOWER leads the Power sector at rank 1 "
-        "and the tied zeros all take rank 2 — even where the page cuts the "
-        f"tie group in half; got {[e.rank for e in power.entries]}")
+    assert all(f.sector == "Power" for f in power.forecasts)
 
 
-# ── A composite of 0.0 must say which kind of zero it is ──────────────────────
-
-def test_score_basis_separates_no_evidence_from_a_bearish_forecast():
+def test_the_list_endpoint_publishes_no_ranking():
     """
-    85 of 95 leaderboard rows scored exactly 0.0 on 2026-08-15, for unrelated
-    reasons that the number alone could not distinguish. compute_composite_score
-    floors both of its components, so a stock the model actively predicted would
-    UNDERPERFORM — with evidence in hand and real conviction — landed on the
-    same 0.0 as a stock the weekly evaluation had never reached. Sorted by
-    score they formed one undifferentiated block, so the single number a reader
-    ranks on silently conflated "no view" with "negative view".
+    The ranking layer is gone and must not come back by accident.
+
+    Pinned at THREE levels, because each could be restored independently and
+    each alone republishes the claim: the response model must carry no rank,
+    score or basis field; the router must interpolate nothing from the request
+    into ORDER BY (that interpolation is precisely why the old endpoint needed
+    a SORTABLE allowlist as a SQL-injection boundary, and dropping the ordering
+    dropped the boundary with it); and the rows must arrive in a fixed order
+    that asserts nothing, rather than sorted by a measured quantity.
+
+    The substantive reason, not tidiness: the evidence gate clears three of
+    ninety-six tickers, which is what chance produces — 3.12 expected under
+    independence, Poisson p = 0.60. An ordering over ninety-three tied rows
+    invites a reader to compare names the measurement cannot separate.
     """
-    from agents.graph import classify_score_basis, compute_composite_score
+    from api.schemas.forecast import CurrentForecast
 
-    bearish = dict(pred_excess_return=-0.04, evidence_grade="WEAK",
-                   prob_outperform=0.31)
-    unevaluated = dict(pred_excess_return=0.06, evidence_grade="INSUFFICIENT",
-                       prob_outperform=0.62)
+    forbidden = {"rank", "composite_score", "score_basis", "upside_pct"}
+    present = forbidden & set(CurrentForecast.model_fields)
+    assert not present, f"the ranking layer is back on the response model: {present}"
 
-    # The defect: both score zero and are indistinguishable by score alone.
-    assert compute_composite_score(**bearish) == 0.0
-    assert compute_composite_score(**unevaluated) == 0.0
+    import api.routers.forecasts as fc
 
-    # The fix: the reason is recorded, so they are distinguishable.
-    assert classify_score_basis(**bearish) == "NOT_LONG"
-    assert classify_score_basis(**unevaluated) == "NO_EVIDENCE"
+    assert "sort_by" not in inspect.signature(fc.list_forecasts).parameters, (
+        "a caller-supplied sort key reaches ORDER BY as an identifier, which "
+        "cannot be a bind parameter — reintroducing it reintroduces the "
+        "injection boundary the SORTABLE allowlist existed to hold")
 
-    assert classify_score_basis(pred_excess_return=None,
-                                evidence_grade="WEAK",
-                                prob_outperform=None) == "NO_FORECAST"
+    source = inspect.getsource(fc.list_forecasts)
+    assert "RANK() OVER" not in source
 
-    ranked = dict(pred_excess_return=0.05, evidence_grade="STRONG",
-                  prob_outperform=0.70)
-    assert compute_composite_score(**ranked) > 0
-    assert classify_score_basis(**ranked) == "RANKED"
+    rows = [("CANBK.NS", 0.0295, "WEAK", "S"),
+            ("ADANIPOWER.NS", 0.0136, "WEAK", "S")]
+    rows += [(f"Z{i}.NS", 0.0, "INSUFFICIENT", "S") for i in range(6)]
+    response = _call_forecast_list(_forecast_api_fixture(rows))
 
-    # Flags can drive a genuine long signal to zero; that is a fourth reason.
-    assert classify_score_basis(**ranked, n_flags=20) == "FLAGGED_OUT"
-
-
-def test_score_basis_is_persisted_to_both_tables():
-    """A basis that never reaches the database explains nothing to a reader."""
-    import agents.graph as graph_mod
-
-    source = inspect.getsource(graph_mod.save_forecast_to_db)
-    assert '"score_basis": score_basis' in source
-
-    db_source = (REPO / "data" / "db.py").read_text(encoding="utf-8")
-    assert '"score_basis"' in db_source, "column must exist in the schema migration"
-
-    schema = (REPO / "api" / "schemas" / "leaderboard.py").read_text(encoding="utf-8")
-    assert "score_basis" in schema, "the API must expose it or nothing changed"
+    tickers = [f.ticker for f in response.forecasts]
+    assert response.total == 8
+    assert tickers == sorted(tickers), (
+        f"rows must arrive in a fixed order that asserts nothing about merit; "
+        f"got {tickers}")
 
 
 # ── Sentiment must not report a reading it never took ─────────────────────────
@@ -859,24 +979,26 @@ def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
 
 def test_the_llm_is_not_called_where_its_flags_cannot_change_anything():
     """
-    95 Groq calls a day, 91 of them arithmetically incapable of moving a figure.
+    95 Groq calls a day, 91 of them incapable of changing what gets published.
 
-    A flag reaches the leaderboard through exactly two paths and an INSUFFICIENT
-    grade closes both: the verdict downgrade only applies to APPROVED (which
-    needs STRONG, and the live board holds none), and the composite multiplies
-    by EVIDENCE_MULTIPLIER — 0.0 here — before deducting 5 points per flag.
+    The gate was justified by TWO closed paths: the verdict downgrade only
+    applies to APPROVED (which needs STRONG, and the live board holds none),
+    and the composite multiplied by EVIDENCE_MULTIPLIER — 0.0 for INSUFFICIENT
+    — before deducting per flag. The score path went with the ranking layer, so
+    only the verdict remains, and this test is narrowed to what still holds:
+    a flag cannot move a REJECTED verdict, so the call is still free.
 
-    So this is not a cost optimisation that trades accuracy for spend. It is
-    provably free, and the assertion below is the proof rather than a claim.
+    Kept rather than deleted because the SKIP must stay visible in the output.
+    A skipped step that says nothing reads as a step that ran and found nothing
+    wrong, which is the opposite of what happened.
     """
     from agents import critic_agent as ca
-    from agents.graph import compute_composite_score
+    from agents.state import EVIDENCE_MULTIPLIER
 
-    # The proof: for a grade that scores zero, flags are arithmetically inert.
-    for n_flags in (0, 1, 5, 100):
-        assert compute_composite_score(
-            pred_excess_return=0.05, evidence_grade="INSUFFICIENT",
-            prob_outperform=0.9, n_flags=n_flags) == 0.0
+    # The gate reads the same constant that defines "INSUFFICIENT carries no
+    # weight", so the two cannot drift into disagreeing.
+    assert EVIDENCE_MULTIPLIER["INSUFFICIENT"] == 0.0
+    assert EVIDENCE_MULTIPLIER["WEAK"] > 0.0
 
     calls: list[str] = []
 
@@ -1197,112 +1319,50 @@ def test_weekly_job_aborts_if_recomputing_signals_destroys_labels():
 
 # ── Conviction must not outvote the point forecast ────────────────────────────
 
-def test_conviction_requires_the_point_forecast_to_agree():
+# ── The list endpoint must serve rows, and never an ordering ────────────────
+
+def _forecast_api_fixture(rows):
     """
-    The composite claimed to rank long candidates only, and did not. PNB.NS
-    ranked THIRD on the live leaderboard on 2026-08-17 while forecasting a
-    1.69% underperformance: signal floored to 0.00 as designed, but conviction
-    independently collected 10.75 points from prob_outperform=0.567 and 0.38
-    survived the flag deduction.
-
-    The disagreement is real — prob_positive(-0.0169) is the share of
-    calibration residuals above +0.0169, so >0.5 means the model is biased low
-    — but a row whose point forecast and calibrated probability point opposite
-    ways is not a ranking signal, and the score must not quietly side with
-    whichever half scores higher.
-    """
-    from agents.graph import _score_parts, classify_score_basis, compute_composite_score
-
-    # PNB.NS, exactly as served.
-    signal, conviction = _score_parts(-0.0169213, 0.567196)
-    assert signal == 0.0
-    assert conviction == 0.0, "a predicted decline must earn no conviction points"
-    assert compute_composite_score(-0.0169213, "WEAK", 0.567196, 1) == 0.0
-    assert classify_score_basis(-0.0169213, "WEAK", 0.567196, 1) == "NOT_LONG"
-
-    # A genuine long candidate is untouched (CANBK.NS).
-    signal, conviction = _score_parts(0.0295344, 0.753968)
-    assert signal > 0 and conviction == 40.0
-    assert compute_composite_score(0.0295344, "WEAK", 0.753968, 1) == 23.86
-
-    # The narrative gate and the score must now agree on what "rankable" means:
-    # neither admits a non-positive predicted excess return.
-    from agents.forecasting_agent import _deserves_a_written_narrative
-
-    for pred in (-0.02, 0.0):
-        assert compute_composite_score(pred, "STRONG", 0.99) == 0.0
-        assert _deserves_a_written_narrative(
-            {"eval_evaluated_at": "2026-08-16", "pred_excess_return": pred}) is False
-
-
-# ── Rank must not invent an ordering the score cannot support ─────────────────
-
-def _leaderboard_api_fixture(rows):
-    """
-    An in-memory leaderboard table. `rows` is (ticker, score, basis, sector).
+    An in-memory forecast_current table. `rows` is
+    (ticker, pred_excess_return, evidence grade, sector).
     """
     from sqlalchemy import create_engine, text
 
     engine = create_engine("sqlite://")          # single shared connection
     with engine.connect() as conn:
         conn.execute(text(
-            "CREATE TABLE leaderboard (ticker TEXT, company TEXT, sector TEXT, "
-            "composite_score REAL, score_basis TEXT, upside_pct REAL, "
-            "critic_verdict TEXT, forecast_confidence TEXT, last_updated TEXT)"))
-        for ticker, score, basis, sector in rows:
+            "CREATE TABLE forecast_current (ticker TEXT, company TEXT, "
+            "sector TEXT, pred_excess_return REAL, forecast_confidence TEXT, "
+            "change_pct REAL, critic_verdict TEXT, last_updated TEXT)"))
+        for ticker, pred, grade, sector in rows:
             conn.execute(
-                text("INSERT INTO leaderboard VALUES (:t, :t, :sec, :s, :b, 1.0, "
-                     "'REJECTED', 'INSUFFICIENT', '2026-08-17')"),
-                {"t": ticker, "s": score, "b": basis, "sec": sector})
+                text("INSERT INTO forecast_current VALUES (:t, :t, :sec, :p, "
+                     ":g, 1.0, 'REJECTED', '2026-08-17')"),
+                {"t": ticker, "p": pred, "g": grade, "sec": sector})
         conn.commit()
     return engine
 
 
-def _call_leaderboard(engine, **kwargs):
+def _call_forecast_list(engine, **kwargs):
     """
-    Calls the endpoint against `engine`.
+    Calls the list endpoint against `engine`.
 
-    Every argument is passed explicitly because calling the endpoint outside a
-    request leaves FastAPI's Query() defaults unresolved. The column cache is
-    cleared on both sides so a fixture engine's schema never leaks into another
-    test through the lru_cache.
+    Every argument is passed explicitly because calling a router function
+    outside a request leaves FastAPI's Query() defaults unresolved, and a
+    Query object reaching a comparison raises `NotImplementedError: eq not
+    implemented`.
     """
-    import api.routers.leaderboard as lb
+    import api.routers.forecasts as fc
 
-    args = dict(sector=None, verdict=None, evidence=None,
-                sort_by="composite_score", limit=50)
+    args = dict(sector=None, verdict=None, evidence=None, limit=50)
     args.update(kwargs)
 
-    original = lb.get_engine
-    lb.get_engine = lambda: engine
-    lb._leaderboard_columns.cache_clear()
+    original = fc.get_engine
+    fc.get_engine = lambda: engine
     try:
-        return lb.get_leaderboard(**args)
+        return fc.list_forecasts(**args)
     finally:
-        lb.get_engine = original
-        lb._leaderboard_columns.cache_clear()
-
-
-def test_tied_rows_share_a_rank():
-    """
-    93 of 95 rows share composite_score 0.0 under the 2-of-3 gate, and
-    positional numbering handed them ranks 3 through 95 from whatever order
-    pandas left them in — publishing "rank 47" as a fact about a stock the
-    score cannot separate from 92 others.
-    """
-    rows = [("CANBK.NS", 23.86, "RANKED", "S"),
-            ("ADANIPOWER.NS", 13.64, "RANKED", "S")]
-    rows += [(f"Z{i}.NS", 0.0, "NO_EVIDENCE", "S") for i in range(6)]
-
-    response = _call_leaderboard(_leaderboard_api_fixture(rows))
-
-    ranks = [e.rank for e in response.entries]
-    assert response.total == 8
-    assert ranks[:2] == [1, 2], "the two scoring rows rank normally"
-    assert ranks[2:] == [3] * 6, (
-        f"tied rows must share a rank, got {ranks[2:]}"
-    )
-    assert max(ranks) == 3, "no row may be numbered past the last real ordering"
+        fc.get_engine = original
 
 
 # ── /api/stocks latency: the universe screen must not be N+1 ──────────────────
@@ -1357,7 +1417,7 @@ def _universe_fixture(liquid_fillers: int = 0):
 
 
 def _screen(engine, rule):
-    """Runs get_universe against `engine`, counting SELECTs against ohlcv."""
+    """Runs screen_universe against `engine`, counting SELECTs against ohlcv."""
     from sqlalchemy import event
     import data.universe as uni
 
@@ -1371,7 +1431,7 @@ def _screen(engine, rule):
     original = uni.get_engine
     uni.get_engine = lambda: engine
     try:
-        result = uni.get_universe(as_of=AS_OF, rule=rule)
+        result = uni.screen_universe(as_of=AS_OF, rule=rule)
     finally:
         uni.get_engine = original
         event.remove(engine, "before_cursor_execute", record)
@@ -1783,7 +1843,7 @@ def _stub_daily(monkeypatch, **overrides):
         (pipeline.sentiment, "fetch_and_score"): lambda **k: None,
         (pipeline.macro, "fetch_and_store"): lambda: None,
         (agents.graph, "run_graph"): lambda t: {"forecast_available": True},
-        (agents.graph, "prune_leaderboard"): lambda u: 0,
+        (agents.graph, "prune_forecast_current"): lambda u: 0,
     }
     for (module, name), value in defaults.items():
         monkeypatch.setattr(module, name, overrides.pop(name, value))
@@ -2510,10 +2570,10 @@ def test_the_ic_t_stat_behind_a_published_grade_travels_with_the_row(tmp_path):
     One third of the evidence gate was not recorded on the row it graded.
 
     `grade_evidence` weighs three held-out checks — rank IC, |IC t-stat| and the
-    hit-rate edge. Two were written onto `forecasts` and `leaderboard`; the
+    hit-rate edge. Two were written onto `forecasts` and `forecast_current`; the
     t-statistic went only to `model_metadata`, so the exact WEAK vs INSUFFICIENT
-    decision behind a published composite could not be recomputed from what the
-    board carries. Same rule as `evaluated_at`: the evidence travels with the
+    decision behind a published grade could not be recomputed from what the row
+    itself carries. Same rule as `evaluated_at`: the evidence travels with the
     claim it backs.
 
     Asserting the value ARRIVES, through a real engine and a real round trip.
@@ -2557,7 +2617,7 @@ def test_the_ic_t_stat_behind_a_published_grade_travels_with_the_row(tmp_path):
         })
 
         with engine.connect() as conn:
-            for table in ("forecasts", "leaderboard"):
+            for table in ("forecasts", "forecast_current"):
                 got = conn.execute(
                     sa.text(f"SELECT eval_rank_ic_t FROM {table} WHERE ticker = 'TEST.NS'")
                 ).scalar()

@@ -329,7 +329,50 @@ def get_universe(
     apply_liquidity: bool = True,
 ) -> list[str]:
     """
-    Returns the tradable universe as of a date.
+    The forecasting universe. FROZEN — this no longer queries anything.
+
+    Every caller in the codebase reaches the universe through this function,
+    so freezing it here freezes it everywhere at once: the daily job, the
+    weekly evaluation, the panel harness, the validation gate and the API all
+    see the identical 84 names, on every call, in every process.
+
+    That identity is the point. The screen this used to run reads the ohlcv
+    table, so a partial yfinance response or a half-written fetch produced a
+    SHORTER universe rather than an error — and a run measured over 46 names
+    is not comparable with one measured over 95, which is precisely the
+    confound `data_hash` exists to expose after the fact. Now the row set is
+    fixed by a checked-in file and a short download is a data defect the
+    validation gate reports, not a silently different experiment.
+
+    The rule itself is not gone. `screen_universe()` below still executes it,
+    and `tools/audit_universe.py` runs that and reports every name whose
+    measurement has drifted away from what data/frozen_universe.py records.
+    The arguments are retained so the ~25 existing call sites keep working;
+    they are ignored, because a frozen universe that varied with `as_of` would
+    not be frozen.
+
+    See data/frozen_universe.py for the membership and the measurements
+    behind it.
+    """
+    from data.frozen_universe import frozen_universe
+
+    return frozen_universe()
+
+
+def screen_universe(
+    as_of: str | None = None,
+    rule: UniverseRule = DEFAULT_RULE,
+    apply_liquidity: bool = True,
+) -> list[str]:
+    """
+    Executes the universe RULE against the database. Audit path only.
+
+    This is what get_universe() used to be, and nothing in the pipeline calls
+    it any more — the universe is frozen, and a rule that ran at forecast time
+    would unfreeze it. It survives because a rule you cannot execute is a rule
+    you cannot check: tools/audit_universe.py runs this and reports the
+    difference against the frozen list, exactly as tools/audit_benchmarks.py
+    --apply-check does for the benchmark mapping.
 
     Applies index membership, then the liquidity floor and listing-history
     minimum, both computed only from data dated on or before ``as_of``. No step
@@ -446,13 +489,27 @@ def get_universe(
 def get_ingest_universe(as_of: str | None = None,
                         rule: UniverseRule = DEFAULT_RULE) -> list[str]:
     """
-    Tickers to FETCH data for: raw index membership, before any screen that
-    depends on that data existing.
+    Tickers to FETCH data for: the frozen universe, UNION current index
+    membership.
 
-    Use this for ingestion, and ``get_universe()`` for modelling.
+    Both halves are load-bearing.
+
+    The frozen universe must be in here unconditionally, or the freeze rots.
+    A name that leaves the NIFTY 100 would otherwise stop being fetched while
+    still being forecast — its ohlcv would end on the day it was dropped, the
+    forecast would be built on a stale last price, and nothing would say so.
+    Freezing the universe means committing to feed it.
+
+    Current membership stays because the index sync is what makes drift
+    VISIBLE. tools/audit_universe.py compares the frozen list against the live
+    rule, and it can only do that if the newcomers have data to be screened
+    on. Fetching them costs one yfinance call each and buys the ability to
+    answer "what would the rule choose today".
     """
     as_of = as_of or date.today().isoformat()
-    return get_index_members(as_of, rule.index_name)
+    from data.frozen_universe import FROZEN_UNIVERSE
+
+    return sorted(set(FROZEN_UNIVERSE) | set(get_index_members(as_of, rule.index_name)))
 
 
 def describe_universe_bias(index_name: str = INDEX_NAME) -> dict:

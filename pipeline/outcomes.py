@@ -238,9 +238,11 @@ def realised_accuracy(engine=None, ticker: str | None = None) -> dict:
     `eval_*` columns, which are backtest figures.
 
     Returns Nones rather than zeros when nothing has resolved yet. A hit rate of
-    0.0 and "no forecast has matured" are very different statements, and the
-    leaderboard already carries one column (`composite_score`) where a single
-    value covers several meanings — see agents.graph.classify_score_basis.
+    0.0 and "no forecast has matured" are very different statements. The board
+    used to carry one column, `composite_score`, where a single value covered
+    "never evaluated", "predicted to underperform" and "flagged out" — that
+    column is gone with the rest of the ranking layer, but the lesson it taught
+    is why every field here is nullable.
     """
     engine = engine or get_engine()
     where, params = "", {}

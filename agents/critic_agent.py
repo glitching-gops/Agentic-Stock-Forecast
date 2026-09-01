@@ -53,7 +53,7 @@ MIN_HIT_RATE_EDGE_PP = 1.0     # percentage points above the majority baseline
 # How many of those checks a forecast must pass to earn each grade.
 #
 # WEAK used to require ONE of three, which meant the rank-IC floor alone was
-# enough — and at +0.02 that floor is very low. The result was a leaderboard
+# enough — and at +0.02 that floor is very low. The result was a board
 # whose visible top was carried by single, statistically insignificant
 # correlations: on 2026-08-15, BEL.NS ranked 3rd on a rank IC of +0.049 while
 # its hit rate sat 4.7pp BELOW the majority-class baseline, its IC t-statistic
@@ -248,23 +248,27 @@ def critic_node(state: AgentState) -> dict:
 
     grade, reasons = grade_evidence(dict(state))
 
-    # THE LLM ONLY RUNS WHERE ITS OUTPUT CAN CHANGE A NUMBER.
+    # THE LLM ONLY RUNS WHERE ITS OUTPUT CAN CHANGE THE VERDICT.
     #
-    # Flags reach the published leaderboard through exactly two paths, and both
-    # are closed for an INSUFFICIENT grade:
+    # This gate was built when flags reached the published board through two
+    # paths, and it was justified by BOTH being closed for an INSUFFICIENT
+    # grade: the verdict (flags only downgrade APPROVED, which requires
+    # STRONG) and the score (compute_composite_score multiplied by
+    # EVIDENCE_MULTIPLIER before deducting per flag, and the multiplier is 0.0
+    # for INSUFFICIENT, so zero times anything less a deduction is zero).
     #
-    #   verdict   flags can only downgrade APPROVED, and APPROVED requires
-    #             STRONG. On 2026-08-25 the live board held 0 APPROVED and
-    #             4 FLAGGED against 91 REJECTED, so this branch was dead.
-    #   score     compute_composite_score multiplies by EVIDENCE_MULTIPLIER
-    #             before deducting 5 points per flag, and the multiplier is
-    #             0.0 for INSUFFICIENT. Zero times anything, less a deduction,
-    #             floored at zero, is zero however many flags are raised.
+    # THE SCORE PATH IS GONE with the ranking layer, so the argument now rests
+    # on the verdict alone. That is still sound — a flag cannot move a REJECTED
+    # row — and it still saves ~91 of 95 Groq calls a day. But it is one leg
+    # rather than two, and it is narrower than it looks: what a flag can no
+    # longer change is a NUMBER, and the P4 forecast object is supposed to
+    # explain in words why a stock does or does not work. A raised flag is
+    # exactly that kind of content. When the written analysis lands, revisit
+    # whether "cannot change the verdict" is still the right test, or whether
+    # the cost is now buying something a reader wants to see.
     #
-    # So this was 95 Groq calls a day of which 91 were arithmetically incapable
-    # of moving a published figure. Skipping them changes no score — that is
-    # provable from the line above, not an empirical claim — and the gate reads
-    # the SAME multiplier the score uses, so the two cannot drift apart.
+    # EVIDENCE_MULTIPLIER is retained as the single definition of "INSUFFICIENT
+    # means nothing survives". It no longer multiplies anything.
     if EVIDENCE_MULTIPLIER.get(grade, 0.0) > 0.0:
         flags, llm_reasoning = _llm_review(dict(state), ticker)
     else:

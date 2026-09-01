@@ -126,11 +126,25 @@ def _deserves_a_written_narrative(updates: dict) -> bool:
 
     Choosing deliberately instead: a narrative is only ever read next to a
     ranked row, and a row can only rank if it has a persisted evaluation behind
-    it AND a positive predicted excess return (compute_composite_score floors
-    both of its components at zero, so a predicted underperformer scores 0.0
-    and sinks regardless of what the narrative says). Both facts are already in
+    it AND a positive predicted excess return (compute_composite_score floored
+    both of its components at zero, so a predicted underperformer scored 0.0
+    and sank regardless of what the narrative said). Both facts are already in
     ``updates`` by the time this is called. That takes NARRATIVE calls from one
     per ticker (~95) to roughly 15.
+
+    THIS RATIONALE IS NOW STALE AND THE GATE IS DELIBERATELY LEFT ALONE. There
+    are no ranked rows: every stock in the frozen universe gets a forecast, and
+    each is read on its own rather than against the others. So "only ever read
+    next to a ranked row" is false, and the narrower half of the condition —
+    `pred > 0` — now withholds the written analysis from precisely the stocks a
+    reader most needs it for, the ones forecast to fall.
+
+    It is not changed here because changing it is not free and not this phase's
+    call. It multiplies narrative calls by ~6, the configured model is
+    decommissioned and 404s on every request, and the replacement has not been
+    chosen. The P4 forecast object is meant to explain every stock, including
+    why one does NOT work; that is where this gate gets rewritten, alongside
+    the model decision it depends on.
 
     Note this gates one of the two LLM calls per ticker. critic_agent's
     _llm_review still runs unconditionally, so the daily total is ~95 + ~15

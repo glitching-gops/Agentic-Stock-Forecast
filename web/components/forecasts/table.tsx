@@ -3,105 +3,102 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 
-import { Badge, Eyebrow, Meter, evidenceTone, verdictTone } from "@/components/ui";
+import { Badge, Eyebrow, evidenceTone, verdictTone } from "@/components/ui";
 import {
   cx,
   decimal,
+  evidenceState,
+  evidenceStateExplainer,
+  evidenceStateLabel,
   probability,
-  scoreBasisExplainer,
-  scoreBasisLabel,
   signed,
   signedPct,
 } from "@/lib/format";
-import type { LeaderboardEntry } from "@/lib/types";
+import type { CurrentForecast, EvidenceState } from "@/lib/types";
 
 /**
- * The leaderboard, filtered and sorted entirely in the browser.
+ * Every forecast in the frozen universe, filtered in the browser.
  *
- * The whole table is 95 rows and arrives with the page, so a filter change
+ * The whole table is 84 rows and arrives with the page, so a filter change
  * costs no network at all — no round trip to a free-tier instance that may be
  * asleep. The API's own filter parameters still exist and still work; they are
  * just not the right tool at this size.
  *
- * The one thing NOT recomputed here is `rank`. It is issued by the API as a
- * SQL window function over the full filtered set, with ties sharing a rank.
- * Re-deriving that client-side would mean maintaining the same tie semantics
- * in two languages, so instead the rank column is shown only while the
- * ordering it refers to is in effect, and hidden the moment the reader sorts
- * by something else.
+ * THIS IS NOT A LEADERBOARD, and the difference is structural rather than
+ * cosmetic. The table it replaced put a "Rated" section on top, ordered by a
+ * composite score, and collapsed the rest under a disclosure. Two names sat in
+ * the lit section and ninety-three in the drawer, which reads as a podium with
+ * a long tail — but the evidence gate clears three of ninety-six tickers, and
+ * 3.12 is what chance produces (Poisson p = 0.60). There was no podium.
+ *
+ * So the ordering is alphabetical and fixed, the same order the API returns,
+ * and grouping is by WHAT IS KNOWN about each forecast rather than by how it
+ * placed. Sorting by a measured column stays available because a reader
+ * exploring the data should be able to ask "which names have the largest
+ * predicted move" — but it is a question the reader poses, not a verdict the
+ * page hands them on arrival.
  */
 
 const SORTS = {
-  composite_score: "Score",
+  ticker: "Ticker",
   pred_excess_return: "Excess return",
   prob_outperform: "P(outperform)",
   eval_rank_ic: "Rank IC",
+  eval_rank_ic_t: "IC t-stat",
   eval_hit_rate: "Hit rate",
 } as const;
 
 type SortKey = keyof typeof SORTS;
 
-/** Order in which the unranked groups are disclosed — most informative first. */
-const BASIS_ORDER = [
-  "NOT_LONG",
-  "FLAGGED_OUT",
-  "NO_EVIDENCE",
+/** Most informative first: what we know, then what we do not. */
+const STATE_ORDER: EvidenceState[] = [
+  "STRONG",
+  "WEAK",
+  "INSUFFICIENT",
   "NO_FORECAST",
-] as const;
+];
 
-export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
+export function ForecastTable({ forecasts }: { forecasts: CurrentForecast[] }) {
   const [sector, setSector] = useState("");
   const [evidence, setEvidence] = useState("");
   const [verdict, setVerdict] = useState("");
   const [query, setQuery] = useState("");
-  const [sortKey, setSortKey] = useState<SortKey>("composite_score");
+  const [sortKey, setSortKey] = useState<SortKey>("ticker");
 
   const sectors = useMemo(
     () =>
       Array.from(
-        new Set(entries.map((e) => e.sector).filter((s): s is string => !!s)),
+        new Set(forecasts.map((f) => f.sector).filter((s): s is string => !!s)),
       ).sort(),
-    [entries],
+    [forecasts],
   );
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return entries.filter((entry) => {
-      if (sector && entry.sector !== sector) return false;
-      if (evidence && entry.forecast_confidence !== evidence) return false;
-      if (verdict && entry.critic_verdict !== verdict) return false;
+    return forecasts.filter((forecast) => {
+      if (sector && forecast.sector !== sector) return false;
+      if (evidence && evidenceState(forecast) !== evidence) return false;
+      if (verdict && forecast.critic_verdict !== verdict) return false;
       if (
         q &&
-        !`${entry.company ?? ""} ${entry.ticker}`.toLowerCase().includes(q)
+        !`${forecast.company ?? ""} ${forecast.ticker}`.toLowerCase().includes(q)
       ) {
         return false;
       }
       return true;
     });
-  }, [entries, sector, evidence, verdict, query]);
+  }, [forecasts, sector, evidence, verdict, query]);
 
   const sorted = useMemo(
-    () => [...filtered].sort(byDescendingWithNullsLast(sortKey)),
+    () => [...filtered].sort(comparator(sortKey)),
     [filtered, sortKey],
   );
 
-  const ranked = sorted.filter((e) => e.score_basis === "RANKED");
-  const unranked = sorted.filter((e) => e.score_basis !== "RANKED");
+  const groups = STATE_ORDER.map((state) => ({
+    state,
+    rows: sorted.filter((f) => evidenceState(f) === state),
+  })).filter((group) => group.rows.length > 0);
 
-  const groups = BASIS_ORDER.map((basis) => ({
-    basis: basis as string,
-    rows: unranked.filter((e) => e.score_basis === basis),
-  }))
-    .concat({
-      basis: "__other__",
-      rows: unranked.filter(
-        (e) =>
-          !BASIS_ORDER.includes(e.score_basis as (typeof BASIS_ORDER)[number]),
-      ),
-    })
-    .filter((group) => group.rows.length > 0);
-
-  const showRank = sortKey === "composite_score";
   const anyFilter = Boolean(sector || evidence || verdict || query);
 
   return (
@@ -119,74 +116,54 @@ export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
         sortKey={sortKey}
         setSortKey={setSortKey}
         matched={filtered.length}
-        total={entries.length}
+        total={forecasts.length}
         onReset={() => {
           setSector("");
           setEvidence("");
           setVerdict("");
           setQuery("");
-          setSortKey("composite_score");
+          setSortKey("ticker");
         }}
       />
 
-      {/* ── Rated ────────────────────────────────────────────────────────── */}
-      <section aria-labelledby="ranked-heading">
-        <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 border-b border-rule-hi pb-1.5">
-          <h2
-            id="ranked-heading"
-            className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-bright"
-          >
-            Rated
-            <span className="ml-2 font-normal text-dim">{ranked.length}</span>
-          </h2>
-          {!showRank && ranked.length > 0 ? (
-            <p className="text-[0.68rem] text-dim">
-              Rank is assigned on score — hidden while sorted by{" "}
-              {SORTS[sortKey].toLowerCase()}.
-            </p>
-          ) : null}
+      {groups.length === 0 ? (
+        <div className="border border-rule bg-shell px-4 py-6 text-center text-[0.78rem] text-dim">
+          {anyFilter
+            ? "No stock matches these filters."
+            : "No forecasts have been published yet."}
         </div>
-
-        {ranked.length === 0 ? (
-          <div className="border border-rule bg-shell px-4 py-6 text-center text-[0.78rem] text-dim">
-            {anyFilter
-              ? "No rated name matches these filters."
-              : "No name currently clears the evidence gate with a positive forecast."}
-          </div>
-        ) : (
-          <EntryTable rows={ranked} showRank={showRank} />
-        )}
-      </section>
-
-      {/* ── Not rated ────────────────────────────────────────────────────── */}
-      {groups.length > 0 ? (
-        <section aria-labelledby="unranked-heading" className="space-y-1.5">
+      ) : (
+        <section aria-labelledby="forecasts-heading" className="space-y-1.5">
           <div className="mb-2 border-b border-rule-hi pb-1.5">
             <h2
-              id="unranked-heading"
+              id="forecasts-heading"
               className="text-[0.72rem] font-semibold uppercase tracking-[0.18em] text-bright"
             >
-              Not rated
+              Forecasts
               <span className="ml-2 font-normal text-dim">
-                {unranked.length}
+                {filtered.length}
               </span>
             </h2>
             <p className="mt-2 max-w-4xl font-prose text-[0.8rem] leading-relaxed text-mid">
-              Every name below scores exactly 0.0, and that one value covers
-              several unrelated situations. They are grouped by the reason
-              rather than numbered off in an order the score cannot support.
+              Grouped by what the held-out evaluation supports, not by how the
+              stocks compare. Every stock in the universe gets a forecast; the
+              group says how much weight it has earned.
             </p>
           </div>
 
           {groups.map((group) => (
-            <BasisGroup
-              key={group.basis}
-              basis={group.basis}
+            <EvidenceGroup
+              key={group.state}
+              state={group.state}
               rows={group.rows}
+              // The groups that matter open on arrival; the large INSUFFICIENT
+              // block does not, because a 70-row table above the fold buries
+              // the distinction the grouping exists to draw.
+              open={group.state === "STRONG" || group.state === "WEAK"}
             />
           ))}
         </section>
-      ) : null}
+      )}
     </div>
   );
 }
@@ -194,11 +171,19 @@ export function LeaderboardBoard({ entries }: { entries: LeaderboardEntry[] }) {
 /* ── Sorting ───────────────────────────────────────────────────────────── */
 
 /**
- * Descending, nulls last — matching the API's `ORDER BY <key> DESC NULLS LAST`
- * so a client-side sort never reorders rows differently from the server.
+ * Ticker ascending, or a measured column descending with nulls last.
+ *
+ * Nulls last rather than as zero. Roughly a fifth of these cells are genuinely
+ * unmeasured, and sorting them as 0.0 would interleave "no evidence was
+ * gathered" with "the evidence came out neutral" — two statements a reader
+ * must be able to tell apart.
  */
-function byDescendingWithNullsLast(key: SortKey) {
-  return (a: LeaderboardEntry, b: LeaderboardEntry) => {
+function comparator(key: SortKey) {
+  if (key === "ticker") {
+    return (a: CurrentForecast, b: CurrentForecast) =>
+      a.ticker.localeCompare(b.ticker);
+  }
+  return (a: CurrentForecast, b: CurrentForecast) => {
     const left = a[key];
     const right = b[key];
     const leftNull = left === null || left === undefined;
@@ -260,6 +245,7 @@ function Filters(props: {
           <option value="STRONG">strong</option>
           <option value="WEAK">weak</option>
           <option value="INSUFFICIENT">none</option>
+          <option value="NO_FORECAST">no forecast</option>
         </Select>
       </Field>
 
@@ -340,21 +326,17 @@ function Select({
 
 /* ── Grouped disclosure ────────────────────────────────────────────────── */
 
-function BasisGroup({
-  basis,
+function EvidenceGroup({
+  state,
   rows,
+  open,
 }: {
-  basis: string;
-  rows: LeaderboardEntry[];
+  state: EvidenceState;
+  rows: CurrentForecast[];
+  open: boolean;
 }) {
-  const label = basis === "__other__" ? "Other" : scoreBasisLabel(basis);
-  const explainer =
-    basis === "__other__"
-      ? "These rows carry a score basis this interface does not recognise."
-      : scoreBasisExplainer(basis);
-
   return (
-    <details className="group border border-rule bg-shell">
+    <details className="group border border-rule bg-shell" open={open}>
       <summary className="flex cursor-pointer list-none items-start gap-2.5 px-3 py-2 hover:bg-raise [&::-webkit-details-marker]:hidden">
         <span
           aria-hidden
@@ -365,17 +347,17 @@ function BasisGroup({
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-baseline gap-2">
             <span className="text-[0.76rem] font-semibold uppercase tracking-[0.12em] text-bright">
-              {label}
+              {evidenceStateLabel(state)}
             </span>
             <span className="text-[0.7rem] text-dim">{rows.length}</span>
           </span>
           <span className="mt-1 block max-w-4xl font-prose text-[0.78rem] leading-relaxed text-dim">
-            {explainer}
+            {evidenceStateExplainer(state)}
           </span>
         </span>
       </summary>
       <div className="border-t border-rule">
-        <EntryTable rows={rows} showRank={false} flush />
+        <ForecastRows rows={rows} />
       </div>
     </details>
   );
@@ -383,21 +365,12 @@ function BasisGroup({
 
 /* ── Table ─────────────────────────────────────────────────────────────── */
 
-function EntryTable({
-  rows,
-  showRank,
-  flush = false,
-}: {
-  rows: LeaderboardEntry[];
-  showRank: boolean;
-  flush?: boolean;
-}) {
+function ForecastRows({ rows }: { rows: CurrentForecast[] }) {
   return (
-    <div className={cx("overflow-x-auto", !flush && "border border-rule")}>
+    <div className="overflow-x-auto">
       <table className="w-full min-w-[1120px] border-collapse text-[0.76rem]">
         <thead>
           <tr className="border-b border-rule-hi bg-inset text-left">
-            {showRank ? <Th className="w-9 text-right">#</Th> : null}
             <Th className="w-24">Ticker</Th>
             <Th className="min-w-[150px]">Name</Th>
             <Th className="w-36">Sector</Th>
@@ -430,22 +403,22 @@ function EntryTable({
             </Th>
             <Th
               align="right"
+              help="t-statistic of that IC, and the only one of the three checks that tests significance. Read it with the sign: the gate tests |t|, so a large negative value marks a stock the model gets reliably WRONG."
+            >
+              IC t
+            </Th>
+            <Th
+              align="right"
               help="Out-of-sample directional accuracy minus the majority-class baseline on the same window. This is the number that matters, not the raw hit rate."
             >
               Hit−base
             </Th>
             <Th className="w-40">Evidence</Th>
-            <Th
-              className="w-32"
-              help="Ranking heuristic in [0,100]: predicted excess return and conviction, multiplied by an evidence grade. Not an expected return."
-            >
-              Score
-            </Th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((entry) => (
-            <Row key={entry.ticker} entry={entry} showRank={showRank} />
+          {rows.map((forecast) => (
+            <Row key={forecast.ticker} forecast={forecast} />
           ))}
         </tbody>
       </table>
@@ -480,31 +453,24 @@ function Th({
   );
 }
 
-function Row({
-  entry,
-  showRank,
-}: {
-  entry: LeaderboardEntry;
-  showRank: boolean;
-}) {
-  const excess = entry.pred_excess_return;
-  const hit = entry.eval_hit_rate;
-  const base = entry.eval_baseline_hit_rate;
+function Row({ forecast }: { forecast: CurrentForecast }) {
+  const excess = forecast.pred_excess_return;
+  const hit = forecast.eval_hit_rate;
+  const base = forecast.eval_baseline_hit_rate;
+  const ict = forecast.eval_rank_ic_t;
 
   /*
    * The model contradicting itself is worth showing, not smoothing over.
    * `prob_positive(pred)` is the share of calibration residuals above `-pred`,
    * so a probability above 0.5 on a negative point forecast means the model is
-   * biased low for that ticker. This is exactly the disagreement that put PNB
-   * at rank 3 with a predicted 1.69% underperformance before the conviction
-   * gate closed it — the gate stops it from ranking, and this marks it so the
-   * reader sees the disagreement rather than just its consequence.
+   * biased low for that ticker. The composite used to hide this by flooring;
+   * with no composite the disagreement is simply displayed.
    */
   const contradicts =
     excess !== null &&
     excess < 0 &&
-    entry.prob_outperform !== null &&
-    entry.prob_outperform > 0.5;
+    forecast.prob_outperform !== null &&
+    forecast.prob_outperform > 0.5;
 
   /*
    * A hit rate that equals its baseline to four decimals is not a near miss —
@@ -514,38 +480,43 @@ function Row({
   const degenerate =
     hit !== null && base !== null && Math.abs(hit - base) < 1e-6;
 
+  /*
+   * The gate takes |t|, so a t of −2.3 PASSES a check while meaning the model
+   * is reliably wrong about this stock. All four tickers that clear it sit
+   * there. Marking it is the only way a reader sees the difference between a
+   * check passed and a check passed backwards.
+   */
+  const antiSignal = ict !== null && ict <= -2.0;
+
   return (
     <tr className="border-b border-rule/70 last:border-b-0 hover:bg-raise">
-      {showRank ? (
-        <td className="px-2.5 py-1 text-right text-dim">{entry.rank ?? "—"}</td>
-      ) : null}
-
       <td className="px-2.5 py-1">
         <Link
-          href={`/stocks/${entry.ticker}`}
+          href={`/stocks/${forecast.ticker}`}
           className="font-semibold text-bright underline-offset-2 hover:underline"
         >
-          {entry.ticker.replace(/\.NS$/, "")}
+          {forecast.ticker.replace(/\.NS$/, "")}
         </Link>
       </td>
 
       <td className="max-w-[220px] truncate px-2.5 py-1 text-text">
-        {entry.company ?? "—"}
+        {forecast.company ?? "—"}
       </td>
 
       <td className="max-w-[9rem] truncate px-2.5 py-1 text-dim">
-        {entry.sector ?? "—"}
+        {forecast.sector ?? "—"}
       </td>
 
       <td className="px-2.5 py-1 text-right text-text">
-        {decimal(entry.current_price)}
+        {decimal(forecast.current_price)}
       </td>
 
       <td className="px-2.5 py-1 text-right text-mid">
-        {decimal(entry.forecast_price)}
-        {entry.interval_low !== null && entry.interval_high !== null ? (
+        {decimal(forecast.forecast_price)}
+        {forecast.interval_low !== null && forecast.interval_high !== null ? (
           <span className="ml-1.5 text-[0.66rem] text-dim">
-            [{decimal(entry.interval_low, 0)}–{decimal(entry.interval_high, 0)}]
+            [{decimal(forecast.interval_low, 0)}–
+            {decimal(forecast.interval_high, 0)}]
           </span>
         ) : null}
       </td>
@@ -563,25 +534,43 @@ function Row({
         {contradicts ? (
           <span
             className="mr-1 text-bar"
-            title="The calibrated probability says up while the point forecast says down. The model is biased low for this ticker; the composite refuses to rank on the cheerier half."
+            title="The calibrated probability says up while the point forecast says down. The model is biased low for this ticker, and the two halves disagree."
           >
             !
           </span>
         ) : null}
-        {probability(entry.prob_outperform)}
+        {probability(forecast.prob_outperform)}
       </td>
 
       <td
         className={cx(
           "px-2.5 py-1 text-right",
-          entry.eval_rank_ic === null
+          forecast.eval_rank_ic === null
             ? "text-dim"
-            : entry.eval_rank_ic >= 0
+            : forecast.eval_rank_ic >= 0
               ? "text-text"
               : "text-neg/85",
         )}
       >
-        {signed(entry.eval_rank_ic)}
+        {signed(forecast.eval_rank_ic)}
+      </td>
+
+      <td className="px-2.5 py-1 text-right">
+        {antiSignal ? (
+          <span
+            className="mr-1 text-bar"
+            title="Passes the significance check by magnitude while the sign says the model is reliably WRONG about this stock. The gate tests |t| and does not distinguish the two."
+          >
+            !
+          </span>
+        ) : null}
+        <span
+          className={cx(
+            ict === null ? "text-dim" : antiSignal ? "text-neg" : "text-text",
+          )}
+        >
+          {signed(ict, 2)}
+        </span>
       </td>
 
       <td className="px-2.5 py-1 text-right">
@@ -607,19 +596,15 @@ function Row({
 
       <td className="px-2.5 py-1">
         <span className="flex flex-wrap items-center gap-1">
-          <Badge tone={evidenceTone(entry.forecast_confidence)}>
-            {entry.forecast_confidence === "INSUFFICIENT"
+          <Badge tone={evidenceTone(forecast.forecast_confidence)}>
+            {forecast.forecast_confidence === "INSUFFICIENT"
               ? "none"
-              : (entry.forecast_confidence ?? "—")}
+              : (forecast.forecast_confidence ?? "—")}
           </Badge>
-          <Badge tone={verdictTone(entry.critic_verdict)}>
-            {entry.critic_verdict ?? "—"}
+          <Badge tone={verdictTone(forecast.critic_verdict)}>
+            {forecast.critic_verdict ?? "—"}
           </Badge>
         </span>
-      </td>
-
-      <td className="px-2.5 py-1">
-        <Meter value={entry.composite_score} />
       </td>
     </tr>
   );

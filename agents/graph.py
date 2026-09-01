@@ -1,21 +1,29 @@
 """
 agents/graph.py — LangGraph orchestration and forecast persistence.
 
-The composite score is rebuilt. Previously it summed 30 pts directional
-accuracy + 30 pts critic verdict + 15 pts confidence + 25 pts upside. The first
-three were all functions of the leaked in-sample metrics, and the verdict was a
-near-constant APPROVED, so roughly 75 of 100 points did not vary across stocks
-and the ranking reduced to sorting by predicted upside (audit finding F9).
+THERE IS NO RANKING ANY MORE. The product is one forecast per stock over a
+fixed universe, not an ordering of stocks against each other, and the scoring
+layer that produced that ordering is gone: `composite_score`, `score_basis`,
+`_score_parts` and the SQL window rank behind `/api/leaderboard`.
 
-The replacement separates two things that were tangled together:
+Worth recording WHY, because the score was itself a Phase 0 repair and was not
+obviously wrong. It was rebuilt once already — the original summed 30 pts
+directional accuracy + 30 pts critic verdict + 15 pts confidence + 25 pts
+upside, of which the first three were functions of leaked in-sample metrics
+that barely varied across stocks, so the ranking reduced to sorting by
+predicted upside (audit finding F9). The replacement separated signal from
+evidence and gated one by the other, which was the right correction.
 
-    signal    — how strong is the predicted excess return?
-    evidence  — has this model shown skill on data it did not see?
+What it could not fix is that ranking 95 names needs 95 comparable numbers,
+and the evidence gate produces 3 — a yield indistinguishable from chance
+(pass rates 0.385/0.042/0.042 give 3.12 expected under independence; three
+observed, Poisson p = 0.60). A ranking over 3 real numbers and 92 zeros is a
+table that invites a reader to compare rows the measurement cannot separate.
+The honest object is a forecast per stock, each carrying its own evidence.
 
-Ranking is driven by signal, gated by evidence. A stock whose model failed its
-held-out checks cannot outrank one that passed simply by predicting a bigger
-move. The score is a ranking heuristic and is documented as such; it is not an
-expected return.
+`forecast_confidence` (STRONG / WEAK / INSUFFICIENT) survives and still says
+what the held-out evidence supports. It grades a single forecast; it does not
+order one against another.
 """
 
 from __future__ import annotations
@@ -32,136 +40,28 @@ from agents.forecasting_agent import forecasting_node
 from agents.state import EVIDENCE_MULTIPLIER, AgentState
 from agents.trading_data_agent import trading_data_node
 
-# Refuse to prune more of the leaderboard than this in one run. See
-# prune_leaderboard().
+# Refuse to prune more of the universe than this in one run. See
+# prune_forecast_current().
 PRUNE_MAX_FRACTION = 0.25
 
 
-def _score_parts(
-    pred_excess_return: float,
-    prob_outperform: float | None,
-) -> tuple[float, float]:
-    """
-    The two ungated components of the composite, before evidence and flags.
-
-    signal      (0-60)  predicted excess return, saturating at +10% over 30
-                        sessions so one extreme forecast cannot dominate.
-    conviction  (0-40)  distance of P(outperform) from a coin flip, but ONLY
-                        when the point forecast agrees that the move is up.
-
-    Both floor at zero, which is what makes the composite a LONG-ONLY ranking:
-    a confidently predicted underperformer scores exactly the same as a
-    confidently predicted flat one. classify_score_basis() exists to keep that
-    fact visible rather than buried in a 0.0.
-
-    Conviction used to be computed independently of the point forecast, and
-    that was not long-only at all. PNB.NS ranked THIRD on the live leaderboard
-    on 2026-08-17 while forecasting a 1.69% UNDERPERFORMANCE: signal floored to
-    0.00 as intended, but conviction still collected 10.75 points from a
-    prob_outperform of 0.567, and 0.38 survived the flag deduction. The two
-    inputs disagreed and the score quietly sided with the one that scored
-    higher.
-
-    They disagree for a real reason — prob_positive(-0.0169) is the fraction of
-    calibration residuals above +0.0169, so a value over 0.5 means the model is
-    biased LOW for that ticker — but "the point forecast says down, the
-    calibrated probability says up" is not a ranking signal. It is a statement
-    that the model contradicts itself, and the honest response is to rank it
-    nowhere rather than to pick the cheerier half.
-    """
-    signal = min(max(pred_excess_return, 0.0) / 0.10, 1.0) * 60.0
-
-    if pred_excess_return <= 0.0 or prob_outperform is None:
-        conviction = 0.0
-    else:
-        conviction = min(max(prob_outperform - 0.5, 0.0) / 0.25, 1.0) * 40.0
-
-    return signal, conviction
-
-
-def compute_composite_score(
-    pred_excess_return: float | None,
-    evidence_grade: str,
-    prob_outperform: float | None,
-    n_flags: int = 0,
-) -> float:
-    """
-    Ranking heuristic in [0, 100]. NOT an expected return.
-
-    signal + conviction, multiplied by an evidence grade so a model that failed
-    its held-out checks scores 0 regardless of its prediction, less a 5-point
-    deduction per critic flag, floored at zero.
-    """
-    if pred_excess_return is None:
-        return 0.0
-
-    signal, conviction = _score_parts(pred_excess_return, prob_outperform)
-    raw = (signal + conviction) * EVIDENCE_MULTIPLIER.get(evidence_grade, 0.0)
-    return round(max(raw - 5.0 * n_flags, 0.0), 2)
-
-
-def classify_score_basis(
-    pred_excess_return: float | None,
-    evidence_grade: str,
-    prob_outperform: float | None,
-    n_flags: int = 0,
-) -> str:
-    """
-    Why a row scored what it scored — in particular, why it scored zero.
-
-    A composite of 0.0 was previously ambiguous across four unrelated
-    situations, and the leaderboard is mostly zeros: of 95 rows on 2026-08-15,
-    85 scored 0.0. A stock the model actively predicted would UNDERPERFORM
-    (evidence in hand, conviction real) was indistinguishable from one the
-    weekly evaluation had simply never reached. Sorting by score put them in
-    the same undifferentiated block, so the one number a reader is invited to
-    rank on silently conflated "no view" with "negative view".
-
-    The score itself is unchanged — this only names the reason:
-
-        RANKED        scored above zero and ranks normally.
-        NO_FORECAST   the model produced no prediction at all.
-        NO_EVIDENCE   the evidence gate zeroed it; the weekly walk-forward
-                      has not cleared this ticker (grade INSUFFICIENT).
-        NOT_LONG      evidence exists, but the prediction is flat-to-negative,
-                      and the composite only ranks long candidates.
-        FLAGGED_OUT   a real long signal that critic flags drove to zero.
-    """
-    if pred_excess_return is None:
-        return "NO_FORECAST"
-
-    if EVIDENCE_MULTIPLIER.get(evidence_grade, 0.0) == 0.0:
-        return "NO_EVIDENCE"
-
-    signal, conviction = _score_parts(pred_excess_return, prob_outperform)
-    if signal + conviction <= 0.0:
-        return "NOT_LONG"
-
-    if compute_composite_score(pred_excess_return, evidence_grade,
-                               prob_outperform, n_flags) <= 0.0:
-        return "FLAGGED_OUT"
-
-    return "RANKED"
-
-
 def save_forecast_to_db(state: dict) -> None:
-    """Persists the forecast, its evidence, and the leaderboard row."""
+    """
+    Persists the forecast: one append-only row in `forecasts`, one upserted
+    row in `forecast_current`.
+
+    The two tables are the history and the present view of the same object.
+    `forecast_current` was called `leaderboard` and is renamed rather than
+    dropped — the ranking lived in three of its columns, not in the table. The
+    row itself is the product.
+    """
     from data.db import get_engine, to_native_params
+    from data.frozen_universe import frozen_fingerprint
     from data.tickers import get_benchmark_name, get_company, get_sector
-    from data.universe import DEFAULT_RULE
 
     engine = get_engine()
     ticker = state.get("ticker", "")
     now = datetime.now(timezone.utc)
-
-    score_args = {
-        "pred_excess_return": state.get("pred_excess_return"),
-        "evidence_grade": state.get("evidence_grade", "INSUFFICIENT"),
-        "prob_outperform": state.get("prob_outperform"),
-        "n_flags": len(state.get("critic_flags", []) or []),
-    }
-    composite = compute_composite_score(**score_args)
-    score_basis = classify_score_basis(**score_args)
 
     benchmark = state.get("benchmark_ticker") or ""
     payload = {
@@ -192,7 +92,11 @@ def save_forecast_to_db(state: dict) -> None:
         "eval_baseline_hit_rate": state.get("eval_baseline_hit_rate"),
         "eval_beats_random_walk": int(bool(state.get("eval_beats_naive"))),
         "model_version": state.get("model_version"),
-        "universe_rule": DEFAULT_RULE.fingerprint(),
+        # The FROZEN universe's fingerprint, not the rule's. The rule no longer
+        # decides who is forecast, so recording it would say nothing about
+        # which rows this run covered — and that is the whole purpose of the
+        # column. See data/frozen_universe.py.
+        "universe_rule": frozen_fingerprint(),
         "evaluated_at": state.get("eval_evaluated_at"),
         "forecast_confidence": state.get("evidence_grade", "INSUFFICIENT"),
         "signal_narrative": state.get("signal_narrative"),
@@ -205,9 +109,6 @@ def save_forecast_to_db(state: dict) -> None:
         # compatibility but are no longer written with in-sample values.
         "mape": None,
         "directional_accuracy": state.get("eval_hit_rate"),
-        "upside_pct": state.get("forecast_change_pct"),
-        "composite_score": composite,
-        "score_basis": score_basis,
     }
 
     forecast_cols = [
@@ -219,18 +120,21 @@ def save_forecast_to_db(state: dict) -> None:
         "prob_outperform", "random_walk_price", "benchmark_ticker", "benchmark_name",
         "benchmark_sector_specific", "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate",
         "eval_baseline_hit_rate", "eval_beats_random_walk", "model_version",
-        "universe_rule", "evaluated_at", "score_basis",
+        "universe_rule", "evaluated_at",
     ]
 
-    leaderboard_cols = [
-        "ticker", "company", "sector", "current_price", "forecast_price", "upside_pct",
-        "composite_score", "critic_verdict", "forecast_confidence", "mape",
+    # `change_pct`, not `upside_pct`. Same quantity, and the old name was the
+    # ranking's vocabulary: "upside" asserts a long recommendation, which is
+    # exactly the claim this layer no longer makes. A forecast can point down.
+    current_cols = [
+        "ticker", "company", "sector", "current_price", "forecast_price", "direction",
+        "change_pct", "critic_verdict", "forecast_confidence", "mape",
         "directional_accuracy", "last_updated", "pred_excess_return", "interval_low",
         "interval_high", "interval_coverage", "prob_outperform", "random_walk_price",
         "benchmark_ticker", "benchmark_name", "benchmark_sector_specific",
         "eval_rank_ic", "eval_rank_ic_t", "eval_hit_rate", "eval_baseline_hit_rate",
         "eval_beats_random_walk", "model_version", "universe_rule", "evaluated_at",
-        "score_basis",
+        "signal_narrative",
     ]
 
     def _insert(cols: list[str], table: str) -> str:
@@ -247,41 +151,38 @@ def save_forecast_to_db(state: dict) -> None:
         conn.execute(text(_insert(forecast_cols, "forecasts")),
                      to_native_params({c: payload.get(c) for c in forecast_cols}))
 
-        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in leaderboard_cols if c != "ticker")
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in current_cols if c != "ticker")
         conn.execute(
-            text(f"{_insert(leaderboard_cols, 'leaderboard')} "
+            text(f"{_insert(current_cols, 'forecast_current')} "
                  f"ON CONFLICT (ticker) DO UPDATE SET {updates}"),
-            to_native_params({c: payload.get(c) for c in leaderboard_cols}),
+            to_native_params({c: payload.get(c) for c in current_cols}),
         )
         conn.commit()
 
 
-def prune_leaderboard(universe: list[str],
-                      max_fraction: float = PRUNE_MAX_FRACTION) -> int:
+def prune_forecast_current(universe: list[str],
+                           max_fraction: float = PRUNE_MAX_FRACTION) -> int:
     """
-    Deletes leaderboard rows for tickers no longer in the tradable universe.
+    Deletes forecast_current rows for tickers outside the frozen universe.
 
     save_forecast_to_db upserts per ticker and never deletes, so a name that
-    leaves the index keeps its last row forever. That is not merely untidy:
-    those rows carry a composite_score computed under the pre-Phase-0 formula,
-    which had no evidence gate and routinely produced scores near 100, while
-    every score written today is gated by evidence and is 0.0 whenever the
-    weekly evaluation has not yet cleared the ticker. Sorted by score, the
-    orphans outrank the entire live universe — the leaderboard was still
-    headed by IDEA.NS and SAIL.NS, neither of which is in the NIFTY 100,
-    months after they left it.
+    leaves the universe keeps its last row forever, dated whenever it was last
+    forecast. That is worse than untidy: the row renders exactly like a live
+    one. The board was still headed by IDEA.NS and SAIL.NS — neither in the
+    NIFTY 100 — months after they left it, because their stale rows carried a
+    pre-Phase-0 composite near 100 while every gated score written since was
+    0.0. The score is gone; the stale row is not, and a reader has no way to
+    tell a forecast published today from one abandoned last May.
 
-    ``max_fraction`` bounds the blast radius. Refusing to prune an EMPTY
-    universe is not enough of a guard, because the input is the same
-    get_universe() call whose output already varies run to run: it applies a
-    liquidity floor and a listing-history floor over freshly fetched OHLCV, so
-    a partial yfinance response or a half-written ohlcv table yields a short
-    universe rather than an empty one. At that point every healthy name
-    missing from the short list looks exactly like a delisting, and this
-    function would delete the live leaderboard on the strength of a bad
-    download. A legitimate index reconstitution moves a handful of names; a
-    quarter of the table disappearing at once is a broken input, so it is
-    reported and skipped rather than executed.
+    ``max_fraction`` bounds the blast radius. It mattered more when the input
+    varied: get_universe() used to screen freshly fetched OHLCV, so a partial
+    yfinance response produced a SHORT universe rather than an empty one, and
+    every healthy name missing from it looked exactly like a delisting. The
+    universe is frozen now and cannot shrink by accident, which removes that
+    failure mode — but not the guard, because the frozen list is edited by
+    hand and a typo in a checked-in file deletes rows just as effectively as a
+    bad download did. A universe change of any size is deliberate and can be
+    re-run; a quarter of the table vanishing unnoticed cannot be undone.
 
     Returns the number of rows removed (0 when the prune is refused).
     """
@@ -299,25 +200,25 @@ def prune_leaderboard(universe: list[str],
     params = {"tickers": list(universe)}
 
     with engine.connect() as conn:
-        total = conn.execute(text("SELECT COUNT(*) FROM leaderboard")).scalar() or 0
+        total = conn.execute(text("SELECT COUNT(*) FROM forecast_current")).scalar() or 0
         if not total:
             return 0
 
         doomed = conn.execute(
-            outside_universe("SELECT COUNT(*) FROM leaderboard "
+            outside_universe("SELECT COUNT(*) FROM forecast_current "
                              "WHERE ticker NOT IN :tickers"),
             params,
         ).scalar() or 0
 
         if doomed > total * max_fraction:
-            print(f"[Leaderboard] REFUSING to prune {doomed} of {total} rows "
+            print(f"[Forecasts] REFUSING to prune {doomed} of {total} rows "
                   f"(>{max_fraction:.0%}) against a universe of {len(universe)} "
                   f"tickers — treating this as a bad universe, not a mass "
-                  f"delisting. Leaderboard left untouched.")
+                  f"delisting. forecast_current left untouched.")
             return 0
 
         result = conn.execute(
-            outside_universe("DELETE FROM leaderboard WHERE ticker NOT IN :tickers"),
+            outside_universe("DELETE FROM forecast_current WHERE ticker NOT IN :tickers"),
             params,
         )
         conn.commit()

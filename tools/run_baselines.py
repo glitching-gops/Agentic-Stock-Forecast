@@ -20,7 +20,7 @@ records into ``experiment_runs`` cannot drift from the table printed here.
 Read the output in this order:
 
   1. ``zero`` is the floor. It is the random walk in excess-return space.
-  2. ``daily_IC`` is the number that matters for a leaderboard, not ``IC``.
+  2. ``daily_IC`` is the cross-sectional number, not ``IC``.
      The pooled IC can be moved by knowing which months were good and by
      knowing which fold a row came from; the daily one is computed within each
      date and then averaged, so it measures only cross-sectional ordering.
