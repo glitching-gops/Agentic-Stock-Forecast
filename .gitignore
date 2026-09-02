@@ -72,3 +72,7 @@ scheduler.lock
 # Generated model packages (LoRA export, probe embedding caches) — regenerable
 # from tools/export_lora_package.py and tools/run_probe.py, and large.
 *.npz
+
+# Serena MCP server's per-project cache and memories — machine-local, and it
+# re-derives itself from the source tree on demand.
+.serena/
