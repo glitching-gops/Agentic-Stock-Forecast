@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -111,6 +112,64 @@ def test_the_shipped_modules_import_with_no_repository_present(tmp_path):
                           capture_output=True, text=True)
     assert proc.stdout.strip().endswith("False"), \
         "importing the shipped forecasters pulled in torch at module level"
+
+
+def test_a_missing_model_dependency_fails_before_the_run_not_during_it(monkeypatch):
+    """
+    MEASURED, on the first real Kaggle run: three Chronos configurations
+    completed at 100% coverage and the fourth died because
+    `TimesFm2_5ModelForPrediction` was absent from the installed transformers.
+
+    Two things were wrong and both are fixed here.
+
+    IT FAILED LATE. The import happens inside `load_model`, which the
+    forecaster calls on its first `forecast()` - so the package was loaded, the
+    grid was sliced and the run was underway before anything checked. The cost
+    of finding out is two seconds; the cost of finding out then was the run.
+
+    IT GAVE THE WRONG ADVICE. `TimesFMUnavailable` says to install
+    requirements-series.txt, which is correct locally and in CI and is the
+    WORST possible instruction on Kaggle: that file opens with
+    `--extra-index-url .../whl/cpu`, so following it would have replaced the
+    CUDA torch the three successful runs had just used, silently, leaving only
+    a slower wall clock as evidence. The Kaggle-specific message therefore
+    lives in the Kaggle script rather than in the shared module.
+    """
+    import types
+
+    from tools.series_kaggle import KNOWN_GOOD_TRANSFORMERS, preflight
+
+    fake = types.ModuleType("transformers")
+    fake.__version__ = "4.57.1"                    # no TimesFm2_5 class
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+
+    with pytest.raises(SystemExit) as excinfo:
+        preflight("timesfm")
+
+    message = str(excinfo.value)
+    assert "TimesFm2_5ModelForPrediction" in message
+    # A CONCRETE PIN, not a range. Asserting only that the constant appears in
+    # the message passes just as happily when the constant is ">=5.0,<6" - and
+    # that range is the thing that failed, so the remediation repeating it
+    # would send the reader round the same loop.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", KNOWN_GOOD_TRANSFORMERS), \
+        f"the remediation must pin an exact version, got {KNOWN_GOOD_TRANSFORMERS!r}"
+    assert f"transformers=={KNOWN_GOOD_TRANSFORMERS}" in message
+    assert "4.57.1" in message, "the message must name what is actually installed"
+    assert "DO NOT install requirements-series.txt" in message, \
+        "the obvious fix is the one that silently downgrades CUDA torch"
+
+    # And it passes once the symbol is there, so the guard is not simply
+    # refusing everything.
+    fake.TimesFm2_5ModelForPrediction = object
+    preflight("timesfm")
+
+    # Chronos is checked the same way and names its own package, not TimesFM's.
+    monkeypatch.setitem(sys.modules, "chronos", None)
+    with pytest.raises(SystemExit) as excinfo:
+        preflight("chronos")
+    assert "chronos-forecasting" in str(excinfo.value)
+    assert "DO NOT install requirements-series.txt" in str(excinfo.value)
 
 
 # ── The package's declarations ────────────────────────────────────────────

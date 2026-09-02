@@ -4,10 +4,20 @@ tools/series_kaggle.py - The Kaggle side for Chronos-2 and TimesFM-2.5.
 Attach the package from `tools/export_series_package.py` as a Kaggle dataset,
 then in a GPU notebook:
 
-    !pip -q install "chronos-forecasting>=2.0" "transformers>=5.0,<6"
+    !pip install -q "chronos-forecasting>=2.0" "transformers==5.5.4"
+    !python -c "import transformers as t; print(t.__version__, \\
+        hasattr(t,'TimesFm2_5ModelForPrediction'))"
     !python series_kaggle.py --package /kaggle/input/<ds>/series_panel.npz \\
         --model chronos --model-id amazon/chronos-2 --context 2048 \\
         --out /kaggle/working/chronos2_2048.npz
+
+TRANSFORMERS IS PINNED, NOT RANGED, AND THAT IS THE FIX FOR A REAL FAILURE
+--------------------------------------------------------------------------
+TimesFM-2.5 ships inside transformers as `TimesFm2_5ModelForPrediction`, a
+class that landed in 5.x. `pip install "transformers>=5.0,<6"` on a Kaggle
+image that already carries a 4.x can resolve by leaving it exactly where it is,
+and the first thing that then fails is the fourth of five configurations, an
+hour of attention later. `preflight()` below now checks this in two seconds.
 
 DO NOT `pip install -r requirements-series.txt` ON KAGGLE
 ---------------------------------------------------------
@@ -100,6 +110,66 @@ def install_sources(package, where: str = "/kaggle/working/_shipped") -> None:
         sys.path.insert(0, where)
 
 
+# The exact version this repository's results were produced against. Pinned in
+# the remediation text below rather than left as a range, because a range is
+# what failed: `pip install "transformers>=5.0,<6"` on a Kaggle image that
+# already carries a 4.x can resolve to leaving it exactly where it is.
+KNOWN_GOOD_TRANSFORMERS = "5.5.4"
+
+
+def preflight(model: str) -> None:
+    """
+    Fail in two seconds rather than after the package load and a model download.
+
+    THE COST OF NOT DOING THIS IS MEASURED, not hypothetical. A run of five
+    configurations reached the fourth before `TimesFm2_5ModelForPrediction`
+    turned out to be missing, and the exception it raised then told the reader
+    to `pip install -r requirements-series.txt` - which on Kaggle is the WORST
+    available advice, because that file opens with the CPU torch index and
+    would replace the CUDA build the first three configurations had just used.
+    That message is correct locally and in CI, which is exactly why the
+    Kaggle-specific one belongs here instead of there.
+    """
+    import importlib
+
+    if model == "timesfm":
+        transformers = importlib.import_module("transformers")
+        version = getattr(transformers, "__version__", "unknown")
+        has_class = hasattr(transformers, "TimesFm2_5ModelForPrediction")
+        print(f"  transformers {version}  "
+              f"TimesFm2_5ModelForPrediction: {has_class}")
+        if not has_class:
+            raise SystemExit(
+                f"\nREFUSING TO RUN: transformers {version} does not export "
+                f"TimesFm2_5ModelForPrediction.\n"
+                f"\nTimesFM-2.5 ships INSIDE transformers and the class landed "
+                f"in 5.x. A `>=5.0,<6` range is not enough on a Kaggle image "
+                f"that already carries a 4.x - the resolver is free to leave it "
+                f"alone. Pin it, then confirm:\n"
+                f"\n    !pip install -q --upgrade "
+                f"'transformers=={KNOWN_GOOD_TRANSFORMERS}'\n"
+                f"    !python -c \"import transformers as t; "
+                f"print(t.__version__, hasattr(t,'TimesFm2_5ModelForPrediction'))\"\n"
+                f"\nDO NOT install requirements-series.txt to fix this. It "
+                f"pins the CPU torch index and would silently replace this "
+                f"notebook's CUDA build.\n"
+            )
+        return
+
+    if model == "chronos":
+        try:
+            chronos = importlib.import_module("chronos")
+        except ImportError as exc:
+            raise SystemExit(
+                f"\nREFUSING TO RUN: chronos-forecasting is not importable "
+                f"({exc}).\n\n    !pip install -q 'chronos-forecasting>=2.0'\n"
+                f"\nDO NOT install requirements-series.txt to fix this - it "
+                f"pins the CPU torch index.\n"
+            ) from exc
+        print(f"  chronos-forecasting "
+              f"{getattr(chronos, '__version__', 'unknown')}")
+
+
 def build_forecaster(args):
     if args.model == "chronos":
         from pipeline.chronos_forecaster import Chronos2Forecaster
@@ -149,6 +219,9 @@ def main() -> int:
                          "on Kaggle is a CPU torch wheel installed over the "
                          "CUDA one, which is silent and merely slow.")
     args = ap.parse_args()
+
+    # BEFORE the package load and before any weights are fetched. See preflight.
+    preflight(args.model)
 
     package = np.load(args.package, allow_pickle=True)
     meta = json.loads(str(package["meta"][0]))
