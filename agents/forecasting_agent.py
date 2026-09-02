@@ -29,8 +29,9 @@ from __future__ import annotations
 
 import os
 import time
+from datetime import date
 
-from agents.llm import DEFAULT_GROQ_MODEL, groq_client
+from agents.llm import DEFAULT_GROQ_MODEL, groq_client, strip_reasoning
 from agents.state import AgentState
 from pipeline.model import forecast_ticker_daily
 
@@ -117,52 +118,89 @@ def forecasting_node(state: AgentState) -> dict:
     return updates
 
 
-def _deserves_a_written_narrative(updates: dict) -> bool:
-    """
-    Whether this ticker is worth spending a Groq call on.
+# How many stocks get an LLM-written narrative on any one day.
+#
+# Not "all of them", and no longer "the ones forecast to rise". See
+# _deserves_a_written_narrative for why the old condition had to go and why
+# this is a SAMPLE rather than the whole universe.
+#
+# 12 divides 84 exactly, so the rotation below tiles the frozen universe in
+# seven windows and every stock gets a written narrative once a week, on a
+# known day. Change the size and the rotation still works, it just stops
+# tiling evenly.
+NARRATIVE_SAMPLE_SIZE = int(os.getenv("NARRATIVE_SAMPLE_SIZE", "12"))
 
-    The daily job runs the whole universe, two LLM calls per ticker, against a
+
+def _narrative_sample(day: date | None = None,
+                      size: int | None = None) -> tuple[str, ...]:
+    """
+    The stocks whose narrative is WRITTEN today.
+
+    A contiguous window over the sorted frozen universe, advanced by one full
+    window per calendar day. Deterministic, so a re-run of the same day writes
+    the same narratives and costs the same tokens; and a pure function of the
+    DATE and the universe file, so it cannot see a forecast.
+
+    That independence is the whole design. Any rule that reads the prediction
+    to decide who gets explained selects the sample on the outcome, and this
+    project has spent a phase removing exactly that shape of mistake.
+    """
+    from data.frozen_universe import FROZEN_UNIVERSE
+
+    universe = sorted(FROZEN_UNIVERSE)
+    if not universe:
+        return ()
+
+    n = max(0, min(size if size is not None else NARRATIVE_SAMPLE_SIZE,
+                   len(universe)))
+    if n == 0:
+        return ()
+
+    start = ((day or date.today()).toordinal() * n) % len(universe)
+    return tuple(universe[(start + i) % len(universe)] for i in range(n))
+
+
+def _deserves_a_written_narrative(ticker: str, updates: dict) -> bool:
+    """
+    Whether this ticker is worth spending a Groq call on today.
+
+    HISTORY, because the shape of the mistake matters more than the rule.
+    The daily job ran the whole universe at two LLM calls per ticker against a
     free-tier daily token budget. On 2026-08-15 that budget ran out partway
     through and the tail of the alphabet fell back to the rule-based narrative
-    anyway — so the cap was already choosing which stocks got a written
-    narrative, by arrival order, which is the worst possible selection rule.
+    - so the cap was already choosing which stocks got written up, by arrival
+    order, which is the worst possible selection rule.
 
-    Choosing deliberately instead: a narrative is only ever read next to a
-    ranked row, and a row can only rank if it has a persisted evaluation behind
-    it AND a positive predicted excess return (compute_composite_score floored
-    both of its components at zero, so a predicted underperformer scored 0.0
-    and sank regardless of what the narrative said). Both facts are already in
-    ``updates`` by the time this is called. That takes NARRATIVE calls from one
-    per ticker (~95) to roughly 15.
+    The rule that replaced it was "a row that can rank": a persisted evaluation
+    AND a positive predicted return. Neither half survives P0 and P1. Nothing
+    ranks any more, so "only read beside a ranked row" is false. And on an
+    absolute-return target `pred > 0` withheld the written analysis from
+    exactly the stocks a reader most needs it for - the ones forecast to fall -
+    while making the sample a function of the model's own output.
 
-    THIS RATIONALE IS NOW STALE AND THE GATE IS DELIBERATELY LEFT ALONE. There
-    are no ranked rows: every stock in the frozen universe gets a forecast, and
-    each is read on its own rather than against the others. So "only ever read
-    next to a ranked row" is false, and the narrower half of the condition —
-    `pred > 0` — now withholds the written analysis from precisely the stocks a
-    reader most needs it for, the ones forecast to fall.
+    WHAT IT IS NOW (2026-09-02): membership of today's rotating sample, and
+    nothing else. Two conditions were dropped deliberately.
 
-    It is not changed here because changing it is not free and not this phase's
-    call. It multiplies narrative calls by ~6, the configured model is
-    decommissioned and 404s on every request, and the replacement has not been
-    chosen. The P4 forecast object is meant to explain every stock, including
-    why one does NOT work; that is where this gate gets rewritten, alongside
-    the model decision it depends on.
+      `pred > 0`            gone. It selected on the outcome, and a forecast
+                            reading is not more worth explaining because it is
+                            bullish.
 
-    Note this gates one of the two LLM calls per ticker. critic_agent's
-    _llm_review still runs unconditionally, so the daily total is ~95 + ~15
-    rather than ~15 — comfortably inside 500k tokens/day, but the critic is now
-    the larger consumer of the two.
+      `eval_evaluated_at`   gone, and this one is less obvious. The prompt
+                            withholds the forecast on purpose (see _narrative):
+                            what the model is asked to describe is the SIGNAL
+                            state, which every ticker has whether or not a
+                            weekly evaluation has graded it. Requiring evidence
+                            here would also mean zero narratives for the whole
+                            of P1, since MODEL_VERSION moved and every ticker
+                            sits at INSUFFICIENT until the weekly job re-runs.
+                            The evidence grade is published beside the
+                            narrative; it does not need to gate it.
 
-    Everything else still gets _rule_based_narrative, which is deterministic
-    and states only what the signals say — not a degraded output, just an
-    unwritten one.
+    The cost is bounded by the sample, not by the gate's opinion of a stock -
+    ~12 calls a day against a 1,000/day allowance, with the critic's review
+    gated separately on the evidence grade.
     """
-    if not updates.get("eval_evaluated_at"):
-        return False
-
-    pred = updates.get("pred_return")
-    return pred is not None and pred > 0
+    return ticker in _narrative_sample()
 
 
 def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
@@ -175,7 +213,7 @@ def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     """
     signals = state.get("latest_signals", {}) or {}
 
-    if not _deserves_a_written_narrative(updates):
+    if not _deserves_a_written_narrative(ticker, updates):
         return _rule_based_narrative(ticker, signals)
 
     client = _groq_client()
@@ -209,7 +247,14 @@ Do not state a price target, a percentage move, or a buy/sell recommendation."""
                 model=model_name,
                 temperature=0.3,
             )
-            return completion.choices[0].message.content.strip()
+            written = strip_reasoning(completion.choices[0].message.content)
+            if written:
+                return written
+            # An empty answer after stripping means the model spent the whole
+            # response reasoning. Fall through to the deterministic narrative
+            # rather than publishing a blank one.
+            print(f"[{ticker}] narrative was empty after stripping reasoning")
+            break
         except Exception as exc:                               # noqa: BLE001
             if "429" in str(exc) and attempt == 0:
                 time.sleep(2)

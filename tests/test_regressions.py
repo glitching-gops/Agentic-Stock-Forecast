@@ -1217,6 +1217,68 @@ def test_weak_evidence_requires_two_independent_checks():
     assert tied == "INSUFFICIENT"
 
 
+def test_an_anti_signal_is_not_evidence_however_significant_it_is():
+    """
+    Q4 of the Phase 0 audit, closed 2026-09-02.
+
+    The IC t-statistic check read `abs(ic_t) >= 2.0`, and it is the ONLY one of
+    the gate's three checks that tests significance at all - the IC floor and
+    the hit-rate edge are point estimates with no inferential content. So the
+    absolute value made the gate's single inferential check symmetric in a
+    quantity that is not symmetric in meaning.
+
+    Measured, not hypothesised. Over all 96 tickers on 2026-08-31 exactly four
+    passed this check and ALL FOUR had strongly negative IC - the model ranked
+    them reliably BACKWARDS. The largest positive t-statistic anywhere in the
+    universe was +1.84. Any of those four was one lucky second check away from
+    being graded WEAK and published as validated.
+
+    The four real ones are the cases here.
+    """
+    from agents.critic_agent import grade_evidence
+
+    # TRENT.NS: t -2.33, and a hit rate exactly ON its baseline. Under abs()
+    # this passed the t-stat check; one more check anywhere and it is WEAK.
+    trent, reasons = grade_evidence(_evidence_state(
+        ic=-0.295, ic_t=-2.33, hit=52.0, baseline=52.0))
+    assert trent == "INSUFFICIENT"
+    assert any("NEGATIVE" in r for r in reasons),         "a reliably backwards ranking is a real measurement and must be REPORTED"
+
+    # MUTHOOTFIN.NS: t -2.00, exactly at the threshold on the wrong side.
+    muthoot, _ = grade_evidence(_evidence_state(
+        ic=-0.253, ic_t=-2.00, hit=39.4, baseline=59.5))
+    assert muthoot == "INSUFFICIENT"
+
+    # The construction the fix actually prevents. TRENT.NS and LT.NS both sit
+    # exactly here: a positive IC, a hit rate ON the baseline, and a t-statistic
+    # that is significant in the WRONG direction. Under abs() that is two of
+    # three checks and a published WEAK badge, bought entirely by a measurement
+    # saying the ranking is inverted. Now it is one of three.
+    one_lucky_check, _ = grade_evidence(_evidence_state(
+        ic=0.05, ic_t=-2.4, hit=52.0, baseline=52.0))
+    assert one_lucky_check == "INSUFFICIENT",         "a significantly NEGATIVE t-statistic must never count as a check passed"
+
+    # And where a second check IS genuinely passed, the grade falls rather than
+    # disappearing - three of three became two of three. The point is that the
+    # anti-signal stops CONTRIBUTING, not that it becomes disqualifying.
+    downgraded, _ = grade_evidence(_evidence_state(
+        ic=0.05, ic_t=-2.4, hit=56.0, baseline=52.0))
+    assert downgraded == "WEAK", "under abs() this was STRONG"
+
+    # The same shape with the sign the right way round is still evidence: the
+    # fix must remove grades, not the check.
+    real, _ = grade_evidence(_evidence_state(
+        ic=0.05, ic_t=+2.4, hit=56.0, baseline=52.0))
+    assert real == "STRONG"
+
+    # And the ordinary case is untouched: within noise reads as within noise,
+    # not as an anti-signal.
+    noisy, noisy_reasons = grade_evidence(_evidence_state(
+        ic=0.05, ic_t=-0.4, hit=56.0, baseline=52.0))
+    assert noisy == "WEAK"
+    assert not any("NEGATIVE" in r for r in noisy_reasons)
+
+
 def test_strong_requires_every_check_to_have_actually_run():
     """
     Grading on `passed == checks` alone hands STRONG to a ticker whose single
@@ -1319,62 +1381,236 @@ def test_weekly_job_ingests_its_own_data_before_evaluating():
 
 # ── LLM budget: choose which tickers get a written narrative ──────────────────
 
-def test_default_groq_model_has_the_larger_free_tier_budget():
+def test_the_configured_model_exists_and_lives_in_exactly_one_place():
     """
-    openai/gpt-oss-20b allows 200k tokens/day; the daily job makes two calls
-    per ticker across ~95 tickers and exhausted it partway through the
-    2026-08-15 run. llama-3.1-8b-instant allows 500k/day on the same tier.
+    The default was ``llama-3.1-8b-instant``, chosen for its 500k tokens/day.
+    Groq then DECOMMISSIONED it: every call returned 404, which fired the stale
+    `_rule_based_narrative` call site and failed 64 of 95 tickers while the job
+    reported OK. A dead model id is not a budget decision, it is an outage.
+
+    The replacement is ``openai/gpt-oss-120b`` (2026-09-02): a reasoning model
+    on the same free tier at 1,000 requests/day and 200k tokens/day. The
+    smaller allowance is affordable because the two call sites are now gated -
+    the narrative by a fixed daily sample, the critic's review by the evidence
+    grade - so the job makes ~16 calls a day, not ~190.
+
+    OpenRouter was researched and refused: 50 requests/day unfunded, against an
+    84-stock universe.
     """
     from agents.llm import DEFAULT_GROQ_MODEL
 
-    assert DEFAULT_GROQ_MODEL == "llama-3.1-8b-instant"
+    assert DEFAULT_GROQ_MODEL == "openai/gpt-oss-120b"
+    assert "llama-3.1-8b-instant" != DEFAULT_GROQ_MODEL,         "the decommissioned model must never be the default again"
 
-    # And the model must be configured in exactly one place.
+    # And the model must be configured in exactly one place, so the two nodes
+    # cannot drift onto different models.
     for module in ["critic_agent.py", "forecasting_agent.py"]:
         source = (REPO / "agents" / module).read_text(encoding="utf-8")
         assert "gpt-oss" not in source, f"{module} still hardcodes a model name"
+        assert "llama-3.1" not in source, f"{module} still hardcodes a model name"
 
 
-def test_the_narrative_gate_still_holds_and_its_rationale_no_longer_does():
+def test_a_reasoning_model_cannot_publish_its_own_working():
     """
-    The gate is UNCHANGED and this test pins it as it stands, deliberately.
+    The switch to openai/gpt-oss-120b makes the configured model a REASONING
+    model, and a reasoning model may return its chain of thought inside the
+    message content rather than in a separate field - which of the two it does
+    depends on the provider's default reasoning format, not on our code.
 
-    Why it exists: without a gate the token cap chose which stocks got a
-    written narrative by arrival order, and the tail of the alphabet logged
-    "narrative generation failed". The condition it settled on was "a row that
-    can rank" — a persisted evaluation, and a positive predicted return.
+    Both consumers fail badly and quietly if it does:
 
-    NEITHER HALF OF THAT RATIONALE SURVIVES P0 AND P1. Nothing ranks any more,
-    so "only read beside a ranked row" is false; and on an absolute target
-    `pred > 0` withholds the written analysis from exactly the stocks a reader
-    most needs it for, the ones forecast to FALL. The rebuild's P4 says every
-    stock gets an explanation including why it does not work, so this condition
-    has to be rewritten there.
+      the narrative   publishes `content` verbatim to the dashboard, so the
+                      model's private working is presented to a reader as the
+                      analysis.
+      the critic      json.loads() the content, so a prefix drops every review
+                      into the "not valid JSON" branch - which records NO flags
+                      and is indistinguishable, from outside, from a clean
+                      review that found nothing to flag.
 
-    It is left alone here on purpose: changing it multiplies LLM calls by ~6,
-    the configured model is decommissioned and 404s on every request, and the
-    replacement has not been chosen. Pinning current behaviour keeps the change
-    deliberate rather than incidental — the failure mode this project keeps
-    hitting is a rule whose justification quietly evaporated while the rule
-    stayed.
+    The second is the dangerous one. It is the shape this project keeps
+    hitting: a silent failure that reads as a pass.
     """
-    from agents.forecasting_agent import _deserves_a_written_narrative
+    import json
 
-    written = {"eval_evaluated_at": "2026-08-15 17:02:11", "pred_return": 0.031}
-    assert _deserves_a_written_narrative(written) is True
+    from agents.critic_agent import _llm_review
+    from agents.llm import strip_reasoning
 
-    # No persisted evaluation: the evidence gate grades this INSUFFICIENT.
+    assert strip_reasoning("<think>working</think>\nThe RSI is 55.") == "The RSI is 55."
+    assert strip_reasoning("<Thinking>x</Thinking> answer") == "answer"
+    assert strip_reasoning("<reasoning>a</reasoning>{}") == "{}"
+
+    # A truncated response is not half an answer, it is no answer.
+    assert strip_reasoning("<think>cut off mid-thou") == ""
+
+    # No-ops. A provider that separates the fields must pay nothing for this.
+    assert strip_reasoning("already clean") == "already clean"
+    assert strip_reasoning(None) == ""
+
+    # A tag that merely STARTS with the same letters is not a think tag, and
+    # over-stripping here is worse than under-stripping: `<thinker>` has no
+    # matching close, so it would fall through to the truncation rule and
+    # delete the entire response rather than a fragment of it.
+    #
+    # (`<thing>` does NOT exercise this - "think" is not a prefix of "thing" -
+    # which is how the first version of this assertion passed against a regex
+    # with no word boundary at all.)
+    assert strip_reasoning("a <thinker> tag") == "a <thinker> tag"
+    assert strip_reasoning("a <thinker>x</thinker> tag") == "a <thinker>x</thinker> tag"
+
+    # End to end through the critic: a fenced, reasoning-prefixed response of
+    # the shape a reasoning model actually returns must still yield its flags.
+    payload = json.dumps({"flags": ["SIGNAL CONFLICT"], "reasoning": "rsi high"})
+
+    class _Reasoner:
+        class chat:
+            class completions:
+                @staticmethod
+                def create(**kwargs):
+                    class _M:
+                        content = ("<think>Let me check the RSI first.</think>\n"
+                                   "```json\n" + payload + "\n```")
+                    class _C:
+                        message = _M()
+                    class _R:
+                        choices = [_C()]
+                    return _R()
+
+    import agents.critic_agent as ca
+    original = ca._groq_client
+    ca._groq_client = lambda: _Reasoner()
+    try:
+        flags, reasoning = _llm_review({"ticker": "ABB.NS"}, "ABB.NS")
+    finally:
+        ca._groq_client = original
+
+    assert flags == ["SIGNAL CONFLICT"], \
+        "an inline reasoning block must not silently cost the review its flags"
+    assert reasoning == "rsi high"
+
+
+def test_the_critic_is_told_which_quantity_it_is_reviewing():
+    """
+    P1 renamed the forecast from an excess return to the stock's own absolute
+    return. The critic's PROMPT was not renamed with it: it announced a
+    "30-session relative-return forecast" and labelled the number "Predicted
+    excess return", while handing over `pred_return`.
+
+    That is the same failure shape as every other half of that rename - it
+    raises nothing, produces fluent prose, and is wrong. Check 2 in the prompt
+    asks the model to flag momentum running against the predicted direction,
+    which it cannot do correctly while it believes the number has an index
+    subtracted from it.
+    """
+    source = (REPO / "agents" / "critic_agent.py").read_text(encoding="utf-8")
+
+    prompt = source[source.index("prompt = f\"\"\"You are reviewing"):]
+    prompt = prompt[:prompt.index('Respond ONLY with JSON')]
+
+    assert "absolute-return forecast" in prompt
+    assert "excess return" not in prompt.lower(), \
+        "the prompt still describes the target P1 replaced"
+    assert "relative-return" not in prompt
+
+    # The benchmark is still shown - it is real context for a sector read - but
+    # it must be labelled as context rather than as part of the target.
+    assert "benchmark_ticker" in prompt
+    assert "NOT subtracted" in prompt
+
+
+def test_the_narrative_sample_is_chosen_without_looking_at_the_forecast():
+    """
+    The gate's OLD condition was a persisted evaluation AND `pred_return > 0`.
+    Both halves are gone (2026-09-02), and the second one is the important one:
+    it selected which stocks got explained BY THE MODEL'S OWN OUTPUT, so the
+    written analysis was systematically withheld from the stocks forecast to
+    fall - the ones a reader most needs it for.
+
+    What replaced it must therefore be provably independent of the forecast.
+    This asserts that directly: the same ticker, on the same day, with wildly
+    different predictions and with or without an evaluation behind it, gets the
+    same answer.
+    """
+    from datetime import date
+
+    from agents.forecasting_agent import (
+        _deserves_a_written_narrative, _narrative_sample)
+
+    member = _narrative_sample()[0]
+
+    # A predicted collapse still earns a written narrative...
+    assert _deserves_a_written_narrative(member, {"pred_return": -0.42}) is True
+    # ...as does one with no evaluation behind it at all, which is the state
+    # the WHOLE universe is in until the weekly job re-runs under v3.
+    assert _deserves_a_written_narrative(member, {}) is True
     assert _deserves_a_written_narrative(
-        {"eval_evaluated_at": None, "pred_return": 0.031}) is False
+        member, {"eval_evaluated_at": None, "pred_return": None}) is True
 
-    # A predicted DECLINE. Still gated, and this is the half P4 must revisit.
+    # And a bullish forecast on a ticker outside today's window does not buy
+    # its way in.
     assert _deserves_a_written_narrative(
-        {"eval_evaluated_at": "2026-08-15 17:02:11",
-         "pred_return": -0.02}) is False
+        "ZZZZ.NS", {"pred_return": 0.9,
+                    "eval_evaluated_at": "2026-08-15 17:02:11"}) is False
 
-    assert _deserves_a_written_narrative(
-        {"eval_evaluated_at": "2026-08-15 17:02:11",
-         "pred_return": None}) is False
+    # The sample is a pure function of the date: a re-run of the same day
+    # writes the same narratives and spends the same tokens.
+    assert _narrative_sample(date(2026, 9, 2)) == _narrative_sample(date(2026, 9, 2))
+    assert _narrative_sample(date(2026, 9, 2)) != _narrative_sample(date(2026, 9, 3))
+
+
+def test_the_sample_covers_every_stock_and_costs_what_it_says_it_costs():
+    """
+    A sample that is stable is not enough - one that is stable and never moves
+    is arrival order with extra steps, which is the rule this gate exists to
+    replace. It has to ROTATE, and the rotation has to reach everyone.
+
+    12 divides 84 exactly, so seven consecutive days tile the frozen universe
+    and every stock is written up once a week. The cost claim in agents/llm.py
+    (~12 narrative calls a day against a 1,000/day allowance) depends on the
+    window being a fixed size, so that is pinned too.
+    """
+    from datetime import date, timedelta
+
+    from agents.forecasting_agent import NARRATIVE_SAMPLE_SIZE, _narrative_sample
+    from data.frozen_universe import FROZEN_UNIVERSE
+
+    day = date(2026, 9, 2)
+    seen: set[str] = set()
+    for i in range(len(FROZEN_UNIVERSE) // NARRATIVE_SAMPLE_SIZE):
+        window = _narrative_sample(day + timedelta(days=i))
+        assert len(window) == NARRATIVE_SAMPLE_SIZE, "the daily cost must be fixed"
+        assert len(set(window)) == len(window), "a stock must not pay twice in a day"
+        assert not seen & set(window), "the windows must not overlap"
+        seen |= set(window)
+
+    assert seen == set(FROZEN_UNIVERSE),         "every stock must get a written narrative within one rotation"
+
+    # Every name in the sample is a real member of the universe - a rotation
+    # that ran off the end of the list would silently write nothing.
+    assert set(_narrative_sample(day)) <= set(FROZEN_UNIVERSE)
+
+    # The window WRAPS, and that only matters at a size which does not divide
+    # the universe - which is reachable, because NARRATIVE_SAMPLE_SIZE is read
+    # from the environment. At 12 into 84 every window happens to land inside
+    # the list and a plain slice would pass this test; at 10 it does not, and a
+    # plain slice quietly returns a SHORT final window - fewer narratives than
+    # the cost claim says, on a rotation that then never realigns.
+    #
+    # (This is the mutant that survived the first pass: `universe[start:start+n]`
+    # is indistinguishable from the wrap at the configured size.)
+    off_the_end = [d for d in (day + timedelta(days=i) for i in range(40))
+                   if (d.toordinal() * 10) % len(FROZEN_UNIVERSE) > len(FROZEN_UNIVERSE) - 10]
+    assert off_the_end, "no day in the range straddles the end of the list"
+    for d in off_the_end:
+        window = _narrative_sample(d, 10)
+        assert len(window) == 10, "a window straddling the end must still be full"
+        assert len(set(window)) == 10, "and must not name the same stock twice"
+
+    # Turned off entirely, nothing is written and nothing raises.
+    assert _narrative_sample(day, 0) == ()
+
+    # A size larger than the universe is clamped rather than repeating names.
+    everyone = _narrative_sample(day, len(FROZEN_UNIVERSE) + 50)
+    assert sorted(everyone) == sorted(FROZEN_UNIVERSE)
 
 
 # ── A missing benchmark costs the excess label and nothing else ───────────
@@ -2809,12 +3045,16 @@ def test_the_narrative_falls_back_without_crashing_when_the_llm_call_fails():
     fa._groq_client = lambda: _Exploding()
     try:
         # _deserves_a_written_narrative must be True, or the earlier (correct)
-        # call site is taken and this test proves nothing.
+        # call site is taken and this test proves nothing. Which ticker that is
+        # depends on today's rotation, so it is taken FROM the rotation rather
+        # than hardcoded - a fixed ABB.NS here would make this test pass
+        # vacuously on six days out of seven.
+        ticker = fa._narrative_sample()[0]
         updates = {"eval_evaluated_at": "2026-08-01", "pred_return": 0.03}
-        assert fa._deserves_a_written_narrative(updates) is True
+        assert fa._deserves_a_written_narrative(ticker, updates) is True
 
-        text = fa._narrative({"ticker": "ABB.NS", "latest_signals": {"rsi": 55}},
-                             "ABB.NS", updates)
+        text = fa._narrative({"ticker": ticker, "latest_signals": {"rsi": 55}},
+                             ticker, updates)
     finally:
         fa._groq_client = original
 

@@ -38,7 +38,7 @@ import re
 
 from dotenv import load_dotenv
 
-from agents.llm import DEFAULT_GROQ_MODEL, groq_client
+from agents.llm import DEFAULT_GROQ_MODEL, groq_client, strip_reasoning
 from agents.state import EVIDENCE_MULTIPLIER, AgentState
 
 load_dotenv(override=True)
@@ -47,6 +47,37 @@ load_dotenv(override=True)
 # with a t-statistic above 2 is a real but weak edge, which is an honest
 # description of what technical signals deliver at a 30-session horizon.
 MIN_RANK_IC = 0.02
+
+# SIGNED, not absolute. This is Q4 of the Phase 0 audit, closed 2026-09-02.
+#
+# The check used to read `abs(ic_t) >= MIN_IC_TSTAT`, and it is the ONLY one of
+# the three that tests significance at all - the IC floor and the hit-rate edge
+# are point estimates with no inferential content. Taking the absolute value
+# therefore made the gate's single inferential check symmetric in a quantity
+# that is not symmetric in meaning: a rank IC reliably NEGATIVE at t = -2.3 says
+# the ranking is backwards, which is a finding about the model and the opposite
+# of evidence for the forecast it is grading.
+#
+# This was not hypothetical. Measured over all 96 tickers on 2026-08-31, four
+# passed this check and ALL FOUR had strongly negative IC:
+#
+#     MUTHOOTFIN.NS  IC -0.253  t -2.00   hit-base -20.1pp
+#     TRENT.NS       IC -0.295  t -2.33   hit-base   0.0pp
+#     HDFCAMC.NS     IC -0.321  t -2.18   hit-base   0.0pp
+#     LT.NS          IC -0.263  t -2.08   hit-base   0.0pp
+#
+# The maximum POSITIVE t-statistic anywhere in the universe was +1.84. So the
+# gate's only real check was passed exclusively by tickers the model gets
+# reliably wrong, and any one of them was a single lucky second check away from
+# being graded WEAK and published as validated.
+#
+# Fixing it makes the board strictly MORE conservative - it can only remove
+# grades, never add them - which is why it was safe to do while every ticker is
+# being re-evaluated against the new absolute-return target anyway.
+#
+# An anti-signal is still REPORTED, in its own branch below, because "reliably
+# backwards" is worth a reader's attention and is not the same statement as
+# "indistinguishable from noise". It just does not count as a check passed.
 MIN_IC_TSTAT = 2.0
 MIN_HIT_RATE_EDGE_PP = 1.0     # percentage points above the majority baseline
 
@@ -109,9 +140,15 @@ def grade_evidence(state: dict) -> tuple[str, list[str]]:
 
     if ic_t is not None:
         checks += 1
-        if abs(ic_t) >= MIN_IC_TSTAT:
+        if ic_t >= MIN_IC_TSTAT:
             passed += 1
             reasons.append(f"Rank IC t-statistic {ic_t:+.2f} is distinguishable from noise.")
+        elif ic_t <= -MIN_IC_TSTAT:
+            reasons.append(
+                f"Rank IC t-statistic {ic_t:+.2f} is significantly NEGATIVE: the "
+                f"out-of-sample ranking is reliably backwards. That is a real "
+                f"measurement and it counts AGAINST this forecast, not for it."
+            )
         else:
             reasons.append(f"Rank IC t-statistic {ic_t:+.2f} is within noise.")
 
@@ -186,11 +223,17 @@ def _llm_review(state: dict, ticker: str) -> tuple[list[str], str]:
     if client is None:
         return [], "LLM review skipped (no API key configured)."
 
-    prompt = f"""You are reviewing the inputs to a 30-session relative-return forecast for an Indian (NSE) stock.
+    # THE QUANTITY NAMED HERE IS THE ONE P1 CHANGED. `pred_return` is the
+    # stock's OWN 30-session log return, not its distance from an index. The
+    # prompt used to call it an excess return, which asked the model to check a
+    # direction conflict against a number that means something else - and, like
+    # every other half of the rename, it would have failed by producing
+    # plausible prose rather than an error.
+    prompt = f"""You are reviewing the inputs to a 30-session absolute-return forecast for an Indian (NSE) stock.
 
 Stock: {state.get('company_name', ticker)} ({ticker})
-Benchmark: {state.get('benchmark_ticker')}
-Predicted excess return: {state.get('pred_return')}
+Sector benchmark, for context only - it is NOT subtracted from the forecast: {state.get('benchmark_ticker')}
+Predicted 30-session log return of the stock itself: {state.get('pred_return')}
 Calibrated probability the stock RISES (unconditional base rate on this universe is 0.577): {state.get('prob_up')}
 
 Signal snapshot:
@@ -201,7 +244,7 @@ Narrative: {state.get('signal_narrative', '')}
 Raise a flag ONLY where a specific, checkable contradiction is present:
 1. SIGNAL CONFLICT — RSI above 75 AND MACD histogram strongly negative, simultaneously.
 2. DIRECTION CONFLICT — the narrative describes clear momentum in the opposite
-   direction to the predicted excess return.
+   direction to the predicted return.
 3. THIN TRADING — OBV essentially flat across the window AND volume ROC near zero.
 4. STALE OR DEGENERATE INPUT — signal values that are constant, zero, or implausible.
 
@@ -219,7 +262,7 @@ Respond ONLY with JSON:
             model=model_name,
             temperature=0.2,
         )
-        raw = completion.choices[0].message.content.strip()
+        raw = strip_reasoning(completion.choices[0].message.content)
     except Exception as exc:                                   # noqa: BLE001
         return [], f"LLM review unavailable: {exc}"
 
