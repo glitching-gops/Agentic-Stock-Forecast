@@ -121,9 +121,38 @@ def _metadata() -> dict[str, dict[str, str]]:
     Cached for the process lifetime; call ``refresh_metadata()`` after a
     universe sync. Returns an empty dict if the table does not exist yet, so
     that importing this module never requires a populated database.
+
+    ONLY A MISSING TABLE OPENS THE SOFT PATH. This used to be a bare
+    ``except Exception: return {}`` — the same over-wide guard the Phase 0
+    outage audit removed from four API read paths, then found a fifth of in
+    ``api/routers/sentiment.py``. This was the sixth, and it is the worst
+    placed of them.
+
+    What made it worse than a 200-instead-of-503 is where the empty dict goes.
+    ``get_sector`` then returns "Unknown", ``get_benchmark`` finds no entry in
+    ``SECTOR_INDICES`` and hands back ``(BROAD_MARKET_INDEX, False)`` — so
+    **during a database outage every ticker in the universe silently gets
+    NIFTY 50 as its benchmark**. ``target_excess_return`` is the stock's return
+    MINUS its benchmark's, so a signals recompute in that state redefines the
+    label for the whole universe with no ``MODEL_VERSION`` bump. That is
+    exactly the "benchmark mapping is half the label" landmine, reached by an
+    outage rather than by an edit. ``_upsert_signals``'s F6 guard would not
+    catch it either: it counts labelled rows, and the rows are all still there
+    — just computed against the wrong index.
+
+    And ``lru_cache`` made it durable. A single transient failure at the first
+    call pins ``{}`` for the entire process, so every later lookup keeps
+    returning the fallback long after the database has recovered. Letting the
+    error propagate fixes that too, because ``lru_cache`` does not cache a
+    raised exception.
+
+    Observed live 2026-09-03: `psycopg2.OperationalError: connection to server
+    at "aws-1-ap-south-1.pooler.supabase.com", port 5432 failed: Connection
+    timed out`.
     """
+    from data.db import get_engine, is_missing_relation
+
     try:
-        from data.db import get_engine
         df = pd.read_sql(
             text("""
                 SELECT ticker, company, industry FROM index_membership
@@ -131,7 +160,9 @@ def _metadata() -> dict[str, dict[str, str]]:
             """),
             get_engine(),
         )
-    except Exception:
+    except Exception as exc:                                     # noqa: BLE001
+        if not is_missing_relation(exc):
+            raise
         return {}
 
     if df.empty:

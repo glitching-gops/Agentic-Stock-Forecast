@@ -553,6 +553,40 @@ def test_an_unresolved_company_name_is_detectable_before_the_requests():
     assert not company_name_is_unresolved("ABB.NS", "ABB India Ltd.")
 
 
+def test_the_remediation_names_the_right_cause_for_the_right_shape():
+    """
+    A WRONG REMEDIATION IS A REAL DEFECT, not a cosmetic one. The first version
+    of this message told the reader to run `refresh_metadata()` while the actual
+    cause was an unreachable database — they follow it, nothing changes, and
+    they have learned nothing. Same shape as `TimesFMUnavailable` sending a
+    Kaggle user to install requirements-series.txt, which would have replaced
+    the CUDA torch three successful runs had just used.
+
+    All 84 missing means empty-or-unreachable: check the CONNECTION first.
+    A handful missing means stale: re-sync membership.
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    from tools.backfill_news import unresolved_remediation
+
+    universe = [f"T{i}.NS" for i in range(84)]
+
+    whole = unresolved_remediation(universe, universe)
+    assert "UNREACHABLE" in whole
+    assert "get_engine().connect()" in whole, (
+        "when every ticker is affected the first thing to check is the "
+        "database connection, not the metadata cache")
+
+    partial = unresolved_remediation(universe[:3], universe)
+    assert "UNREACHABLE" not in partial
+    assert "get_engine().connect()" not in partial, (
+        "a few missing names is a stale table, not an outage — sending the "
+        "reader to check the connection wastes the one thing the message has"
+    )
+    assert "sync_current_membership" in partial
+
+
 def test_a_ticker_symbol_matches_on_case_because_the_word_does_not():
     """
     The alias list carries the bare symbol, and matching it case-insensitively

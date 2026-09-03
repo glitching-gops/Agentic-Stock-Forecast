@@ -72,6 +72,49 @@ MAX_BLOCK_RATE = 0.30
 RECENT_TICKERS = 3
 
 
+def unresolved_remediation(unresolved: list[str], tickers: list[str]) -> str:
+    """
+    What to tell the reader when `get_company` is handing back bare symbols.
+
+    THE REMEDIATION DEPENDS ON WHY, and the first version of this guessed. It
+    said "run refresh_metadata()" while the actual cause was an unreachable
+    database, which that call cannot help with — the reader follows it, watches
+    it change nothing, and learns nothing. Same class of mistake as
+    `TimesFMUnavailable` telling a Kaggle user to install
+    requirements-series.txt: confident, specific and wrong.
+
+    A few names missing means the table is populated but stale. EVERY name
+    missing means the table is empty or the database is not there, so the first
+    thing to check is the connection. `data.tickers._metadata` used to swallow
+    the connection error, which is what made the two indistinguishable from
+    here; that is fixed at the source, and this says which one it is.
+    """
+    head = (
+        f"\nREFUSING TO RUN: {len(unresolved)} of {len(tickers)} tickers have "
+        f"no company name, so `get_company` is\nreturning the bare symbol. The "
+        f"query would become the symbol and the archive would\ncome back "
+        f"near-empty for each, silently:\n"
+        f"  {', '.join(unresolved[:12])}"
+        f"{' ...' if len(unresolved) > 12 else ''}\n"
+    )
+    if len(unresolved) == len(tickers):
+        return head + (
+            "\nEVERY ticker is affected, which means the metadata table is "
+            "empty or UNREACHABLE\nrather than a few names being missing. In "
+            "order:\n"
+            "  1. Is the database up?   python -c \"from data.db import "
+            "get_engine; get_engine().connect()\"\n"
+            "  2. Populate membership:  python -c \"import data.universe as u; "
+            "u.sync_current_membership()\"\n"
+            "  3. Clear the cache:      python -c \"import data.tickers as t; "
+            "t.refresh_metadata()\"")
+    return head + (
+        "\nOnly some names are affected, so the table is populated but "
+        "incomplete. Re-sync\nmembership, then clear the cache:\n"
+        "  python -c \"import data.universe as u; u.sync_current_membership()\"\n"
+        "  python -c \"import data.tickers as t; t.refresh_metadata()\"")
+
+
 def _completed(engine, provider: str) -> set[tuple[str, str, str]]:
     """
     (ticker, start, end) triples already recorded ok — the resume point.
@@ -172,14 +215,15 @@ def main() -> int:
     # each and the tool reported success.
     unresolved = [t for t in tickers if company_name_is_unresolved(t, get_company(t))]
     if unresolved:
-        print(f"\nREFUSING TO RUN: {len(unresolved)} of {len(tickers)} tickers "
-              f"have no company name, so `get_company` is returning the bare\n"
-              f"symbol. The query would become the symbol and the archive would "
-              f"come back near-empty for each, silently:\n"
-              f"  {', '.join(unresolved[:12])}"
-              f"{' ...' if len(unresolved) > 12 else ''}\n\n"
-              f"Run this first:\n"
-              f"  python -c \"import data.tickers as t; t.refresh_metadata()\"")
+        # THE REMEDIATION DEPENDS ON WHY, and the first version of this message
+        # guessed. It told the reader to run `refresh_metadata()` when in fact
+        # the database was unreachable, which that call cannot help with — the
+        # same class of mistake as `TimesFMUnavailable` telling a Kaggle user to
+        # install requirements-series.txt. `_metadata()` used to swallow the
+        # connection error, so "no metadata" and "no database" were genuinely
+        # indistinguishable here; that is fixed at the source in data/tickers.py
+        # and this now says which one it is.
+        print(unresolved_remediation(unresolved, tickers))
         return 1
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()

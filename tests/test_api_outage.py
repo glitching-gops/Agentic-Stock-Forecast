@@ -156,6 +156,126 @@ def test_index_members_degrades_only_when_the_table_is_absent(tmp_path):
         "the test must be raising on the outage, not on a missing table")
 
 
+def test_an_outage_must_not_silently_repoint_every_benchmark(tmp_path):
+    """
+    THE SIXTH OVER-WIDE GUARD, and the worst placed of them.
+
+    `data.tickers._metadata()` caught every exception and returned `{}`. On a
+    fresh database that is correct — there is no `index_membership` until the
+    first sync. During an OUTAGE it is a different thing entirely, and the
+    empty dict does not stay local:
+
+        _metadata()   -> {}
+        get_sector()  -> "Unknown"
+        get_benchmark -> SECTOR_INDICES has no "Unknown" -> (^NSEI, False)
+
+    So every ticker in the universe silently gets NIFTY 50 as its benchmark.
+    `target_excess_return` is the stock's return MINUS its benchmark's, so a
+    signals recompute in that state redefines the label for the whole universe
+    with no MODEL_VERSION bump — the "benchmark mapping is half the label"
+    landmine, reached by an outage instead of by an edit. The F6 guard cannot
+    see it: it counts labelled rows, and every row is still labelled.
+
+    `lru_cache` made it durable, too — one transient failure at the first call
+    pinned `{}` for the whole process. Propagating fixes that as well, because
+    lru_cache does not cache a raised exception.
+
+    Observed live: `OperationalError: connection to server at
+    "aws-1-ap-south-1.pooler.supabase.com", port 5432 failed: Connection timed
+    out`.
+    """
+    import data.db as db
+    import data.tickers as tickers
+
+    # HDFCBANK is Financial Services, which the benchmark audit mapped to
+    # ^NSEI anyway — so it cannot show the defect. TCS is IT, which maps to
+    # ^CNXIT, and that is the one an outage would silently move.
+    healthy = create_engine("sqlite://")
+    with healthy.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE index_membership (
+                ticker TEXT, index_name TEXT, effective_from TEXT,
+                effective_to TEXT, company TEXT, industry TEXT, source TEXT)
+        """))
+        conn.execute(text(
+            "INSERT INTO index_membership VALUES "
+            "('TCS.NS','NIFTY 100','2016-01-01','9999-12-31',"
+            "'Tata Consultancy Services Ltd.','Information Technology','t')"))
+        conn.commit()
+
+    original = db.get_engine
+    try:
+        db.get_engine = lambda: healthy
+        tickers.refresh_metadata()
+        assert tickers.get_sector("TCS.NS") == "Information Technology"
+        healthy_benchmark = tickers.get_benchmark("TCS.NS")
+        assert healthy_benchmark == ("^CNXIT", True)
+
+        # Now the database goes away.
+        db.get_engine = lambda: _broken_engine(tmp_path)
+        tickers.refresh_metadata()
+
+        with pytest.raises(Exception) as outage:
+            tickers.get_benchmark("TCS.NS")
+    finally:
+        db.get_engine = original
+        tickers.refresh_metadata()
+
+    assert not is_missing_relation(outage.value), (
+        "the test must be raising on the outage, not on a missing table")
+
+    # And a genuinely fresh database must STILL fail soft, or a first-run
+    # deployment cannot boot.
+    try:
+        db.get_engine = lambda: create_engine("sqlite://")
+        tickers.refresh_metadata()
+        assert tickers.get_sector("TCS.NS") == "Unknown", (
+            "a database with no index_membership must degrade, not raise")
+    finally:
+        db.get_engine = original
+        tickers.refresh_metadata()
+
+
+def test_a_failed_metadata_load_is_not_cached_for_the_process(tmp_path):
+    """
+    `_metadata` is lru_cached, so a swallowed failure was pinned for the whole
+    process: every later lookup kept returning the fallback benchmark long
+    after the database had recovered. A raised exception is not cached, so the
+    next call retries — this asserts the recovery, not just the raise.
+    """
+    import data.db as db
+    import data.tickers as tickers
+
+    populated = create_engine("sqlite://")
+    with populated.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE index_membership (
+                ticker TEXT, index_name TEXT, effective_from TEXT,
+                effective_to TEXT, company TEXT, industry TEXT, source TEXT)
+        """))
+        conn.execute(text(
+            "INSERT INTO index_membership VALUES "
+            "('TCS.NS','NIFTY 100','2016-01-01','9999-12-31',"
+            "'Tata Consultancy Services Ltd.','Information Technology','t')"))
+        conn.commit()
+
+    original = db.get_engine
+    try:
+        db.get_engine = lambda: _broken_engine(tmp_path)
+        tickers.refresh_metadata()
+        with pytest.raises(Exception):
+            tickers.get_company("TCS.NS")
+
+        # The database comes back. WITHOUT clearing the cache.
+        db.get_engine = lambda: populated
+        assert tickers.get_company("TCS.NS") == "Tata Consultancy Services Ltd.", (
+            "the failure was cached, so recovery needs a manual cache clear "
+            "that nothing in production performs")
+    finally:
+        db.get_engine = original
+        tickers.refresh_metadata()
+
+
 # ── The forecast list: two guards, and the outage has to pass both ──────────
 
 def _call(engine, **kwargs):
