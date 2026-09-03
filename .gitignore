@@ -69,9 +69,17 @@ scheduler.lock
 .claude/settings.local.json
 *.doctor-backup
 
-# Generated model packages (LoRA export, probe embedding caches) — regenerable
-# from tools/export_lora_package.py and tools/run_probe.py, and large.
+# Generated model packages (LoRA export, probe embedding caches, the Kaggle
+# series package) — regenerable from tools/export_*_package.py and
+# tools/run_probe.py, and large.
 *.npz
+
+# Scored comparison output. The measurement itself belongs in experiment_runs
+# and in the commit message that reports it, which is how every earlier result
+# here was recorded; a JSON checked in beside them would be a second copy that
+# can disagree with the first.
+p2_*.json
+baselines_*.json
 
 # Serena MCP server's per-project cache and memories — machine-local, and it
 # re-derives itself from the source tree on demand.
