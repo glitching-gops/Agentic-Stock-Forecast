@@ -190,6 +190,13 @@ def load_panel(
 
     panel = _attach_macro(panel, engine)
 
+    # News and regime are NOT attached here. Both are OPTIONAL enrichments
+    # measured against the same folds as everything else, and `load_panel` is
+    # the loader every existing result was produced from — silently widening it
+    # would change `data_hash` for every comparator at once and make the tables
+    # in CLAUDE.md incomparable with anything measured afterwards. Callers ask
+    # for them explicitly via `attach_news` / `attach_regime`.
+
     for col in FEATURES:
         panel[col] = pd.to_numeric(panel[col], errors="coerce")
         panel[col] = panel[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -244,6 +251,50 @@ def _attach_macro(panel: pd.DataFrame, engine) -> pd.DataFrame:
     aligned.index.name = "date"
 
     return panel.merge(aligned.reset_index(), on="date", how="left")
+
+
+def attach_news(panel: pd.DataFrame, engine=None,
+                scorer_id: str | None = None) -> pd.DataFrame:
+    """
+    Joins point-in-time news features onto the panel, LEFT.
+
+    A left join on purpose: a (date, ticker) with no news row keeps every other
+    column and gets NULL here. An inner join would silently restrict the panel
+    to the rows news happens to cover, which is ~a third of it and is
+    concentrated in the recent period — the same shape as the valuation
+    experiment, where a sweep that changed the row count was read as a trend
+    until it was re-run on a fixed sample.
+    """
+    from pipeline.news_features import NEWS_COLS, build_news_features
+
+    if panel.empty:
+        return panel
+    features = build_news_features(panel, engine=engine, scorer_id=scorer_id)
+    if features.empty:
+        for col in NEWS_COLS:
+            panel[col] = np.nan
+        return panel
+    return panel.merge(features, on=["date", "ticker"], how="left")
+
+
+def attach_regime(panel: pd.DataFrame, engine=None) -> pd.DataFrame:
+    """
+    Joins beta x regime interactions onto the panel, LEFT.
+
+    Only the interactions. The market-state columns themselves are identically
+    zero after `cross_sectional_zscore` and would be dead weight in exactly the
+    way `fii_net_flow` was — see pipeline/regime.py.
+    """
+    from pipeline.regime import REGIME_INTERACTIONS, build_regime_features
+
+    if panel.empty:
+        return panel
+    features = build_regime_features(panel, engine=engine)
+    if features.empty:
+        for col in REGIME_INTERACTIONS:
+            panel[col] = np.nan
+        return panel
+    return panel.merge(features, on=["date", "ticker"], how="left")
 
 
 def cross_sectional_zscore(

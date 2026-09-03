@@ -33,6 +33,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # The news scorer only. CPU wheels, ~200MB, and NOT in requirements.txt —
+      # that file is installed by Render and by the daily job, neither of which
+      # scores anything, and torch was removed in Phase 0 as the largest
+      # contributor to memory pressure on an instance already OOM-killed once.
+      # `continue-on-error` because a scorer that will not install must cost a
+      # recorded skip, not an hour of persisted per-ticker evaluation.
+      - name: Install news-scoring extras
+        continue-on-error: true
+        run: pip install -r requirements-scoring.txt
+
       - name: Restore tuned hyperparameters cache
         uses: actions/cache/restore@v4
         with:

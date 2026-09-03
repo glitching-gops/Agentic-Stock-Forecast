@@ -60,6 +60,8 @@ from pipeline.evaluation import (PurgedPanelWalkForward, oos_dates,
                                  panel_walk_forward)
 from pipeline.panel import (
     EXCESS_TARGET,
+    attach_news,
+    attach_regime,
     MIN_NAMES_PER_DATE,
     SCALE_FREE,
     TARGET,
@@ -442,6 +444,53 @@ class LinearFactorModel:
         return dict(zip(self.used_, (float(c) for c in self.model_.coef_)))
 
 
+class NewsAugmentedFactor(LinearFactorModel):
+    """
+    The technical factor set PLUS the news columns, fitted the same way.
+
+    A SUBCLASS AND NOT A FLAG, so the base comparator's columns are untouched
+    and the two rows in the table differ by exactly one thing. `LinearFactorModel`
+    reads `self.columns`, NOT `X` — passing extra columns through `feature_cols`
+    alone silently does nothing, which is how a `linear_factor+val` row once came
+    out identical to `linear_factor` to five decimal places and read as
+    "valuation does not help" rather than "valuation was never supplied". The
+    extra columns therefore reach the CONSTRUCTOR here.
+
+    NULL IS NOT ZERO, AND FILLING IT IS THE WHOLE PROBLEM. A row with no news
+    has no measurement; `LinearFactorModel.fit` fills NaN with 0.0, which for a
+    signed sentiment score means "measured as neutral". So the news columns are
+    accompanied by `news_observed`, an explicit indicator, and the model can
+    learn that the zero is a placeholder rather than a reading. Without it, the
+    early panel — where coverage is ~1 article per ticker-month — would be
+    training the model that the market was permanently neutral before 2022.
+    """
+
+    name = "news_factor"
+
+    def __init__(self, alpha: float = 1.0, columns: list[str] | None = None) -> None:
+        from pipeline.news_features import NEWS_COLS
+        cols = list(columns) if columns else list(FACTORS) + list(NEWS_COLS) + ["news_observed"]
+        super().__init__(alpha=alpha, columns=cols)
+
+
+class RegimeAugmentedFactor(LinearFactorModel):
+    """
+    The technical factor set PLUS the beta x regime interactions.
+
+    Only interactions, never the market state itself: every ticker sees the
+    same market on a date, so a bare regime column is identically zero after
+    `cross_sectional_zscore` and carries no ranking information. That is not a
+    theory — `fii_net_flow` sat in FEATURES for years being exactly that.
+    """
+
+    name = "regime_factor"
+
+    def __init__(self, alpha: float = 1.0, columns: list[str] | None = None) -> None:
+        from pipeline.regime import REGIME_INTERACTIONS
+        cols = list(columns) if columns else list(FACTORS) + list(REGIME_INTERACTIONS)
+        super().__init__(alpha=alpha, columns=cols)
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 # What every Phase 2 result is reported against. Ordered from least to most
@@ -458,6 +507,8 @@ BASELINES: dict[str, callable] = {
     "momentum_20d":  lambda: SingleFactor("sector_rel_20d"),
     "reversal_5d":   lambda: SingleFactor("lag5_ret"),
     "linear_factor": LinearFactorModel,
+    "news_factor":   NewsAugmentedFactor,
+    "regime_factor": RegimeAugmentedFactor,
 }
 
 #: What a comparator has to beat before its number means anything. NOT `zero`.
@@ -498,6 +549,12 @@ def baseline_feature_columns(name: str) -> list[str]:
     """
     if name == "linear_factor":
         return list(FACTORS)
+    if name == "news_factor":
+        from pipeline.news_features import NEWS_COLS
+        return list(FACTORS) + list(NEWS_COLS) + ["news_observed"]
+    if name == "regime_factor":
+        from pipeline.regime import REGIME_INTERACTIONS
+        return list(FACTORS) + list(REGIME_INTERACTIONS)
     if name.startswith("momentum"):
         return ["sector_rel_20d"]
     if name.startswith("reversal"):
@@ -725,6 +782,8 @@ def compare_baselines(
     rebalance_only: bool = False,
     horizon: int = HORIZON_SESSIONS,
     with_fundamentals: bool = False,
+    with_news: bool = False,
+    with_regime: bool = False,
     on_result=None,
     max_tickers: int | None = None,
     allow_thin: bool = False,
@@ -802,11 +861,42 @@ def compare_baselines(
             f"panel restricted to {len(panel):,} rows from "
             f"{panel['date'].min()}")
 
+    # NEWS AND REGIME DO NOT RESTRICT THE PANEL, and that is the opposite of
+    # what `with_fundamentals` does above. Valuation is either present for a row
+    # or the row cannot be scored on it, so restricting is correct there. News
+    # coverage instead GROWS WITH TIME - measured, ~1 article per ticker-month
+    # in 2016 against ~7 in 2024 - so restricting to covered rows would silently
+    # delete the early panel and leave a comparison run entirely on the recent
+    # period. That is the valuation post-mortem's lesson stated forwards: a
+    # sweep that changes the row count measures two things at once.
+    extra_cols: list[str] = []
+    if with_news:
+        from pipeline.news_features import NEWS_COLS
+        panel = attach_news(panel, engine)
+        # AN EXPLICIT "WE LOOKED" INDICATOR. The model fills NaN with 0.0, and
+        # for a signed sentiment score 0.0 means "measured as neutral" — so
+        # without this the early panel would teach it that the market was
+        # permanently neutral before 2022. Same None-vs-0.0 rule that made
+        # get_aggregate_sentiment return None.
+        #
+        # Derived from the COUNT column, not the sentiment column. A window we
+        # searched that happened to be quiet has a count and no sentiment;
+        # keying this on sentiment would file it under "never looked" and throw
+        # away the very distinction `news_coverage` exists to preserve.
+        panel["news_observed"] = panel["news_count_excess"].notna().astype(float)
+        extra_cols += list(NEWS_COLS)
+        covered = float(panel["news_sent_mean"].notna().mean())
+        logger.info(f"[Baselines] news covers {covered:.1%} of panel rows")
+    if with_regime:
+        from pipeline.regime import REGIME_INTERACTIONS
+        panel = attach_regime(panel, engine)
+        extra_cols += list(REGIME_INTERACTIONS)
+
     if max_tickers:
         counts = panel.groupby("ticker")["date"].count().sort_values(ascending=False)
         panel = panel[panel["ticker"].isin(counts.head(max_tickers).index)]
 
-    panel = cross_sectional_zscore(panel, SCALE_FREE + fundamental_cols)
+    panel = cross_sectional_zscore(panel, SCALE_FREE + fundamental_cols + extra_cols)
     coverage = panel_coverage(panel)
 
     if coverage["median_names_per_date"] < MIN_NAMES_PER_DATE and not allow_thin:

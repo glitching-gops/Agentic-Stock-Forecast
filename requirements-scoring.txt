@@ -1,0 +1,14 @@
+# Installed ONLY by the news-scoring step of weekly-evaluation.yml.
+#
+# torch must never enter requirements.txt: that file is installed by Render, by
+# the daily pipeline and by the weekly evaluation itself, none of which call the
+# scorer, and torch was removed in Phase 0 as the largest contributor to memory
+# pressure on an instance that had already been OOM-killed.
+#
+# CPU wheels on purpose. A GitHub runner has no GPU, and the CPU index keeps the
+# download ~200MB instead of ~2.5GB. NOTE: installing this file on a workstation
+# DOWNGRADES a CUDA build to +cpu, exactly as requirements-series.txt does — run
+# the scorer locally against your existing torch instead of installing this.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.6.0
+transformers==5.5.4

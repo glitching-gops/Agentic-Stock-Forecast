@@ -209,6 +209,43 @@ def _deserves_a_written_narrative(ticker: str, updates: dict) -> bool:
     return ticker in _narrative_sample()
 
 
+NARRATIVE_HEADLINES = int(os.getenv("NARRATIVE_HEADLINES", "6"))
+
+
+def _recent_headlines(ticker: str, limit: int | None = None) -> list[dict]:
+    """
+    The most recent dated headlines for a ticker, newest first.
+
+    Ordered by the ARTICLE'S OWN publication date, which is the whole point of
+    the P3a rewrite: the previous store stamped every headline with the fetch
+    date, so "recent" meant "recently retrieved" and returned stories up to 246
+    days old presented as today's news.
+
+    Read-only and non-fatal. A narrative is worth writing without news; a
+    missing table or an unreachable database must not cost the forecast.
+    """
+    from sqlalchemy import text as _text
+
+    from data.db import get_engine, is_missing_relation
+
+    try:
+        with get_engine().connect() as conn:
+            rows = conn.execute(_text("""
+                SELECT a.published_at, a.title, a.source
+                FROM news_articles a
+                JOIN news_mentions m ON m.article_id = a.article_id
+                WHERE m.ticker = :t
+                ORDER BY a.published_at DESC
+                LIMIT :n
+            """), {"t": ticker, "n": limit or NARRATIVE_HEADLINES}).fetchall()
+    except Exception as exc:                                    # noqa: BLE001
+        if not is_missing_relation(exc):
+            print(f"[{ticker}] headline lookup failed: {exc}")
+        return []
+    return [{"published_at": str(r[0])[:10], "title": r[1], "source": r[2] or "?"}
+            for r in rows]
+
+
 def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     """
     Asks the LLM for a plain-English read of the signals.
@@ -229,6 +266,20 @@ def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
                  "sector_rel_5d", "sector_rel_20d", "close"}
     }
 
+    # HEADLINES, DATED AND ATTRIBUTED, BUT DELIBERATELY UNSCORED.
+    #
+    # They reach a READER here, not the model. Sentiment is not a feature and
+    # will not be one until it can be measured inside a purged fold, so what
+    # this adds is evidence a person can check — a publisher and a date — and
+    # not a number the narrative can lean on. Presenting an unscored headline
+    # as context is honest; presenting a sentiment gauge that was never
+    # computed is the defect this project was audited over.
+    headlines = _recent_headlines(ticker)
+    news_block = (
+        "\n".join(f"- {h['published_at']} ({h['source']}): {h['title']}"
+                  for h in headlines)
+        if headlines else "No headlines recorded in this window.")
+
     prompt = f"""You are a quantitative analyst summarising technical signals for an Indian (NSE) stock.
 
 Stock: {state.get('company_name', ticker)} ({ticker})
@@ -236,8 +287,13 @@ Benchmark: {updates.get('benchmark_ticker')}
 Latest signal values:
 {interesting}
 
+Recent headlines (dated, unscored — context only, NOT model inputs):
+{news_block}
+
 Write exactly 3 sentences describing what these signals collectively suggest about
 near-term momentum relative to the benchmark. Reference specific signals by name and value.
+You may mention a headline ONLY as reported context, and only if you name its date;
+the model did not see any of them, so never present news as a reason for the forecast.
 Do not state a price target, a percentage move, or a buy/sell recommendation."""
 
     # The router handles model choice, the fallback chain and the empty-after-

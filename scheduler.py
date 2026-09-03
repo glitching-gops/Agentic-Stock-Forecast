@@ -543,6 +543,50 @@ def run_weekly_evaluation_job():
         valuation_metrics = {"note": f"comparison raised: {str(exc)[:300]}",
                              "comparators": []}
 
+    # SCORING RUNS HERE AND NOWHERE ELSE, so one checkpoint scores the archive
+    # and the live tail alike. Splitting them across two venues or two models
+    # is F7 in a new costume - the historical feature and the published feature
+    # would be different quantities, and nothing measured in a purged fold
+    # would describe what a reader sees.
+    #
+    # Non-fatal and lazily imported: torch is absent from requirements.txt on
+    # purpose, so a runner that has not installed requirements-scoring.txt gets
+    # a recorded skip rather than a failed weekly evaluation.
+    scoring_metrics: dict = {}
+    try:
+        from pipeline.news_scoring import ScorerUnavailable, score_unscored
+
+        try:
+            scoring = score_unscored()
+            scoring_metrics = {"scored": scoring.scored,
+                               "scorer_id": scoring.scorer_id,
+                               "device": scoring.device,
+                               "seconds": round(scoring.seconds, 1)}
+            logger.info(f"[Scheduler] news scoring: {scoring.summary()}")
+        except ScorerUnavailable as exc:
+            scoring_metrics = {"note": f"scorer unavailable: {str(exc)[:200]}"}
+            logger.warning(f"[Scheduler] news scoring skipped: {exc}")
+    except Exception as exc:                                        # noqa: BLE001
+        scoring_metrics = {"note": f"scoring raised: {str(exc)[:300]}"}
+        logger.error(f"[Scheduler] News scoring failed: {exc}")
+
+    # THE NEWS AND REGIME COMPARISONS ARE RECORDED SEPARATELY from the headline
+    # table, for the same reason `baselines_valuation` is: they change the
+    # feature set, so folding them into `baselines` would make the weekly
+    # number describe a different model week to week with nothing saying so.
+    enriched_metrics: dict = {}
+    try:
+        from pipeline.baselines import compare_baselines
+
+        enriched = compare_baselines(tickers=universe, with_news=True,
+                                     with_regime=True)
+        enriched_metrics = enriched.to_metrics()
+        logger.info(f"[Scheduler] news+regime: {enriched.summary()}")
+    except Exception as exc:                                        # noqa: BLE001
+        logger.error(f"[Scheduler] News/regime comparison failed: {exc}")
+        enriched_metrics = {"note": f"comparison raised: {str(exc)[:300]}",
+                            "comparators": []}
+
     finish_run(run_id, "OK", gate=gate, metrics={
         "tickers_evaluated": len(results),
         "tickers_in_universe": len(universe),
@@ -551,7 +595,9 @@ def run_weekly_evaluation_job():
         "signals_refused": signals_report.refused,
         "baselines": baseline_metrics,
         "baselines_valuation": valuation_metrics,
+        "baselines_news_regime": enriched_metrics,
         "fundamentals": fundamentals_metrics,
+        "news_scoring": scoring_metrics,
     })
 
 
