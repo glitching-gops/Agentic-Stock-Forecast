@@ -38,7 +38,14 @@ import re
 
 from dotenv import load_dotenv
 
-from agents.llm import DEFAULT_GROQ_MODEL, groq_client, strip_reasoning
+from agents.llm import (
+    DEFAULT_GROQ_MODEL,
+    NoRouteAvailable,
+    complete,
+    extract_json,
+    groq_client,
+    strip_reasoning,
+)
 from agents.state import EVIDENCE_MULTIPLIER, AgentState
 
 load_dotenv(override=True)
@@ -219,9 +226,6 @@ def _llm_review(state: dict, ticker: str) -> tuple[list[str], str]:
     Returns ``(flags, reasoning)``. Failure returns no flags rather than a
     default verdict, so an API outage cannot silently change a stock's grade.
     """
-    client = _groq_client()
-    if client is None:
-        return [], "LLM review skipped (no API key configured)."
 
     # THE QUANTITY NAMED HERE IS THE ONE P1 CHANGED. `pred_return` is the
     # stock's OWN 30-session log return, not its distance from an index. The
@@ -254,30 +258,42 @@ Do not comment on whether the model is accurate; you have no way to verify that.
 Respond ONLY with JSON:
 {{"flags": ["..."], "reasoning": "2-3 sentences"}}"""
 
-    model_name = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-
+    # THE SCHEMA IS THE POINT, not a nicety. This function `json.loads()` the
+    # model's content, and a parse failure records NO FLAGS - which from the
+    # outside is indistinguishable from a clean review that found nothing
+    # wrong. A silent failure that reads as a pass. Handing the route a schema
+    # makes the malformed answer unconstructable on a model that supports one,
+    # and `extract_json` still returns None rather than {} on a fallback route
+    # that does not, so the two states stay distinguishable either way.
     try:
-        completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=model_name,
-            temperature=0.2,
+        completion = complete(
+            "critic", prompt, temperature=0.2,
+            schema={
+                "type": "object",
+                "properties": {
+                    "flags": {"type": "array", "items": {"type": "string"}},
+                    "reasoning": {"type": "string"},
+                },
+                "required": ["flags", "reasoning"],
+                "additionalProperties": False,
+            },
         )
-        raw = strip_reasoning(completion.choices[0].message.content)
-    except Exception as exc:                                   # noqa: BLE001
+    except NoRouteAvailable as exc:
         return [], f"LLM review unavailable: {exc}"
 
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    raw = re.sub(r"\s*```$", "", raw)
-
-    try:
-        parsed = json.loads(raw.strip())
-    except json.JSONDecodeError:
-        return [], "LLM response was not valid JSON; no flags recorded."
+    parsed = extract_json(completion.text)
+    if parsed is None:
+        # NOT the same as "no flags found", and it must not read that way in
+        # the record. The model that produced it is named so a recurring
+        # offender is visible rather than averaged away.
+        return [], (f"LLM response from {completion.source} was not valid "
+                    f"JSON; no flags recorded.")
 
     flags = parsed.get("flags", [])
     if not isinstance(flags, list):
         flags = []
-    return [str(f) for f in flags], str(parsed.get("reasoning", ""))
+    reasoning = str(parsed.get("reasoning", ""))
+    return [str(f) for f in flags], f"{reasoning} [{completion.source}]".strip()
 
 
 def critic_node(state: AgentState) -> dict:

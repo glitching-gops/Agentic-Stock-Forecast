@@ -31,7 +31,13 @@ import os
 import time
 from datetime import date
 
-from agents.llm import DEFAULT_GROQ_MODEL, groq_client, strip_reasoning
+from agents.llm import (
+    DEFAULT_GROQ_MODEL,
+    NoRouteAvailable,
+    complete,
+    groq_client,
+    strip_reasoning,
+)
 from agents.state import AgentState
 from pipeline.model import forecast_ticker_daily
 
@@ -216,10 +222,6 @@ def _narrative(state: AgentState, ticker: str, updates: dict) -> str:
     if not _deserves_a_written_narrative(ticker, updates):
         return _rule_based_narrative(ticker, signals)
 
-    client = _groq_client()
-    if client is None:
-        return _rule_based_narrative(ticker, signals)
-
     interesting = {
         k: v for k, v in signals.items()
         if k in {"rsi", "macd_hist", "bb_width", "atr_14", "stoch_k", "williams_r",
@@ -238,24 +240,15 @@ Write exactly 3 sentences describing what these signals collectively suggest abo
 near-term momentum relative to the benchmark. Reference specific signals by name and value.
 Do not state a price target, a percentage move, or a buy/sell recommendation."""
 
-    model_name = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
-
+    # The router handles model choice, the fallback chain and the empty-after-
+    # stripping case; the retry stays here because a 429 is a PACING problem
+    # rather than a broken route, and falling through to the next model on one
+    # would spend a scarcer budget to work around a limit that clears in a
+    # second. See agents/llm.py for which provider carries this task and why.
     for attempt in range(2):
         try:
-            completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=model_name,
-                temperature=0.3,
-            )
-            written = strip_reasoning(completion.choices[0].message.content)
-            if written:
-                return written
-            # An empty answer after stripping means the model spent the whole
-            # response reasoning. Fall through to the deterministic narrative
-            # rather than publishing a blank one.
-            print(f"[{ticker}] narrative was empty after stripping reasoning")
-            break
-        except Exception as exc:                               # noqa: BLE001
+            return complete("narrative", prompt, temperature=0.3).text
+        except NoRouteAvailable as exc:
             if "429" in str(exc) and attempt == 0:
                 time.sleep(2)
                 continue

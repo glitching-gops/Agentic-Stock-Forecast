@@ -98,8 +98,9 @@ def run_pipeline_job():
         from pipeline.fetch import fetch_and_store
         from pipeline.outcomes import resolve_due_forecasts
         from pipeline.signals import compute_and_store, count_labelled_rows
-        from pipeline.sentiment import fetch_and_score
+        from pipeline.news import fetch_recent
         from pipeline.macro import fetch_and_store as fetch_macro
+        from agents.llm import preflight as llm_preflight
         from pipeline.tracking import finish_run, start_run
         from pipeline.validation import FAIL, run_gate
         from agents.graph import prune_forecast_current, run_graph
@@ -195,9 +196,43 @@ def run_pipeline_job():
                 f"{'; '.join(c.detail for c in gate.failures)}"
             )
 
-        logger.info("[6/8] Fetching news sentiment and macro data...")
-        fetch_and_score(tickers=universe)
+        logger.info("[6/8] Fetching news and macro data...")
+        news_totals = fetch_recent(universe)
+        logger.info(f"[6/8] News: {news_totals}")
         fetch_macro()
+
+        # A LOUD WARNING, NOT AN ABORT. A blocked news fetch degrades the
+        # written narrative; it does not corrupt anything published, so the
+        # "a job that writes nothing must raise" rule does not apply. But it
+        # must not be invisible either: two days in August stored the "no news"
+        # placeholder for every ticker and nothing anywhere said the fetch had
+        # been refused.
+        if news_totals.get("blocked"):
+            logger.warning(
+                f"[6/8] {news_totals['blocked']} news windows were BLOCKED. "
+                f"Those are gaps in the archive, not quiet days — "
+                f"news_coverage records which.")
+
+        # THE MODELS ARE CHECKED BEFORE THE TICKER LOOP, NOT DURING IT.
+        # `llama-3.1-8b-instant` was decommissioned under this project and
+        # 404'd every call for days while the job reported OK. OpenRouter is
+        # more exposed still: its free lineup rotates. Two seconds here answers
+        # what ninety-five failures otherwise answer an hour later.
+        try:
+            flight = llm_preflight()
+            for row in flight["routes"]:
+                if not row["status"].startswith(("ok", "configured")):
+                    logger.warning(f"[6/8] LLM route {row['task']} "
+                                   f"{row['provider']}:{row['model']} — {row['status']}")
+            if flight["dead_tasks"]:
+                logger.warning(f"[6/8] LLM tasks with NO usable route: "
+                               f"{flight['dead_tasks']} — those degrade to the "
+                               f"deterministic path")
+            logger.info(f"[6/8] OpenRouter budget {flight['openrouter_daily_budget']}, "
+                        f"reasoning tier needs ~"
+                        f"{flight['reasoning_calls_per_day_estimate']}/day")
+        except Exception as exc:                                # noqa: BLE001
+            logger.warning(f"[6/8] LLM preflight failed: {exc}")
 
         logger.info(f"[7/8] Forecasting {len(universe)} tickers "
                    f"(cached hyperparameters, no search)...")

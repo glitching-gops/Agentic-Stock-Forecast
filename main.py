@@ -55,7 +55,7 @@ if __name__ == "__main__":
               "(this takes a while)...")
         from pipeline.fetch import fetch_and_store
         from pipeline.macro import fetch_and_store as fetch_macro
-        from pipeline.sentiment import fetch_and_score
+        from pipeline.news import fetch_recent
         from pipeline.signals import compute_and_store
         from agents.graph import run_graph
 
@@ -68,7 +68,11 @@ if __name__ == "__main__":
         print(f"      Frozen forecasting universe: {len(universe)}")
 
         compute_and_store(tickers=universe)
-        fetch_and_score(tickers=universe)
+        # A trailing window dated by PUBLICATION, not by fetch. The old call
+        # here seeded a fresh checkout with headlines stamped `today` that were
+        # up to 246 days old — see pipeline/news.py. For real history run
+        # tools/backfill_news.py; this only primes the recent tail.
+        fetch_recent(universe)
 
         # run_graph(), not pipeline.model.train_and_forecast(): only run_graph
         # (via its critic node) populates forecasts/forecast_current. See

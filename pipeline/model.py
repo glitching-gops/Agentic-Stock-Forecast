@@ -72,11 +72,23 @@ from pipeline.tuning import tune, tune_and_cache
 MODEL_VERSION = "rebuild-absolute-return-v3"
 
 FEATURES = FEATURE_COLS + [
-    # Macro. `fii_net_flow` / `dii_net_flow` were scraped and stored by
-    # macro.py but never referenced by the old FEATURES list; they are wired
-    # in here rather than left as dead columns (audit finding F15).
+    # Macro.
+    #
+    # `fii_net_flow` / `dii_net_flow` ARE GONE, and the comment that used to sit
+    # here is why they have to be. It read: "scraped and stored by macro.py but
+    # never referenced by the old FEATURES list; they are wired in here rather
+    # than left as dead columns (audit finding F15)". Measured 2026-09-03, both
+    # held exactly ONE distinct value across all 2,601 macro rows — 0.0, in
+    # every year from 2016 — because the NSE parser read field names the
+    # endpoint does not serve and defaulted to "0". The F15 fix wired in two
+    # zeros, and every per-ticker model since has been fitted on them.
+    #
+    # The parser is fixed and real flows now accumulate in `market_flows`. They
+    # do NOT come back here yet: a column that is zero until 2026-09 and real
+    # afterwards is a structural break in the middle of a feature, which is how
+    # the early-fold artifacts this project has seen three times get made. They
+    # return when there is enough history to be measured across a purged fold.
     "usdinr", "india_vix", "nifty_5d_return", "nifty_20d_return",
-    "fii_net_flow", "dii_net_flow",
 ]
 
 #: What the per-ticker model predicts: the ABSOLUTE 30-session log return.
@@ -158,7 +170,7 @@ def load_features_for_ticker(ticker: str, engine=None) -> pd.DataFrame:
 
     if macro.empty:
         for col in ["usdinr", "india_vix", "nifty_5d_return",
-                    "nifty_20d_return", "fii_net_flow", "dii_net_flow"]:
+                    "nifty_20d_return"]:
             signals[col] = 0.0
         df = signals
     else:

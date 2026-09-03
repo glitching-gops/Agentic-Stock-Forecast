@@ -195,8 +195,98 @@ def test_feature_names_match_between_training_and_serving():
     from pipeline.signals import FEATURE_COLS
 
     macro_features = {"usdinr", "india_vix", "nifty_5d_return",
-                      "nifty_20d_return", "fii_net_flow", "dii_net_flow"}
+                      "nifty_20d_return"}
     assert set(FEATURES) == set(FEATURE_COLS) | macro_features
+
+
+def test_the_two_flow_columns_that_were_always_zero_are_out_of_every_model():
+    """
+    `fii_net_flow` / `dii_net_flow` held ONE distinct value across all 2,601
+    macro rows — 0.0, in every year from 2016 — because the NSE parser read
+    field names the endpoint does not serve and defaulted to "0". They were in
+    both feature lists the whole time, under a comment claiming they had been
+    wired in "rather than left as dead columns (audit finding F15)".
+
+    They stay out until there is real history behind them. Re-adding them the
+    day the parser started working would put a structural break in the middle
+    of a feature — constant until 2026-09, real after — which is precisely how
+    an early-fold artifact gets manufactured.
+    """
+    from pipeline.model import FEATURES
+    from pipeline.panel import FEATURES as PANEL_FEATURES, MACRO_COLS
+
+    dead = {"fii_net_flow", "dii_net_flow"}
+    assert not dead & set(FEATURES)
+    assert not dead & set(MACRO_COLS)
+    assert not dead & set(PANEL_FEATURES)
+
+
+def test_the_flow_parser_reads_the_fields_nse_actually_serves():
+    """
+    NSE returns two ROWS discriminated by `category`, with the figure in
+    `netValue` — not `fiiNetFlow`/`diiNetFlow` keys on one row. The old parser
+    read the latter with a "0" default, so it never raised and never worked.
+    """
+    from pipeline.macro import parse_fii_dii
+
+    payload = [
+        {"category": "DII", "date": "02-Sep-2026", "netValue": "2,812.98",
+         "buyValue": "17639.89", "sellValue": "14826.91"},
+        {"category": "FII/FPI", "date": "02-Sep-2026", "netValue": "6688.37",
+         "buyValue": "26715.88", "sellValue": "20027.51"},
+    ]
+    row = parse_fii_dii(payload)
+    assert row["date"] == "2026-09-02"
+    assert row["fii_net"] == 6688.37
+    assert row["dii_net"] == 2812.98          # comma survives the parse
+    assert row["fii_buy"] == 26715.88
+
+    # THE DEFECT ITSELF: the shape the old parser expected must not silently
+    # yield a row of zeros. It has no category, so it yields nothing at all.
+    assert parse_fii_dii([{"date": "02-Sep-2026", "fiiNetFlow": "6688.37",
+                           "diiNetFlow": "2812.98"}]) is None
+
+    # Half a reading is not a reading. One side present must not default the
+    # other to zero, which is the failure that ran for the life of the project.
+    assert parse_fii_dii([payload[0]]) is None
+
+
+def test_a_flow_row_for_the_wrong_date_is_refused():
+    """
+    NSE accepts `?date=` and IGNORES it — measured 2026-09-03, a request for
+    01-Sep-2026 returned 02-Sep-2026. A backfill loop would therefore write the
+    latest session's flows across ten years of history with nothing raising.
+    """
+    import pipeline.macro as macro
+
+    payload = [
+        {"category": "DII", "date": "02-Sep-2026", "netValue": "2812.98"},
+        {"category": "FII/FPI", "date": "02-Sep-2026", "netValue": "6688.37"},
+    ]
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return payload
+
+    class _Session:
+        def get(self, *a, **k): return _Resp()
+
+    # `fetch_fii_dii_flows` does `import requests` INSIDE the function, so the
+    # only seam is sys.modules. Keep the real module object and put it back —
+    # rebuilding it with import_module() would just hand back the stub, and the
+    # first version of this test did exactly that and broke sixteen unrelated
+    # tests in files it never touched. Same shape as the _chronos_usable()
+    # landmine: a module-scope side effect from one test is a suite-wide defect.
+    import sys, types
+
+    real = sys.modules["requests"]
+    sys.modules["requests"] = types.SimpleNamespace(Session=lambda: _Session())
+    try:
+        assert macro.fetch_fii_dii_flows(expected_date="2026-09-01") is None
+        assert macro.fetch_fii_dii_flows(expected_date="2026-09-02") is not None
+        assert macro.fetch_fii_dii_flows() is not None
+    finally:
+        sys.modules["requests"] = real
 
 
 # ── F11 / F12: adjustment consistency and no backward fill ────────────────────
@@ -1461,31 +1551,30 @@ def test_a_reasoning_model_cannot_publish_its_own_working():
     # the shape a reasoning model actually returns must still yield its flags.
     payload = json.dumps({"flags": ["SIGNAL CONFLICT"], "reasoning": "rsi high"})
 
-    class _Reasoner:
-        class chat:
-            class completions:
-                @staticmethod
-                def create(**kwargs):
-                    class _M:
-                        content = ("<think>Let me check the RSI first.</think>\n"
-                                   "```json\n" + payload + "\n```")
-                    class _C:
-                        message = _M()
-                    class _R:
-                        choices = [_C()]
-                    return _R()
+    # Stubbed at the PROVIDER seam rather than at the client, so the whole
+    # router path runs: route selection, strip_reasoning, then extract_json.
+    # Patching `complete` itself would test nothing but the stub.
+    import agents.llm as llm
 
-    import agents.critic_agent as ca
-    original = ca._groq_client
-    ca._groq_client = lambda: _Reasoner()
+    original = llm._CALLERS
+    llm._CALLERS = {
+        p: (lambda route, prompt, temperature, schema, timeout:
+            "<think>Let me check the RSI first.</think>\n"
+            "```json\n" + payload + "\n```")
+        for p in original
+    }
     try:
         flags, reasoning = _llm_review({"ticker": "ABB.NS"}, "ABB.NS")
     finally:
-        ca._groq_client = original
+        llm._CALLERS = original
 
     assert flags == ["SIGNAL CONFLICT"], \
         "an inline reasoning block must not silently cost the review its flags"
-    assert reasoning == "rsi high"
+    assert reasoning.startswith("rsi high")
+    # The review carries WHICH MODEL produced it. Without that, swapping a
+    # model silently changes what reaches the board and nothing on record says
+    # so — the same defect as an unversioned MODEL_VERSION.
+    assert "openrouter:" in reasoning or "groq:" in reasoning
 
 
 def test_the_critic_is_told_which_quantity_it_is_reviewing():
@@ -2228,9 +2317,10 @@ def _stub_daily(monkeypatch, **overrides):
     import data.universe
     import pipeline.corporate_actions
     import pipeline.fetch
+    import agents.llm
     import pipeline.macro
+    import pipeline.news
     import pipeline.outcomes
-    import pipeline.sentiment
     import pipeline.signals
     import pipeline.tracking
     import pipeline.validation
@@ -2256,14 +2346,71 @@ def _stub_daily(monkeypatch, **overrides):
         (pipeline.tracking, "finish_run"): lambda *a, **k: None,
         (pipeline.outcomes, "resolve_due_forecasts"):
             lambda *a, **k: pipeline.outcomes.OutcomeReport(0, 0, 0, 0),
-        (pipeline.sentiment, "fetch_and_score"): lambda **k: None,
+        (pipeline.news, "fetch_recent"):
+            lambda *a, **k: {"tickers": 1, "articles": 0, "blocked": 0, "errors": 0},
         (pipeline.macro, "fetch_and_store"): lambda: None,
+        # Probing costs a real HTTP request per route against a 50/day budget.
+        (agents.llm, "preflight"): lambda *a, **k: {
+            "routes": [], "dead_tasks": [], "usable_tasks": [],
+            "openrouter_daily_budget": "50 (unfunded)",
+            "reasoning_calls_per_day_estimate": 17},
         (agents.graph, "run_graph"): lambda t: {"forecast_available": True},
         (agents.graph, "prune_forecast_current"): lambda u: 0,
     }
     for (module, name), value in defaults.items():
         monkeypatch.setattr(module, name, overrides.pop(name, value))
     assert not overrides, f"unknown override: {list(overrides)}"
+
+
+def test_the_daily_job_stub_actually_covers_every_outbound_call(monkeypatch):
+    """
+    THE STUB HELPER SILENTLY STOPPED WORKING ONCE, AND THIS IS THE GUARD.
+
+    `_stub_daily` stubbed `pipeline.sentiment.fetch_and_score`. When step
+    6/8 was re-pointed at `pipeline.news.fetch_recent` the entry went stale —
+    it still patched a real function, so `assert not overrides` stayed quiet,
+    and the daily-job tests began making live Google News requests and writing
+    to the production database. A stub that no longer corresponds to a call
+    site is indistinguishable from one that does, right up until it costs you.
+
+    So the fixture's own coverage is asserted: run the job and require that
+    each outbound stub was ACTUALLY reached. A rename now fails here, loudly,
+    instead of quietly reaching the network from a unit test.
+    """
+    import scheduler
+
+    reached: set[str] = set()
+
+    def _mark(name, value):
+        def stub(*a, **k):
+            reached.add(name)
+            return value
+        return stub
+
+    # `fetch_and_store` is the name of THREE different functions in the
+    # defaults table (fetch, corporate_actions, macro) and the helper matches
+    # overrides by bare name, so passing it here would silently patch the wrong
+    # one — the `str.replace` landmine in a new place. Macro is patched
+    # directly, against its module.
+    _stub_daily(
+        monkeypatch,
+        fetch_recent=_mark("news", {"tickers": 1, "articles": 0,
+                                    "blocked": 0, "errors": 0}),
+        preflight=_mark("preflight", {
+            "routes": [], "dead_tasks": [], "usable_tasks": [],
+            "openrouter_daily_budget": "50 (unfunded)",
+            "reasoning_calls_per_day_estimate": 17}),
+    )
+    import pipeline.macro
+    monkeypatch.setattr(pipeline.macro, "fetch_and_store", _mark("macro", None))
+
+    scheduler.run_pipeline_job()
+
+    assert reached == {"news", "macro", "preflight"}, (
+        f"the daily job did not route through every stubbed dependency "
+        f"(reached {sorted(reached)}) — an unstubbed one touches the real "
+        f"network and the real database from a unit test"
+    )
 
 
 def test_daily_job_aborts_when_the_validation_gate_fails(monkeypatch):

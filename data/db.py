@@ -621,5 +621,129 @@ def init_db():
         except Exception:
             pass  # Column already exists, skip
 
+        # ── P3: the news archive ──────────────────────────────────────────────
+        #
+        # THIS DOES NOT REPLACE `sentiment` AND DOES NOT MIGRATE IT. That table
+        # is keyed (date, ticker, headline) where `date` is the day we FETCHED
+        # the row, not the day the article was published — pipeline/sentiment.py
+        # stamped datetime.today() on every headline while Google News RSS was
+        # returning results ranked by relevance, up to 246 days old. There is no
+        # transformation from those rows to correctly-dated ones, because the
+        # publication date was never recorded. `sentiment` is left intact as a
+        # record of what was served to readers and nothing new is written to it.
+        #
+        # An article is identified by its CONTENT, not by the ticker whose query
+        # surfaced it: one story mentioning three universe members should be one
+        # row observed three times, not three rows that drift apart when one is
+        # re-scored. Hence `news_articles` (the article) and `news_mentions`
+        # (the ticker link), rather than one denormalised table.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS news_articles (
+                article_id      TEXT PRIMARY KEY,  -- sha256 of normalised url|title
+                published_at    TEXT NOT NULL,     -- THE ARTICLE'S OWN timestamp
+                title           TEXT NOT NULL,
+                url             TEXT,
+                source          TEXT,              -- publisher, e.g. Moneycontrol
+                provider        TEXT NOT NULL,     -- which adapter found it
+                first_seen      TEXT NOT NULL      -- when WE first recorded it
+            )
+        """))
+
+        # Why `matched_by` is stored rather than just a boolean: the relevance
+        # rule is going to be MEASURED against a hand-labelled sample, and a
+        # measurement you cannot attribute to a rule cannot improve the rule.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS news_mentions (
+                article_id      TEXT NOT NULL,
+                ticker          TEXT NOT NULL,
+                matched_by      TEXT,              -- symbol | name | alias | llm
+                first_seen      TEXT NOT NULL,
+                PRIMARY KEY (article_id, ticker)
+            )
+        """))
+
+        # Scores live apart from articles so a re-score under a new checkpoint
+        # is a NEW ROW SET, never an overwrite. The same reason
+        # fundamental_revisions exists: a figure that can be silently replaced
+        # destroys the only evidence that it moved. `scorer_id` pins the
+        # checkpoint AND its revision, because "FinBERT" is not a reproducible
+        # description of anything.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS news_scores (
+                article_id      TEXT NOT NULL,
+                scorer_id       TEXT NOT NULL,     -- checkpoint@revision
+                label           TEXT NOT NULL,     -- positive | negative | neutral
+                score           REAL,              -- signed, -1..+1
+                confidence      REAL,
+                scored_at       TEXT NOT NULL,
+                PRIMARY KEY (article_id, scorer_id)
+            )
+        """))
+
+        # THE TABLE THAT MAKES "NOT OBSERVED" DISTINCT FROM "NOTHING HAPPENED".
+        #
+        # On 2026-08-20 and 2026-08-28 the live job stored the placeholder
+        # "No news available today." for all 95 tickers — 95 companies do not go
+        # quiet on the same day; the fetch was blocked, and it was recorded as
+        # data. A downstream count would read those days as a market-wide
+        # attention collapse. Every window we ATTEMPT gets a row here, so a
+        # feature can tell an empty window from an absent one.
+        #
+        # `saturated` is the load-bearing column. Google News returns at most
+        # 100 results and ranks them by RELEVANCE — computed today, informed by
+        # everything that has happened since. A window that hits the cap has had
+        # its articles SELECTED with hindsight, which is a look-ahead channel
+        # into the sample rather than into any single value. The backfill splits
+        # such a window until none saturate; this column is how that invariant
+        # is audited after the fact instead of merely asserted.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS news_coverage (
+                ticker          TEXT NOT NULL,
+                window_start    TEXT NOT NULL,
+                window_end      TEXT NOT NULL,
+                provider        TEXT NOT NULL,
+                status          TEXT NOT NULL,     -- ok | blocked | error
+                n_articles      INTEGER,
+                saturated       INTEGER,           -- 1 = hit the cap, selection is ranked
+                attempted_at    TEXT NOT NULL,
+                detail          TEXT,
+                PRIMARY KEY (ticker, window_start, window_end, provider)
+            )
+        """))
+
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_news_articles_published "
+            "ON news_articles (published_at)"))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_news_mentions_ticker "
+            "ON news_mentions (ticker)"))
+
+        # ── P3: FII/DII flows, out of `macro` ─────────────────────────────────
+        #
+        # NOT a macro column any more, and the separation is deliberate.
+        # `macro.fetch_and_store` refreshes its window with DELETE-range +
+        # reinsert from yfinance; a flow figure published once by NSE and never
+        # served again would be destroyed by the next price refresh. Same shape
+        # as the F6 hazard on `signals`, so it gets its own table with its own
+        # write path.
+        #
+        # `first_seen` and the ON CONFLICT DO NOTHING write make this a RECORD:
+        # NSE marks its figures provisional and revises them after custodial
+        # confirmation, so an overwrite would quietly rewrite history the way a
+        # restated fundamental does.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS market_flows (
+                date            TEXT PRIMARY KEY,
+                fii_net         REAL,
+                fii_buy         REAL,
+                fii_sell        REAL,
+                dii_net         REAL,
+                dii_buy         REAL,
+                dii_sell        REAL,
+                source          TEXT NOT NULL,
+                first_seen      TEXT NOT NULL
+            )
+        """))
+
         conn.commit()
     print("Database initialised.")

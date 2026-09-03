@@ -63,9 +63,15 @@ from pipeline.signals import FEATURE_COLS
 # FEATURES because the per-ticker models are fitted on time series and can use
 # them there; they are excluded from the pooled factor set for this reason and
 # not by oversight.
+#
+# `fii_net_flow` / `dii_net_flow` WERE HERE AND ARE NOT ANY MORE. Measured
+# 2026-09-03 they held one distinct value across all 2,601 macro rows — 0.0 —
+# because the NSE parser read field names the endpoint does not serve. Real
+# flows now accumulate in `market_flows`; they rejoin a feature list only when
+# there is history, because a column that is constant until 2026-09 and real
+# after it is a structural break, not a feature. See pipeline/macro.py.
 MACRO_COLS = [
     "usdinr", "india_vix", "nifty_5d_return", "nifty_20d_return",
-    "fii_net_flow", "dii_net_flow",
 ]
 
 FEATURES = FEATURE_COLS + MACRO_COLS
