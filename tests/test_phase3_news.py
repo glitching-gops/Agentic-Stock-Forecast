@@ -180,6 +180,108 @@ def test_a_partial_read_is_not_treated_as_a_saturated_one():
     assert out[0].status == "error"
 
 
+def _feed(status, entries=()):
+    class _F:
+        pass
+    f = _F()
+    f.status = status
+    f.entries = list(entries)
+    return f
+
+
+def _stub_feedparser(monkeypatch, responses):
+    """Serves `responses` in order; records how many parses happened."""
+    import sys, types
+
+    calls = {"n": 0}
+
+    def parse(url):
+        i = min(calls["n"], len(responses) - 1)
+        calls["n"] += 1
+        return responses[i]
+
+    monkeypatch.setitem(sys.modules, "feedparser",
+                        types.SimpleNamespace(parse=parse))
+    return calls
+
+
+def test_a_transient_refusal_is_retried_rather_than_written_in_as_a_gap(monkeypatch):
+    """
+    A 404 from this endpoint means TWO different things and the response cannot
+    tell them apart. Measured over a real 842-request run: ~2.7% of windows
+    returned 404 and re-requesting them minutes later returned 200 with a full
+    result set — transient refusal under load. Recording those as gaps writes
+    holes into the archive that no later run revisits, because the resume logic
+    skips only what it has already answered.
+    """
+    from pipeline.news import GoogleNewsRSS
+
+    entry = {"title": "ok", "link": "http://a",
+             "published_parsed": (2024, 1, 15, 0, 0, 0, 0, 0, 0)}
+    calls = _stub_feedparser(monkeypatch, [_feed(404), _feed(200, [entry])])
+
+    out = GoogleNewsRSS(delay=0, retry_pause=0).fetch(
+        "ACME", date(2024, 1, 1), date(2024, 1, 31))
+
+    assert out.status == "ok"
+    assert len(out.articles) == 1
+    assert calls["n"] == 2, "the transient failure must have been retried"
+
+
+def test_a_permanent_hole_survives_the_retries_and_is_recorded(monkeypatch):
+    """
+    2025-06 returns 404 on five consecutive attempts and for EVERY company
+    tried — a genuine hole in Google's index rather than a refusal aimed at us.
+    Retrying separates the two; what survives must still be recorded as
+    blocked, so a feature reading that month knows it was not observed.
+    """
+    from pipeline.news import GoogleNewsRSS
+
+    calls = _stub_feedparser(monkeypatch, [_feed(404)])
+    out = GoogleNewsRSS(delay=0, retry_pause=0).fetch(
+        "ACME", date(2025, 6, 1), date(2025, 6, 30))
+
+    assert out.status == "blocked"
+    assert "404" in out.detail
+    assert calls["n"] == 3, "a persistent failure must exhaust its attempts"
+
+
+def test_a_successful_window_is_not_retried(monkeypatch):
+    """Retries cost wall-clock across ~12,000 windows; they must be exceptional."""
+    from pipeline.news import GoogleNewsRSS
+
+    calls = _stub_feedparser(monkeypatch, [_feed(200, [])])
+    out = GoogleNewsRSS(delay=0, retry_pause=0).fetch(
+        "ACME", date(2024, 1, 1), date(2024, 1, 31))
+
+    assert out.status == "ok" and calls["n"] == 1
+
+
+def test_a_window_that_fails_for_many_tickers_is_reported_as_a_shared_hole(engine):
+    """
+    A hole in the index and a flaky request look identical in one row and
+    completely different across tickers. 2025-06 failed for every company
+    tried; re-running will never fill it, and a feature reading that month sees
+    zero articles across the WHOLE universe — which is not the same as a quiet
+    month and must not be averaged in as one.
+    """
+    for ticker in ("AAA.NS", "BBB.NS", "CCC.NS"):
+        store_window(WindowResult(ticker=ticker, start=date(2025, 6, 1),
+                                  end=date(2025, 6, 30), provider="stub",
+                                  status="blocked", articles=[]),
+                     ticker, engine=engine)
+    # One ticker failing alone is a flaky request, not a hole.
+    store_window(WindowResult(ticker="AAA.NS", start=date(2025, 7, 1),
+                              end=date(2025, 7, 31), provider="stub",
+                              status="blocked", articles=[]),
+                 "AAA.NS", engine=engine)
+
+    holes = coverage_report(engine)["shared_holes"]
+    assert len(holes) == 1
+    assert holes[0]["window_start"] == "2025-06-01"
+    assert holes[0]["n_tickers"] == 3
+
+
 # ── 2. Publication date, not fetch date ───────────────────────────────────────
 
 def test_an_article_outside_the_requested_window_is_dropped():

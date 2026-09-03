@@ -224,8 +224,10 @@ class GoogleNewsRSS:
     BASE = "https://news.google.com/rss/search"
 
     def __init__(self, delay: float = REQUEST_DELAY_SECONDS, hl: str = "en-IN",
-                 gl: str = "IN", ceid: str = "IN:en"):
+                 gl: str = "IN", ceid: str = "IN:en",
+                 retry_pause: float = 1.0):
         self.delay = delay
+        self.retry_pause = retry_pause
         self.hl, self.gl, self.ceid = hl, gl, ceid
 
     def supports_history(self) -> bool:
@@ -242,20 +244,44 @@ class GoogleNewsRSS:
         return (f"{self.BASE}?q={urllib.parse.quote(q)}"
                 f"&hl={self.hl}&gl={self.gl}&ceid={self.ceid}")
 
-    def fetch(self, query: str, start: date, end: date) -> WindowResult:
+    def fetch(self, query: str, start: date, end: date,
+              attempts: int = 3) -> WindowResult:
         import feedparser
 
         out = WindowResult(ticker="", start=start, end=end, provider=self.name,
                            status="ok")
-        try:
-            feed = feedparser.parse(self._url(query, start, end))
-        except Exception as exc:                                    # noqa: BLE001
-            out.status, out.detail = "error", f"{type(exc).__name__}: {exc}"[:300]
-            return out
 
-        status = getattr(feed, "status", 200)
-        if status and int(status) >= 400:
-            out.status, out.detail = "blocked", f"HTTP {status}"
+        # RETRY WITH BACKOFF, because a 404 here means two different things and
+        # the response cannot tell them apart. Measured 2026-09-03 over a
+        # 842-request run: ~2.7% of windows returned HTTP 404, and re-requesting
+        # them minutes later returned 200 with a full result set — transient
+        # refusal under sustained load. But 2025-06 returns 404 on five
+        # consecutive attempts and for EVERY company tried, which is a genuine
+        # permanent hole in Google's index.
+        #
+        # Retrying separates them at the cost of a few seconds: what survives
+        # three spaced attempts is a real hole and gets recorded as such,
+        # instead of a transient refusal being written into the archive as a
+        # gap that no later run will revisit.
+        feed = None
+        for attempt in range(attempts):
+            try:
+                feed = feedparser.parse(self._url(query, start, end))
+            except Exception as exc:                                # noqa: BLE001
+                out.status = "error"
+                out.detail = f"{type(exc).__name__}: {exc}"[:300]
+                feed = None
+            else:
+                status = int(getattr(feed, "status", 200) or 200)
+                if status < 400:
+                    out.status, out.detail = "ok", ""
+                    break
+                out.status, out.detail = "blocked", f"HTTP {status}"
+                feed = None
+            if attempt < attempts - 1:
+                time.sleep(self.delay * (2 ** attempt) + self.retry_pause)
+
+        if feed is None:
             return out
 
         for entry in feed.entries:
@@ -512,8 +538,23 @@ def coverage_report(engine=None) -> dict:
             FROM news_articles
         """), conn)
 
+        # A WINDOW THAT FAILS FOR MANY TICKERS IS NOT A FLAKY REQUEST.
+        # Measured: 2025-06 returns HTTP 404 on five consecutive attempts and
+        # for every company tried — a genuine hole in Google's index, not a
+        # refusal aimed at us. It has to be reported as a hole, because a
+        # feature reading that month will see zero articles for the entire
+        # universe and no amount of re-running will change it.
+        holes = pd.read_sql(text("""
+            SELECT window_start, window_end, COUNT(DISTINCT ticker) n_tickers
+            FROM news_coverage WHERE status <> 'ok'
+            GROUP BY window_start, window_end
+            HAVING COUNT(DISTINCT ticker) > 1
+            ORDER BY n_tickers DESC, window_start
+        """), conn)
+
     return {"by_year": articles.to_dict("records"),
             "by_status": cov.to_dict("records"),
+            "shared_holes": holes.to_dict("records"),
             "totals": totals.to_dict("records")[0] if not totals.empty else {}}
 
 

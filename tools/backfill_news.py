@@ -65,6 +65,13 @@ from pipeline.news import (                                       # noqa: E402
 )
 
 
+#: Abort only on WHOLESALE refusal. Measured on the first real run, the
+#: ordinary transient block rate is ~2.7%; a burst far above that, sustained
+#: across several tickers, is Google refusing us rather than a flaky window.
+MAX_BLOCK_RATE = 0.30
+RECENT_TICKERS = 3
+
+
 def _completed(engine, provider: str) -> set[tuple[str, str, str]]:
     """
     (ticker, start, end) triples already recorded ok — the resume point.
@@ -128,6 +135,18 @@ def main() -> int:
         for row in rep["by_status"]:
             print(f"    {row['status']:<8} {row['n_windows']:>7,} windows, "
                   f"{row['n_saturated'] or 0:>5} saturated")
+        holes = rep.get("shared_holes") or []
+        if holes:
+            print("\n  WINDOWS THAT FAILED FOR MORE THAN ONE TICKER — a hole in"
+                  "\n  the index, not a refusal aimed at us. Re-running will not"
+                  "\n  fill these, and a feature reading them sees zero articles"
+                  "\n  across the whole universe:")
+            for row in holes[:12]:
+                print(f"    {row['window_start']} .. {row['window_end']}   "
+                      f"{row['n_tickers']} tickers")
+            if len(holes) > 12:
+                print(f"    ... and {len(holes) - 12} more")
+
         saturated = sum(r["n_saturated"] or 0 for r in rep["by_status"])
         if saturated:
             print(f"\n  {saturated} SATURATED windows remain. Those were "
@@ -175,12 +194,15 @@ def main() -> int:
     began = time.time()
     totals = {"requests": 0, "articles": 0, "kept": 0, "saturated": 0,
               "blocked": 0, "errors": 0, "skipped": 0}
+    recent: list[float] = []
 
     for i, ticker in enumerate(tickers, 1):
         company = get_company(ticker)
         aliases = company_aliases(ticker, company)
         query = search_query(ticker, company)
         kept_for_ticker = 0
+        blocked_for_ticker = 0
+        windows_for_ticker = 0
 
         for lo, hi in month_starts(start, end):
             if (ticker, lo.isoformat(), hi.isoformat()) in done:
@@ -195,12 +217,15 @@ def main() -> int:
 
             for result in iter_windows(lo, hi, fetch):
                 totals["articles"] += len(result.articles)
+                windows_for_ticker += 1
                 if result.saturated:
                     totals["saturated"] += 1
                 if result.status == "blocked":
                     totals["blocked"] += 1
+                    blocked_for_ticker += 1
                 elif result.status == "error":
                     totals["errors"] += 1
+                    blocked_for_ticker += 1
 
                 # THE RELEVANCE FILTER IS DETERMINISTIC AND RUNS HERE, not at
                 # feature time. An article attributed to the wrong ticker is
@@ -229,14 +254,28 @@ def main() -> int:
               f"{rate:.1f}/s, {totals['saturated']} saturated, "
               f"{totals['blocked']} blocked")
 
-        # A BLOCK IS NOT A SLOW PATCH. Google refusing us mid-backfill turns
-        # every remaining window into a fake "quiet period" unless we stop, and
-        # coverage rows would record the refusal for thousands of windows we
-        # would then have to re-run anyway.
-        if totals["blocked"] > 20:
-            print("\n  ABORTING: more than 20 blocked windows. Those are gaps, "
-                  "not quiet\n  periods. Wait, then re-run — completed windows "
-                  "are skipped.")
+        # A RATE, NOT A LIFETIME COUNT. The first version aborted at 20 blocked
+        # windows total, which is the same mistake `scheduler` made with
+        # `succeeded == 0`: a threshold written for the catastrophe that fires
+        # on the ordinary case. Measured on the real run, ~2.7% of windows
+        # return a transient 404 under sustained load, so a lifetime cap of 20
+        # is reached at roughly request 800 of 12,000 EVERY TIME and the
+        # backfill can never finish. It aborted at ticker 7 of 84.
+        #
+        # What actually needs catching is Google refusing us WHOLESALE, which
+        # looks like a burst of consecutive failures rather than a low rate
+        # spread over hours. Transient refusals are now retried inside
+        # `provider.fetch`, so anything still recorded blocked has survived
+        # three spaced attempts.
+        recent.append(blocked_for_ticker / max(windows_for_ticker, 1))
+        recent[:] = recent[-RECENT_TICKERS:]
+        if len(recent) == RECENT_TICKERS and sum(recent) / len(recent) > MAX_BLOCK_RATE:
+            print(f"\n  ABORTING: {100 * sum(recent) / len(recent):.0f}% of "
+                  f"windows blocked across the last {RECENT_TICKERS} tickers, "
+                  f"against a {100 * MAX_BLOCK_RATE:.0f}% ceiling.\n"
+                  f"  That is wholesale refusal, not the ordinary transient "
+                  f"rate. Wait an hour, then\n  re-run — completed windows are "
+                  f"skipped, so nothing is lost.")
             break
 
     elapsed = time.time() - began
