@@ -150,6 +150,108 @@ def test_a_failed_window_is_not_split_and_is_still_reported():
     assert out[0].status == "blocked"
 
 
+def test_a_rate_limit_stops_the_walk_instead_of_being_retried():
+    """
+    A 429/503 IS NOT A DEAD WINDOW AND MUST NOT BE RETRIED.
+
+    Measured 2026-09-04: after roughly 600 requests Google returns 503 to
+    everything, including a bare query with no date operators. The first
+    version treated that identically to a 404 and retried each one three
+    times — so one block became 164 blocked windows and 82 minutes of
+    grinding, and the retries are what kept the block alive.
+
+    Two behaviours are required. The provider must not retry it, and the walk
+    must stop rather than marching the rest of the range into `news_coverage`
+    as though we had looked and found nothing there.
+    """
+    from pipeline.news import GoogleNewsRSS
+
+    import sys, types
+    seen = {"n": 0}
+
+    def parse(url):
+        seen["n"] += 1
+        f = _feed(503)
+        return f
+
+    real = sys.modules.get("feedparser")
+    sys.modules["feedparser"] = types.SimpleNamespace(parse=parse)
+    try:
+        out = GoogleNewsRSS(delay=0, retry_pause=0).fetch(
+            "ACME", date(2024, 1, 1), date(2024, 1, 31))
+        assert out.status == "rate_limited"
+        assert seen["n"] == 1, (
+            "a rate limit must not be retried — retrying is three times the "
+            "load on a host that has just said stop")
+
+        # THE STOP HAS TO BE REACHABLE TO BE TESTED. A rate limit returns zero
+        # articles, so a walk that never splits yields exactly one window with
+        # or without the guard — the first version of this assertion passed
+        # against the mutant for that reason. The first fetch therefore
+        # SATURATES, forcing a split, and only the sub-windows rate-limit: with
+        # the guard the walk stops after one of them, without it both are
+        # recorded as though we had looked.
+        calls = {"n": 0}
+
+        def staged(lo, hi):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _result(lo, hi, RESULT_CAP)          # split me
+            return WindowResult(ticker="AAA.NS", start=lo, end=hi,
+                                provider="stub", status="rate_limited",
+                                articles=[], detail="HTTP 503")
+
+        walked = list(iter_windows(date(2024, 1, 1), date(2024, 12, 31), staged))
+        assert [r.status for r in walked] == ["rate_limited"], (
+            f"the walk must stop on the FIRST rate limit; it produced "
+            f"{[r.status for r in walked]} instead of stopping")
+    finally:
+        if real is not None:
+            sys.modules["feedparser"] = real
+        else:
+            sys.modules.pop("feedparser", None)
+
+
+def _tag(result):
+    result.ticker = "AAA.NS"
+    return result
+
+
+def test_an_already_covered_window_costs_no_request():
+    """
+    THE STRUCTURAL FIX FOR THE QUOTA. The endpoint refuses after ~600 requests,
+    so finishing depends on needing fewer — the backfill now hands the WHOLE
+    range to `iter_windows` and lets it binary-search on density instead of
+    walking 121 fixed monthly windows per ticker.
+
+    That only preserves earlier work if a covered subtree can be pruned without
+    a fetch, which is what `skip` is for.
+    """
+    calls = []
+
+    # THE SKIP HAS TO BE REACHABLE. A walk that never splits makes exactly one
+    # call spanning the whole range, which is not inside the covered half — so
+    # the first version of this test passed against a build with skipping
+    # disabled. Wide windows therefore SATURATE, forcing a split down to
+    # sub-windows that do fall entirely inside the covered range.
+    def fetch(lo, hi):
+        calls.append((lo, hi))
+        n = RESULT_CAP if (hi - lo).days > 45 else 3
+        return _result(lo, hi, n)
+
+    done_before = date(2024, 7, 1)          # everything before July is covered
+    out = list(iter_windows(
+        date(2024, 1, 1), date(2024, 12, 31), fetch,
+        skip=lambda lo, hi: hi < done_before))
+
+    assert calls, "the uncovered half must still be fetched"
+    fully_covered = [(lo, hi) for lo, hi in calls if hi < done_before]
+    assert not fully_covered, (
+        f"{len(fully_covered)} window(s) entirely inside the covered range "
+        f"were fetched anyway, spending a scarce quota on finished work")
+    assert any(r.end >= done_before for r in out), "nothing was actually walked"
+
+
 def test_a_partial_read_is_not_treated_as_a_saturated_one():
     """
     THE CASE THE TEST ABOVE CANNOT REACH, and a surviving mutant is what found

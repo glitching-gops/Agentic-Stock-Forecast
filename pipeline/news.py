@@ -86,8 +86,16 @@ RESULT_CAP = 100
 MIN_WINDOW_DAYS = 1
 
 #: Politeness. Google publishes no quota for this endpoint; the backfill makes
-#: five figures of requests, so it paces itself rather than finding the limit.
+#: thousands of requests, so it paces itself rather than finding the limit.
 REQUEST_DELAY_SECONDS = 0.4
+
+#: A GLOBAL REFUSAL, distinct from a dead (query, window) pair. Measured
+#: 2026-09-04: after roughly 600 requests in an hour the endpoint returns 503
+#: to everything, including a bare query with no date operators. That is the
+#: host saying stop, and the only correct response is to stop — a retry is
+#: three times the load on something already refusing, which is precisely how
+#: one block became eighty-two minutes of grinding.
+RATE_LIMIT_STATUSES = frozenset({429, 503})
 
 
 @dataclass(frozen=True)
@@ -113,7 +121,7 @@ class WindowResult:
     start: date
     end: date
     provider: str
-    status: str                       # ok | blocked | error
+    status: str                       # ok | blocked | rate_limited | error
     articles: list[Article] = field(default_factory=list)
     detail: str = ""
 
@@ -151,6 +159,7 @@ def iter_windows(
     end: date,
     fetch: Callable[[date, date], WindowResult],
     min_days: int = MIN_WINDOW_DAYS,
+    skip: Callable[[date, date], bool] | None = None,
 ) -> Iterator[WindowResult]:
     """
     Walks [start, end] and yields results, splitting any window that saturates.
@@ -174,7 +183,23 @@ def iter_windows(
     stack: list[tuple[date, date]] = [(start, end)]
     while stack:
         lo, hi = stack.pop()
+
+        # ALREADY COVERED, so spend nothing. `skip` is how a resume keeps the
+        # work a previous run did when the granularity has changed underneath
+        # it: a caller answers "is every part of this window already recorded
+        # ok" and a whole subtree is pruned without a request. Checked BEFORE
+        # the fetch, which is the only place it saves anything.
+        if skip is not None and skip(lo, hi):
+            continue
+
         result = fetch(lo, hi)
+
+        # A RATE LIMIT ENDS THE WALK. Everything after it would fail too, and
+        # each failure would be written into news_coverage as though we had
+        # looked and found nothing there.
+        if result.status == "rate_limited":
+            yield result
+            return
 
         span = (hi - lo).days + 1
         if result.status == "ok" and result.saturated and span > min_days:
@@ -189,8 +214,19 @@ def iter_windows(
         yield result
 
 
+def months_spanned(start: date, end: date) -> list[str]:
+    """The 'YYYY-MM' months a window touches, for coverage bookkeeping."""
+    out, cur = [], date(start.year, start.month, 1)
+    while cur <= end:
+        out.append(f"{cur.year:04d}-{cur.month:02d}")
+        cur = date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
+    return out
+
+
 def month_starts(start: date, end: date) -> Iterator[tuple[date, date]]:
-    """Calendar months spanning [start, end], the split's starting granularity."""
+    """Calendar months spanning [start, end]. Retained for callers that want
+    a fixed granularity; the backfill now hands the WHOLE range to
+    `iter_windows` and lets it binary-search on density instead."""
     cur = date(start.year, start.month, 1)
     while cur <= end:
         nxt = date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
@@ -276,6 +312,21 @@ class GoogleNewsRSS:
                 if status < 400:
                     out.status, out.detail = "ok", ""
                     break
+                # A RATE LIMIT AND A DEAD WINDOW ARE DIFFERENT ANSWERS AND NEED
+                # DIFFERENT BEHAVIOUR, and conflating them is what turned a
+                # block into an 82-minute grind. Measured 2026-09-04: after
+                # ~600 requests Google returns 503 to EVERYTHING, including a
+                # plain query carrying no date operators at all. Retrying that
+                # three times per window is not resilience, it is three times
+                # the load on a host that has just said stop — and it is what
+                # made the block deepen instead of expire.
+                #
+                # 404 stays retryable: it is specific to one (query, window)
+                # pair and a retry genuinely does recover the transient ones.
+                if status in RATE_LIMIT_STATUSES:
+                    out.status = "rate_limited"
+                    out.detail = f"HTTP {status} — the host is refusing us"
+                    return out
                 out.status, out.detail = "blocked", f"HTTP {status}"
                 feed = None
             if attempt < attempts - 1:

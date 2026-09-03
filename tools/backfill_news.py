@@ -15,19 +15,35 @@ dated articles back to at least 2016-09 — the month the `macro` table starts.
 
 RESUMABLE, AND A RE-RUN IS NEARLY FREE
 --------------------------------------
-Every window that completes writes a `news_coverage` row, and by default this
-skips any (ticker, window) already recorded `ok`. So a run that dies at hour
-three resumes at hour three rather than at zero, and re-running after adding a
-ticker costs only that ticker. `--refetch` overrides it.
+Every window that completes writes a `news_coverage` row, and the resume key is
+MONTHS COVERED rather than windows matched — the granularity changed once
+already, and a window-shaped key would have re-fetched ~1,700 finished windows
+against a quota that refuses after ~600. `--refetch` overrides it.
 
-THE COST IS DOMINATED BY THE SPLIT, NOT BY THE TICKER COUNT
+THE REQUEST COUNT IS THE BINDING CONSTRAINT, NOT THE SPEED
 -----------------------------------------------------------
-Monthly windows are the starting granularity and most names never leave it:
-measured, MUTHOOTFIN returned 14 articles for January 2024 and UNIONBANK 9 for
-June 2019. Large caps saturate — RELIANCE hit the 100 cap for January 2024 and
-split to weeks — so cost scales with how newsworthy a name is rather than with
-the calendar. Budget roughly 12k-18k requests at ~0.65 s for 84 names over ten
-years, so three to five hours. `--report` afterwards is not optional.
+Measured 2026-09-04: after roughly 600 requests the endpoint returns HTTP 503
+to EVERYTHING, including a bare query with no date operators. Pacing does not
+buy much — four tickers ran clean at 0.8 req/s and the wall arrived anyway — so
+the only way to finish is to need fewer requests.
+
+So this hands the WHOLE range to `iter_windows` and lets it binary-search on
+density, instead of walking 121 fixed monthly windows per ticker. Requests then
+follow the ARTICLES rather than the calendar. Simulated against measured
+densities, per ticker over ten years:
+
+    1 article/month    ->  3 requests   (monthly grid: 121)
+    3 articles/month   ->  7 requests
+    7 articles/month   -> 31 requests
+    25 articles/month  -> 63 requests
+
+A 2x saving on the densest name and 40x on the sparsest, which is the right
+shape: cost lands where the articles are.
+
+A 429/503 STOPS THE RUN IMMEDIATELY and is never retried. Retrying a rate limit
+is three times the load on a host that has just said stop, and that is exactly
+how one block became 164 blocked windows and 82 minutes of grinding. A 404 is
+different — it is specific to one (query, window) pair — and stays retryable.
 
 READ THE COVERAGE REPORT BEFORE BELIEVING ANY FEATURE BUILT ON THIS
 --------------------------------------------------------------------
@@ -60,6 +76,7 @@ from pipeline.news import (                                       # noqa: E402
     iter_windows,
     match_ticker,
     month_starts,
+    months_spanned,
     search_query,
     store_window,
 )
@@ -143,6 +160,38 @@ def _previously_blocked(engine, provider: str) -> set[tuple[str, str, str]]:
             raise
         return set()
     return {(r[0], r[1], r[2]) for r in rows}
+
+
+def _completed_months(engine, provider: str) -> set[tuple[str, str]]:
+    """
+    (ticker, 'YYYY-MM') pairs fully covered by a window recorded ok.
+
+    The resume key, and it is months rather than windows on purpose. The
+    backfill's granularity changed from fixed monthly windows to a recursive
+    split, so a window-shaped key would match nothing and re-fetch ~1,700
+    completed windows against a quota that refuses after ~600.
+    """
+    from data.db import is_missing_relation
+    from pipeline.news import months_spanned as _months
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT ticker, window_start, window_end FROM news_coverage "
+                "WHERE provider = :p AND status = 'ok'"),
+                {"p": provider}).fetchall()
+    except Exception as exc:                                     # noqa: BLE001
+        if not is_missing_relation(exc):
+            raise
+        return set()
+
+    out: set[tuple[str, str]] = set()
+    for ticker, lo, hi in rows:
+        a = datetime.strptime(str(lo)[:10], "%Y-%m-%d").date()
+        b = datetime.strptime(str(hi)[:10], "%Y-%m-%d").date()
+        for m in _months(a, b):
+            out.add((ticker, m))
+    return out
 
 
 def _completed(engine, provider: str) -> set[tuple[str, str, str]]:
@@ -261,6 +310,7 @@ def main() -> int:
     provider = GoogleNewsRSS(delay=args.delay)
 
     done = set() if args.refetch else _completed(engine, provider.name)
+    done_months = set() if args.refetch else _completed_months(engine, provider.name)
     retrying = _previously_blocked(engine, provider.name)
     print(f"{len(tickers)} tickers, {start} .. {end}, "
           f"{len(done):,} windows already complete"
@@ -269,7 +319,7 @@ def main() -> int:
     began = time.time()
     totals = {"requests": 0, "articles": 0, "kept": 0, "saturated": 0,
               "blocked": 0, "errors": 0, "skipped": 0,
-              "retried": 0, "recovered": 0}
+              "retried": 0, "recovered": 0, "rate_limited": 0}
     recent: list[float] = []
 
     for i, ticker in enumerate(tickers, 1):
@@ -280,26 +330,48 @@ def main() -> int:
         blocked_for_ticker = 0
         windows_for_ticker = 0
 
-        for lo, hi in month_starts(start, end):
-            key = (ticker, lo.isoformat(), hi.isoformat())
-            if key in done:
-                totals["skipped"] += 1
-                continue
-            # A window we are RETRYING is a known-bad sample and must not feed
-            # the abort rate — see _previously_blocked.
-            is_retry = key in retrying
+        # ONE RECURSIVE WALK OVER THE WHOLE RANGE, not 121 fixed monthly
+        # windows. This is the structural fix for the rate limit, and it is
+        # worth more than any amount of pacing: the endpoint refuses after
+        # roughly 600 requests, so the only way to finish is to need fewer.
+        #
+        # `iter_windows` already binary-searches on density — it splits only
+        # what saturates — so the request count follows the ARTICLES rather
+        # than the calendar. A decade of a sparse name is one or two requests
+        # instead of 121; a dense name still splits down to weeks where the
+        # articles actually are. Estimated over the measured ~46,000 articles:
+        # ~460 leaves plus internal nodes, so ~1,400 requests for the whole
+        # universe against 10,164 at fixed monthly granularity.
+        rate_limited = False
 
-            def fetch(a, b, _q=query):
-                totals["requests"] += 1
-                result = provider.fetch(_q, a, b)
-                result.ticker = ticker
-                return result
+        def fetch(a, b, _q=query):
+            totals["requests"] += 1
+            result = provider.fetch(_q, a, b)
+            result.ticker = ticker
+            return result
 
-            for result in iter_windows(lo, hi, fetch):
+        def already_done(a, b) -> bool:
+            """
+            True when every month this window spans is already recorded ok.
+
+            Keyed on MONTHS rather than on the window itself so the work done
+            by earlier monthly runs still counts — the granularity changed, the
+            coverage did not, and re-fetching 1,700 completed windows to satisfy
+            a key format would be the worst possible use of a scarce quota.
+            """
+            months = months_spanned(a, b)
+            return bool(months) and all((ticker, m) in done_months for m in months)
+
+        for lo, hi in [(start, end)]:
+            is_retry = False
+            for result in iter_windows(lo, hi, fetch, skip=already_done):
                 totals["articles"] += len(result.articles)
                 if result.saturated:
                     totals["saturated"] += 1
-                if result.status == "blocked":
+                if result.status == "rate_limited":
+                    rate_limited = True
+                    totals["rate_limited"] += 1
+                elif result.status == "blocked":
                     totals["blocked"] += 1
                 elif result.status == "error":
                     totals["errors"] += 1
@@ -358,6 +430,20 @@ def main() -> int:
         if windows_for_ticker:
             recent.append(blocked_for_ticker / windows_for_ticker)
             recent[:] = recent[-RECENT_TICKERS:]
+        # A 503 IS NOT A DATA PROBLEM AND HAS NO RATE TO AVERAGE. The host has
+        # said stop; every further request extends the block rather than
+        # sampling it. Stopping on the FIRST one is what keeps a pause short.
+        if rate_limited:
+            print(
+                f"\n  STOPPING: Google returned a rate-limit status (429/503)"
+                f" after {totals['requests']} requests this session.\n"
+                f"  The endpoint refuses EVERYTHING for a while once it does "
+                f"— including a bare\n  query carrying no date operators — so "
+                f"this is a quota, not a data problem.\n"
+                f"  Wait ~1 hour and re-run; completed windows are skipped, so "
+                f"nothing is lost.")
+            break
+
         if len(recent) == RECENT_TICKERS and sum(recent) / len(recent) > MAX_BLOCK_RATE:
             print(f"\n  ABORTING: {100 * sum(recent) / len(recent):.0f}% of "
                   f"windows blocked across the last {RECENT_TICKERS} tickers, "
