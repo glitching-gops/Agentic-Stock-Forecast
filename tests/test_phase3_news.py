@@ -553,6 +553,50 @@ def test_an_unresolved_company_name_is_detectable_before_the_requests():
     assert not company_name_is_unresolved("ABB.NS", "ABB India Ltd.")
 
 
+def test_a_resume_run_does_not_measure_its_abort_rate_on_known_failures(engine):
+    """
+    A RESUME IS AN ADVERSARIALLY SELECTED SAMPLE. It skips every window that
+    already succeeded, so the only ones it attempts are the ones that failed —
+    and those fail again at a far higher rate than fresh windows do.
+
+    Measured: the first resume run tried 13 windows, 9 of them already-known
+    failures, and the abort guard read 81% blocked and stopped at ticker 3 of
+    84. The rate exists to detect Google refusing us WHOLESALE; a known-bad
+    window failing again is no evidence of that. 2025-06 returns 404 for every
+    company ever tried, so it would poison the statistic on every run forever.
+
+    `_previously_blocked` is what the loop subtracts, so this pins the query
+    rather than the arithmetic — the two sets must not overlap, or a window
+    would be both skipped and retried.
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    from tools.backfill_news import _completed, _previously_blocked
+
+    ok = WindowResult(ticker="AAA.NS", start=date(2024, 1, 1),
+                      end=date(2024, 1, 31), provider="stub", status="ok",
+                      articles=[_article("2024-01-05", "a")])
+    bad = WindowResult(ticker="AAA.NS", start=date(2025, 6, 1),
+                       end=date(2025, 6, 30), provider="stub",
+                       status="blocked", articles=[])
+    store_window(ok, "AAA.NS", engine=engine)
+    store_window(bad, "AAA.NS", engine=engine)
+
+    done = _completed(engine, "stub")
+    retry = _previously_blocked(engine, "stub")
+
+    assert ("AAA.NS", "2024-01-01", "2024-01-31") in done
+    assert ("AAA.NS", "2025-06-01", "2025-06-30") in retry
+    assert not (done & retry), (
+        "a window cannot be both already-complete and awaiting retry; "
+        "overlapping sets would skip and retry the same window"
+    )
+    # The failed one is NOT in `done`, so it does get retried — the point is
+    # that its failure must not count toward the abort rate.
+    assert ("AAA.NS", "2025-06-01", "2025-06-30") not in done
+
+
 def test_the_remediation_names_the_right_cause_for_the_right_shape():
     """
     A WRONG REMEDIATION IS A REAL DEFECT, not a cosmetic one. The first version

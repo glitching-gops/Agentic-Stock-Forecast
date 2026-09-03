@@ -136,13 +136,33 @@ def get_engine():
         return _ENGINE
         
     if DATABASE_URL.startswith("postgresql"):
+        # `connect_args={"prepare_threshold": None}` USED TO BE HERE AND WAS A
+        # COMPLETE NO-OP. It is a psycopg3 parameter; this project pins
+        # psycopg2-binary. Measured 2026-09-03: psycopg2 DROPS None-valued
+        # connect_args before building the DSN, so a deliberately bogus key
+        # with a None value is accepted while the same key with a value is
+        # rejected as `invalid connection option`. It never reached libpq.
+        #
+        # It was not merely useless, it was misleading — CLAUDE.md cited it as
+        # evidence that the transaction pooler was intended, and a setting that
+        # looks protective while doing nothing is the same class of defect as
+        # the sentiment gauge that always read NEUTRAL.
+        #
+        # Nothing is needed in its place. psycopg2 does not use server-side
+        # prepared statements by default, so it is compatible with the
+        # transaction pooler (port 6543) as-is. Verified: this codebase uses no
+        # temp tables, advisory locks, LISTEN/NOTIFY, SET SESSION, or
+        # server-side cursors — the features transaction pooling actually
+        # breaks.
+        #
+        # pool_size + max_overflow = 15, which is EXACTLY the session pooler's
+        # client cap on port 5432. That is why the URL belongs on 6543.
         _ENGINE = create_engine(
             DATABASE_URL,
             pool_size=5,
             max_overflow=10,
             pool_timeout=30,
             pool_pre_ping=True,
-            connect_args={"prepare_threshold": None}
         )
     else:
         _ENGINE = create_engine(DATABASE_URL, echo=False)

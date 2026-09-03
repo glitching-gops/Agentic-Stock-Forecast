@@ -115,6 +115,36 @@ def unresolved_remediation(unresolved: list[str], tickers: list[str]) -> str:
         "  python -c \"import data.tickers as t; t.refresh_metadata()\"")
 
 
+def _previously_blocked(engine, provider: str) -> set[tuple[str, str, str]]:
+    """
+    Windows that failed last time, and are therefore being RETRIED.
+
+    THESE MUST NOT COUNT TOWARD THE ABORT RATE, and leaving them in is what
+    made the first resume run impossible. A resume attempts only the windows a
+    previous run failed on — an adversarially selected sample, since anything
+    that worked is skipped. Measured: the resume tried 13 windows, 9 of which
+    were already-known failures, and the guard read 81% and aborted at ticker 3.
+
+    The rate exists to detect Google refusing us WHOLESALE, and a known-bad
+    window failing again is no evidence of that. 2025-06 in particular returns
+    404 for every company ever tried, so it will fail on every run forever and
+    would poison the statistic permanently.
+    """
+    from data.db import is_missing_relation
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT ticker, window_start, window_end FROM news_coverage "
+                "WHERE provider = :p AND status <> 'ok'"),
+                {"p": provider}).fetchall()
+    except Exception as exc:                                     # noqa: BLE001
+        if not is_missing_relation(exc):
+            raise
+        return set()
+    return {(r[0], r[1], r[2]) for r in rows}
+
+
 def _completed(engine, provider: str) -> set[tuple[str, str, str]]:
     """
     (ticker, start, end) triples already recorded ok — the resume point.
@@ -231,13 +261,15 @@ def main() -> int:
     provider = GoogleNewsRSS(delay=args.delay)
 
     done = set() if args.refetch else _completed(engine, provider.name)
+    retrying = _previously_blocked(engine, provider.name)
     print(f"{len(tickers)} tickers, {start} .. {end}, "
           f"{len(done):,} windows already complete"
           f"{'  [DRY RUN]' if args.dry_run else ''}")
 
     began = time.time()
     totals = {"requests": 0, "articles": 0, "kept": 0, "saturated": 0,
-              "blocked": 0, "errors": 0, "skipped": 0}
+              "blocked": 0, "errors": 0, "skipped": 0,
+              "retried": 0, "recovered": 0}
     recent: list[float] = []
 
     for i, ticker in enumerate(tickers, 1):
@@ -249,9 +281,13 @@ def main() -> int:
         windows_for_ticker = 0
 
         for lo, hi in month_starts(start, end):
-            if (ticker, lo.isoformat(), hi.isoformat()) in done:
+            key = (ticker, lo.isoformat(), hi.isoformat())
+            if key in done:
                 totals["skipped"] += 1
                 continue
+            # A window we are RETRYING is a known-bad sample and must not feed
+            # the abort rate — see _previously_blocked.
+            is_retry = key in retrying
 
             def fetch(a, b, _q=query):
                 totals["requests"] += 1
@@ -261,15 +297,20 @@ def main() -> int:
 
             for result in iter_windows(lo, hi, fetch):
                 totals["articles"] += len(result.articles)
-                windows_for_ticker += 1
                 if result.saturated:
                     totals["saturated"] += 1
                 if result.status == "blocked":
                     totals["blocked"] += 1
-                    blocked_for_ticker += 1
                 elif result.status == "error":
                     totals["errors"] += 1
-                    blocked_for_ticker += 1
+                if not is_retry:
+                    windows_for_ticker += 1
+                    if result.status != "ok":
+                        blocked_for_ticker += 1
+                else:
+                    totals["retried"] += 1
+                    if result.status == "ok":
+                        totals["recovered"] += 1
 
                 # THE RELEVANCE FILTER IS DETERMINISTIC AND RUNS HERE, not at
                 # feature time. An article attributed to the wrong ticker is
@@ -311,8 +352,12 @@ def main() -> int:
         # spread over hours. Transient refusals are now retried inside
         # `provider.fetch`, so anything still recorded blocked has survived
         # three spaced attempts.
-        recent.append(blocked_for_ticker / max(windows_for_ticker, 1))
-        recent[:] = recent[-RECENT_TICKERS:]
+        # Only tickers with FRESH windows contribute a rate. On a pure resume
+        # run there are none, so the guard stays silent rather than reading a
+        # sample made entirely of known failures.
+        if windows_for_ticker:
+            recent.append(blocked_for_ticker / windows_for_ticker)
+            recent[:] = recent[-RECENT_TICKERS:]
         if len(recent) == RECENT_TICKERS and sum(recent) / len(recent) > MAX_BLOCK_RATE:
             print(f"\n  ABORTING: {100 * sum(recent) / len(recent):.0f}% of "
                   f"windows blocked across the last {RECENT_TICKERS} tickers, "
@@ -330,6 +375,11 @@ def main() -> int:
           f"alias filter)")
     print(f"{totals['saturated']} saturated, {totals['blocked']} blocked, "
           f"{totals['errors']} errors, {totals['skipped']:,} skipped")
+    if totals["retried"]:
+        print(f"{totals['retried']} previously-failed windows retried, "
+              f"{totals['recovered']} recovered "
+              f"({totals['retried'] - totals['recovered']} still failing — "
+              f"those are index holes, see --report)")
     print("\nRun --report before building any feature on this.")
     return 0
 
