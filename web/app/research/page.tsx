@@ -13,12 +13,16 @@ import {
 import { cx, signed } from "@/lib/format";
 import {
   BAR,
+  BEST_LONG_ONLY,
+  BETA_REFERENCE,
   BOOKS,
   BREAK_EVEN,
   COMPARATORS,
   COSTS,
   DEFLATED,
+  PANEL_IC_RANGE,
   PORTFOLIO_FLOOR,
+  PORTFOLIO_WINDOW,
   SYNTHETIC,
   FOLD_DISPERSION,
   LESSONS,
@@ -36,7 +40,7 @@ import {
 export const metadata = {
   title: "Research",
   description:
-    "Every model scored against the pre-registered bar on the NIFTY 100 panel, including the two results that cleared it and were retired.",
+    "Every model scored against the pre-registered bar on the NIFTY 100 panel, including the two results that cleared it and were retired, and what the ordering was worth after real trading costs.",
 };
 
 /* ── The axis ──────────────────────────────────────────────────────────── */
@@ -712,21 +716,32 @@ export default function ResearchPage() {
         </div>
       </section>
 
-      {/* Phase 4 - what the ordering would have cost */}
+      {/* Phase 4 - what the ordering was worth, net of costs */}
       <section className="space-y-6">
         <SectionHead
-          title="What it would have cost"
-          right={<Badge tone="dim">4 Sep 2026</Badge>}
+          title="What the ordering was actually worth"
+          right={<Badge tone="dim">{PORTFOLIO_WINDOW.to}</Badge>}
           description={
             <>
-              The same null as everything above, restated in money. Every book
-              here is historical and dated, scored against what actually
-              happened next &mdash; a measurement, not a track record and not a
-              recommendation. Costs are the measured Indian equity-delivery
-              stack: STT at {(COSTS.sttEachSide * 100).toFixed(1)}%{" "}
-              <em>on each side</em>, stamp duty{" "}
-              {(COSTS.stampDutyBuy * 100).toFixed(3)}% on the buy, plus
-              exchange, SEBI and GST &mdash;{" "}
+              Over {PORTFOLIO_WINDOW.years} years to {PORTFOLIO_WINDOW.to} the
+              best long-only book returned{" "}
+              {signed(BEST_LONG_ONLY.netAnnual * 100, 2)}% a year net of costs.
+              A sort on beta alone returned{" "}
+              {signed(BETA_REFERENCE.netAnnual * 100, 2)}%. Buying the whole
+              panel returned {signed(PORTFOLIO_FLOOR * 100, 2)}%. That is the
+              finding: of the{" "}
+              {signed(BEST_LONG_ONLY.vsFloor! * 100, 2)}% the best book made
+              over the floor, a strategy holding no view about any company took{" "}
+              {signed(BETA_REFERENCE.vsFloor! * 100, 2)}%.
+              <br />
+              <br />
+              Every book here is historical and dated, scored against what
+              actually happened next &mdash; a measurement, not a track record
+              and not a recommendation. Costs are the measured Indian
+              equity-delivery stack: STT at{" "}
+              {(COSTS.sttEachSide * 100).toFixed(1)}% <em>on each side</em>,
+              stamp duty {(COSTS.stampDutyBuy * 100).toFixed(3)}% on the buy,
+              plus exchange, SEBI and GST &mdash;{" "}
               {(COSTS.roundTrip * 100).toFixed(3)}% round trip, about{" "}
               {(COSTS.annualDragTypical * 100).toFixed(1)}% a year at the
               turnover these orderings generate.
@@ -734,21 +749,25 @@ export default function ResearchPage() {
           }
         />
 
-        <Note tone="bar" title="Read the floor before you read the returns">
-          Every long-only book below beats the equal-weighted panel, and none of
-          that is skill. <strong>beta_market</strong> &mdash; which sorts by beta
-          and holds no company-specific view whatsoever &mdash; beats it by{" "}
-          {signed(7.99, 2)}%. The best of the rest manages {signed(8.95, 2)}%.
-          Indian equities rose a great deal over this window and the top fifth of
-          almost any ordering rose with them; what this table shows is that
-          tilting toward high beta captured essentially all of it.
+        <Note tone="bar" title="Read the reference row before the returns">
+          <strong>{BETA_REFERENCE.label}</strong> is pinned to the top of the
+          table on purpose. It sorts by beta and holds no company-specific view
+          whatsoever, and it beats the floor by{" "}
+          {signed(BETA_REFERENCE.vsFloor! * 100, 2)}% &mdash; against{" "}
+          {signed(BEST_LONG_ONLY.vsFloor! * 100, 2)}% for the best row in the
+          table. Indian equities rose a great deal between{" "}
+          {PORTFOLIO_WINDOW.from} and {PORTFOLIO_WINDOW.to}, and the top fifth
+          of almost any ordering rose with them. Read every row below as a
+          deviation from the reference, not as a ranking: over{" "}
+          {PORTFOLIO_WINDOW.rebalances} rebalances these books are not
+          separable from each other.
         </Note>
 
         <div className="grid gap-3 sm:grid-cols-3">
           <Readout
             label="Equal-weighted panel"
             value={`${signed(PORTFOLIO_FLOOR * 100, 1)}%/yr`}
-            sub="Buy everything, hold 30 sessions. The floor."
+            sub={`Buy everything, hold 30 sessions. The floor, ${PORTFOLIO_WINDOW.from}-${PORTFOLIO_WINDOW.to}.`}
           />
           <Readout
             label="Round-trip cost"
@@ -756,10 +775,10 @@ export default function ResearchPage() {
             sub={`${COSTS.rebalancesPerYear} rebalances a year - the horizon is 30 sessions, not 30 days`}
           />
           <Readout
-            label="Deflated Sharpe"
+            label="Deflated statistic (z)"
             value={DEFLATED.trials[1].deflated.toFixed(2)}
             tone="neg"
-            sub={`Best book, deflated for ${DEFLATED.trials[1].n} trials. Needs 1.96.`}
+            sub={`The best book's Sharpe of ${DEFLATED.sharpeAnnual.toFixed(2)}, deflated for ${DEFLATED.trials[1].n} trials. Clears at ${DEFLATED.threshold}.`}
           />
         </div>
 
@@ -778,8 +797,21 @@ export default function ResearchPage() {
             </thead>
             <tbody className="font-mono">
               {BOOKS.map((b) => (
-                <tr key={b.id} className="border-b border-rule/40">
-                  <td className="py-1.5 pr-3 font-sans">{b.label}</td>
+                <tr
+                  key={b.id}
+                  className={cx(
+                    "border-b border-rule/40",
+                    b.reference ? "bg-shell" : "",
+                  )}
+                >
+                  <td className="py-1.5 pr-3 font-sans">
+                    {b.label}
+                    {b.reference ? (
+                      <span className="ml-2 text-[0.65rem] uppercase tracking-wide text-bar">
+                        reference
+                      </span>
+                    ) : null}
+                  </td>
                   <td
                     className={cx(
                       "py-1.5 pr-3 text-right",
@@ -797,7 +829,7 @@ export default function ResearchPage() {
                     {b.sharpe.toFixed(2)}
                   </td>
                   <td className="py-1.5 pr-3 text-right text-dim">
-                    {(b.maxDrawdown * 100).toFixed(0)}%
+                    {b.marketNeutral ? "n/a" : `${(b.maxDrawdown * 100).toFixed(0)}%`}
                   </td>
                   <td className="py-1.5 text-right text-dim">
                     {b.turnover.toFixed(2)}
@@ -807,9 +839,13 @@ export default function ResearchPage() {
             </tbody>
           </table>
           <p className="mt-3 text-[0.7rem] leading-relaxed text-dim">
-            A long-short book is market-neutral by construction, so it has no
-            &ldquo;vs floor&rdquo;: differencing it against buy-everything would
-            report a loss that is nothing but the market it never held.
+            The market-neutral rows are not comparable to the ones above them
+            and three columns are blanked rather than filled. A long-short book
+            holds no net market exposure, so differencing it against
+            buy-everything reports a loss that is only the market it never held;
+            and its return series is a spread rather than a self-financing
+            portfolio, so a &ldquo;drawdown&rdquo; on it is not the quantity the
+            word usually means &mdash; one of these rows computes to over 100%.
           </p>
         </Panel>
 
@@ -849,10 +885,13 @@ export default function ResearchPage() {
               </tbody>
             </table>
             <p className="mt-3 text-[0.7rem] leading-relaxed text-dim">
-              The comparators on this panel run from +0.0464 (beta_market) down
-              to +0.0083 (news_factor) &mdash; above the bar at zero impact,
-              below it by 50bp. Clearing the bar is not the hard part. Clearing
-              it with something other than beta is.
+              The comparators on this panel run from{" "}
+              {signed(PANEL_IC_RANGE.best, 4)} ({PANEL_IC_RANGE.bestLabel}) down
+              to {signed(PANEL_IC_RANGE.worst, 4)} ({PANEL_IC_RANGE.worstLabel})
+              &mdash; above the bar at zero impact, below it by{" "}
+              {BREAK_EVEN[BREAK_EVEN.length - 1].impactBps}bp. Clearing the bar
+              is not the hard part. Clearing it with something other than beta
+              is.
             </p>
           </Panel>
 
@@ -906,7 +945,7 @@ export default function ResearchPage() {
           {DEFLATED.nRebalances} independent windows. Deflated for the{" "}
           {DEFLATED.trials[1].n} configurations this panel has been asked, the
           statistic is {DEFLATED.trials[1].deflated.toFixed(2)} against a
-          threshold of 1.96. Under the flattering count of only this
+          threshold of {DEFLATED.threshold}. Under the flattering count of only this
           phase&rsquo;s own variants it is{" "}
           {DEFLATED.trials[0].deflated.toFixed(2)}. Neither clears, and the
           larger count is the honest one: every comparator above was tried on
@@ -918,12 +957,13 @@ export default function ResearchPage() {
       <section>
         <Note tone="neutral" title="Where these numbers come from">
           Every figure on this page is transcribed from{" "}
-          <code>experiment_runs.metrics</code>, written by the weekly evaluation
-          job and rendered locally by <code>tools/run_baselines.py</code>. Unlike
-          the rest of the site they are <strong>not fetched live</strong>: the
+          <code>experiment_runs.metrics</code> and rendered locally &mdash; the
+          comparator tables by <code>tools/run_baselines.py</code>, the
+          cost-aware books by <code>tools/run_portfolio.py</code>. Unlike the
+          rest of the site they are <strong>not fetched live</strong>: the
           research log is keyed by a configuration hash and a data hash and means
-          nothing without both, and Phase 2 is closed, so a closed record is
-          served as a closed record. The board and every stock page read the API
+          nothing without both, and Phases 2 through 4 are closed, so a closed
+          record is served as a closed record. The board and every stock page read the API
           directly. See the{" "}
           <Link href="/methodology">methodology</Link> for how a forecast becomes
           a published rank, and the{" "}

@@ -476,24 +476,75 @@ export type Book = {
   sharpe: number;
   maxDrawdown: number;
   turnover: number;
+  /**
+   * A long-short book holds no net market exposure, which changes what several
+   * columns MEAN rather than just their value. Stated rather than inferred from
+   * `vsFloor === null`, so the suppressions below key on a fact about the book.
+   */
+  marketNeutral: boolean;
+  /** The control row: sorts by beta, holds no company-specific view. */
+  reference?: boolean;
 };
 
-/** The equal-weighted panel, 2019-2026. The floor every long-only row is read against. */
+/**
+ * The out-of-sample window the 64 rebalances actually cover. NAMED, because a
+ * +18.8%/yr floor cannot be judged without it and the whole beta argument
+ * depends on this period being a strong bull market.
+ */
+export const PORTFOLIO_WINDOW = {
+  from: "Nov 2018",
+  to: "Jun 2026",
+  years: 7.6,
+  rebalances: 64,
+} as const;
+
+/** The equal-weighted panel over that window. The floor every long-only row is read against. */
 export const PORTFOLIO_FLOOR = 0.188;
 
+/**
+ * ORDER IS DELIBERATE AND MUST NOT BE RE-SORTED BY RETURN.
+ *
+ * `beta_market` is pinned first as the reference row: it sorts by beta and holds
+ * no company-specific view, so every row below it is read as a deviation from a
+ * strategy with no opinion about any company. Sorting this table best-first
+ * rebuilds the leaderboard P0 removed — a ranked table invites a reader to
+ * compare rows the measurement cannot separate, and that is exactly what these
+ * rows cannot do.
+ *
+ * Market-neutral books come last, and are not comparable to the long-only rows
+ * above on return, drawdown or Calmar.
+ */
 export const BOOKS: Book[] = [
-  { id: "beta_market_lo", label: "beta_market · long-only", netAnnual: 0.2679, vsFloor: 0.0799, sharpe: 0.83, maxDrawdown: 0.592, turnover: 0.02 },
-  { id: "news_factor_lo", label: "news_factor · long-only", netAnnual: 0.2775, vsFloor: 0.0895, sharpe: 1.35, maxDrawdown: 0.211, turnover: 0.61 },
-  { id: "pooled_xgb_lo", label: "pooled_xgb · long-only", netAnnual: 0.2643, vsFloor: 0.0762, sharpe: 1.21, maxDrawdown: 0.245, turnover: 0.69 },
-  { id: "regime_factor_lo", label: "regime_factor · long-only", netAnnual: 0.2563, vsFloor: 0.0682, sharpe: 1.30, maxDrawdown: 0.239, turnover: 0.61 },
-  { id: "linear_factor_lo", label: "linear_factor · long-only", netAnnual: 0.2479, vsFloor: 0.0599, sharpe: 1.19, maxDrawdown: 0.248, turnover: 0.63 },
-  { id: "momentum_lo", label: "momentum_20d · long-only", netAnnual: 0.2017, vsFloor: 0.0137, sharpe: 0.77, maxDrawdown: 0.571, turnover: 0.79 },
-  { id: "reversal_lo", label: "reversal_5d · long-only", netAnnual: 0.1900, vsFloor: 0.0020, sharpe: 0.73, maxDrawdown: 0.499, turnover: 0.76 },
-  { id: "beta_market_ls", label: "beta_market · long-short", netAnnual: 0.1185, vsFloor: null, sharpe: 0.49, maxDrawdown: 0.599, turnover: 0.02 },
-  { id: "pooled_xgb_ls", label: "pooled_xgb · long-short", netAnnual: 0.0845, vsFloor: null, sharpe: 0.57, maxDrawdown: 0.220, turnover: 0.66 },
-  { id: "momentum_ls", label: "momentum_20d · long-short", netAnnual: -0.0443, vsFloor: null, sharpe: -0.33, maxDrawdown: 0.762, turnover: 0.79 },
-  { id: "reversal_ls", label: "reversal_5d · long-short", netAnnual: -0.0759, vsFloor: null, sharpe: -0.59, maxDrawdown: 1.101, turnover: 0.77 },
+  { id: "beta_market_lo", label: "beta_market · long-only", netAnnual: 0.2679, vsFloor: 0.0799, sharpe: 0.83, maxDrawdown: 0.592, turnover: 0.02, marketNeutral: false, reference: true },
+  { id: "news_factor_lo", label: "news_factor · long-only", netAnnual: 0.2775, vsFloor: 0.0895, sharpe: 1.35, maxDrawdown: 0.211, turnover: 0.61, marketNeutral: false },
+  { id: "pooled_xgb_lo", label: "pooled_xgb · long-only", netAnnual: 0.2643, vsFloor: 0.0762, sharpe: 1.21, maxDrawdown: 0.245, turnover: 0.69, marketNeutral: false },
+  { id: "regime_factor_lo", label: "regime_factor · long-only", netAnnual: 0.2563, vsFloor: 0.0682, sharpe: 1.30, maxDrawdown: 0.239, turnover: 0.61, marketNeutral: false },
+  { id: "linear_factor_lo", label: "linear_factor · long-only", netAnnual: 0.2479, vsFloor: 0.0599, sharpe: 1.19, maxDrawdown: 0.248, turnover: 0.63, marketNeutral: false },
+  { id: "momentum_lo", label: "momentum_20d · long-only", netAnnual: 0.2017, vsFloor: 0.0137, sharpe: 0.77, maxDrawdown: 0.571, turnover: 0.79, marketNeutral: false },
+  { id: "reversal_lo", label: "reversal_5d · long-only", netAnnual: 0.1900, vsFloor: 0.0020, sharpe: 0.73, maxDrawdown: 0.499, turnover: 0.76, marketNeutral: false },
+  { id: "beta_market_ls", label: "beta_market · long-short", netAnnual: 0.1185, vsFloor: null, sharpe: 0.49, maxDrawdown: 0.599, turnover: 0.02, marketNeutral: true },
+  { id: "pooled_xgb_ls", label: "pooled_xgb · long-short", netAnnual: 0.0845, vsFloor: null, sharpe: 0.57, maxDrawdown: 0.220, turnover: 0.66, marketNeutral: true },
+  { id: "momentum_ls", label: "momentum_20d · long-short", netAnnual: -0.0443, vsFloor: null, sharpe: -0.33, maxDrawdown: 0.762, turnover: 0.79, marketNeutral: true },
+  { id: "reversal_ls", label: "reversal_5d · long-short", netAnnual: -0.0759, vsFloor: null, sharpe: -0.59, maxDrawdown: 1.101, turnover: 0.77, marketNeutral: true },
 ];
+
+/**
+ * The control and the best row, so the prose beside the table stops carrying
+ * literals. Every other figure on this page comes from a constant; a hardcoded
+ * one in prose lies silently the moment BOOKS is updated.
+ */
+export const BETA_REFERENCE = BOOKS.find((b) => b.reference)!;
+export const BEST_LONG_ONLY = BOOKS.filter((b) => !b.marketNeutral).reduce(
+  (a, b) => (b.vsFloor! > a.vsFloor! ? b : a),
+);
+
+/** The rank ICs the panel's comparators actually reached, for the break-even note. */
+export const PANEL_IC_RANGE = {
+  best: 0.0464,
+  bestLabel: "beta_market",
+  worst: 0.0083,
+  worstLabel: "news_factor",
+} as const;
 
 /** What rank IC would be needed just to cover costs, by assumed impact cost. */
 export const BREAK_EVEN: { impactBps: number; roundTrip: number; annualDrag: number; ic: number }[] = [
@@ -505,6 +556,12 @@ export const BREAK_EVEN: { impactBps: number; roundTrip: number; annualDrag: num
 
 /** The deflated Sharpe, under both trial counts. The larger N is the honest one. */
 export const DEFLATED = {
+  /**
+   * Two-sided 95% normal critical value, and the same number
+   * `evaluation.deflated_sharpe_note` tests against. Kept here so the page
+   * cannot quote a threshold the code no longer uses.
+   */
+  threshold: 1.96,
   best: "news_factor · long-only",
   sharpeAnnual: 1.348,
   sharpePerRebalance: 0.465,
