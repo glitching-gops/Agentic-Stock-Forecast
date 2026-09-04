@@ -844,3 +844,66 @@ def test_the_node_asks_whether_we_LOOKED_not_whether_we_FOUND(engine, monkeypatc
     # A ticker nobody has looked at today MUST be fetched.
     node.external_data_node({"ticker": "BBB.NS"})
     assert calls == [["BBB.NS"]]
+
+
+# ── 7. The ambiguous-name fix ─────────────────────────────────────────────────
+
+def test_an_ambiguous_one_word_name_keeps_its_suffix_in_the_query():
+    """
+    MEASURED, 2024-Q1. A one-word company name that collides with a common word
+    returns junk on a bare query and the company on a suffixed one:
+
+        Trent -> Trent Boult, Trent Reznor, Rolls-Royce Trent engines
+        LTM   -> Fortnite's Limited Time Mode, Raytheon, dental research
+        Titan -> Saturn's moon, an MSI laptop
+        REC   -> Renewable Energy Certificates
+
+    Measured on a hand-labelled sample, TRENT.NS and LTM.NS scored precision
+    ZERO while holding 1,996 and 433 stored mentions.
+    """
+    from pipeline.news import AMBIGUOUS_SHORT_NAMES, search_query
+
+    assert search_query("TRENT.NS", "Trent Ltd.") == "Trent Ltd"
+    assert search_query("TITAN.NS", "Titan Company Ltd.") == "Titan Company Ltd"
+    assert search_query("RECLTD.NS", "REC Ltd.") == "REC Ltd"
+    assert "TRENT.NS" in AMBIGUOUS_SHORT_NAMES
+
+
+def test_the_suffix_rule_is_per_ticker_because_a_blanket_one_was_measured_worse():
+    """
+    THIRTEEN of the 84 tickers have a one-word name and only some are
+    ambiguous. Measured over the same window, the suffix costs the unambiguous
+    ones most of their articles for no precision gain:
+
+        Infosys -64%   Wipro -65%   Siemens -55%   NTPC -53%   Vedanta -55%
+
+    Every one of those scored precision 1.00 in the labelled sample, so a
+    blanket rule would punish them for Trent's problem. This pins that they are
+    NOT swept up by it.
+    """
+    from pipeline.news import search_query
+
+    assert search_query("INFY.NS", "Infosys Ltd.") == "Infosys"
+    assert search_query("WIPRO.NS", "Wipro Ltd.") == "Wipro"
+    assert search_query("VEDL.NS", "Vedanta Ltd.") == "Vedanta"
+    assert search_query("NTPC.NS", "NTPC Ltd.") == "NTPC"
+
+
+def test_a_wrong_company_name_in_the_metadata_is_corrected_here():
+    """
+    `get_company("LTM.NS")` returns "LTM Ltd.", which is not a company name —
+    the ticker is LTIMindtree. `index_membership.company` comes from the
+    exchange feed and is not always right, and every alias plus the query
+    derive from that string, so the correction has to happen before either.
+    """
+    from pipeline.news import company_aliases, resolved_company, search_query
+
+    assert resolved_company("LTM.NS", "LTM Ltd.") == "LTIMindtree Ltd."
+    assert "LTIMindtree" in search_query("LTM.NS", "LTM Ltd.")
+
+    aliases = company_aliases("LTM.NS", "LTM Ltd.")
+    assert any("LTIMindtree" in a for a in aliases)
+    # AND the bare symbol is dropped: "LTM" is all-caps, which is exactly how
+    # Fortnite writes Limited Time Mode, so the case-sensitivity that protects
+    # RELIANCE from "Reliance Power" protects nothing here.
+    assert "LTM" not in aliases

@@ -390,6 +390,46 @@ _SUFFIXES = re.compile(
     r"\b(ltd|limited|inc|corp|corporation|plc|co|company)\b\.?", re.I)
 
 
+#: Company names `get_company` returns WRONG. `index_membership.company` comes
+#: from the exchange feed and is not always the company's name; LTM.NS is
+#: LTIMindtree, and the stored "LTM Ltd." is why its query returned Fortnite
+#: patch notes — "LTM" is that game's Limited Time Mode. Corrected here because
+#: the query and every alias derive from this string.
+COMPANY_OVERRIDES: dict[str, str] = {
+    "LTM.NS": "LTIMindtree Ltd.",
+}
+
+#: Tickers whose one-word name collides with a common word or another entity.
+#: For these, and ONLY these, the corporate suffix stays in the query.
+#:
+#: MEASURED over 2024-Q1, both halves. On the ambiguous names the bare query is
+#: mostly junk and the suffix cleans it:
+#:
+#:     Trent   -> Trent Boult, Trent Reznor, Rolls-Royce Trent engines
+#:     LTM     -> Fortnite Limited Time Mode, Raytheon, dental research
+#:     Titan   -> Saturn's moon, an MSI laptop, Amazon Bedrock
+#:     REC     -> Renewable Energy Certificates
+#:     ITC     -> the US International Trade Commission
+#:     Bosch   -> the global parent rather than the listed Indian subsidiary
+#:
+#: A BLANKET "one-word name keeps its suffix" RULE WAS REJECTED ON MEASUREMENT,
+#: not on taste. Thirteen of the 84 tickers have a one-word name, and on the
+#: unambiguous ones the suffix costs most of the articles for no precision gain:
+#:
+#:     Infosys -64%   Wipro -65%   Siemens -55%   NTPC -53%   Vedanta -55%
+#:
+#: Every one of those measured at precision 1.00 in the hand-labelled sample, so
+#: a global rule would punish them for Trent's problem.
+AMBIGUOUS_SHORT_NAMES: frozenset[str] = frozenset({
+    "TRENT.NS", "ITC.NS", "TITAN.NS", "RECLTD.NS", "BOSCHLTD.NS", "LTM.NS",
+})
+
+
+def resolved_company(ticker: str, company: str) -> str:
+    """The company name to use, after any curated correction."""
+    return COMPANY_OVERRIDES.get(ticker, company)
+
+
 def core_name(company: str) -> str:
     """The company name with its corporate form removed, and nothing else."""
     return re.sub(r"\s+", " ", _SUFFIXES.sub(" ", company)).strip(" .,&")
@@ -421,7 +461,16 @@ def search_query(ticker: str, company: str) -> str:
     for free: the feed URL is already pinned to `gl=IN&ceid=IN:en`, and
     `match_ticker` requires the full core name, so "Reliance Steel & Aluminum"
     cannot match "Reliance Industries".
+
+    THE ONE EXCEPTION IS THE CORPORATE SUFFIX, and it is per-ticker rather than
+    a rule. For a name that is one common word — Trent, Titan, REC — dropping
+    "Ltd" leaves a query that returns cricketers and Saturn's moon; keeping it
+    returns the company. For Infosys or Wipro the same suffix throws away
+    two thirds of the articles for nothing. See AMBIGUOUS_SHORT_NAMES.
     """
+    company = resolved_company(ticker, company)
+    if ticker in AMBIGUOUS_SHORT_NAMES:
+        return company.strip().rstrip(".").strip() or company.strip()
     return core_name(company) or company.strip()
 
 
@@ -454,13 +503,21 @@ def company_aliases(ticker: str, company: str) -> list[str]:
     RELIANCE.NS is noise assigned to the wrong row. The residual is measured
     against a hand-labelled sample before any model is paid to adjudicate it.
     """
+    company = resolved_company(ticker, company)
     symbol = ticker.split(".")[0]
     names = {company.strip(), core_name(company)}
     names.discard("")
     # The bare symbol is cheap to include and rarely fires in prose. It is
     # restricted to alphabetic symbols of three characters or more so that a
     # short or numeric one cannot match arbitrary text.
-    if len(symbol) >= 3 and symbol.isalpha():
+    #
+    # NOT for a name already known to be ambiguous, though. "LTM" is an
+    # all-caps symbol AND the all-caps way Fortnite writes Limited Time Mode,
+    # so the case-sensitivity that protects RELIANCE from "Reliance Power"
+    # protects nothing here. Defence in depth: the narrowed query keeps those
+    # articles out, and dropping the symbol alias keeps them out if one slips
+    # past.
+    if len(symbol) >= 3 and symbol.isalpha() and ticker not in AMBIGUOUS_SHORT_NAMES:
         names.add(symbol)
     return sorted(names, key=len, reverse=True)
 
