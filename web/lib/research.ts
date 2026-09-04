@@ -442,3 +442,86 @@ export function axisRows() {
   );
   return [...scored].sort((a, b) => a.rebT - b.rebT);
 }
+
+/* ── Phase 4: what the ordering would have cost ────────────────────────────
+ *
+ * Transcribed from `tools/run_portfolio.py`, run 2026-09-04 and recorded in
+ * experiment_runs. NOT a track record and NOT a recommendation: P0 removed the
+ * portfolio from this product and it stays removed. This is the same null the
+ * rest of the page reports, restated in money so it can be read by someone who
+ * does not think in rank ICs.
+ *
+ * Every book is historical, dated, and scored against what actually happened
+ * next. Nothing here is a current or forward-looking holding.
+ */
+
+export const COSTS = {
+  /** Zerodha equity-delivery, NSE, verified 4 Sep 2026. */
+  sttEachSide: 0.001,
+  stampDutyBuy: 0.00015,
+  roundTrip: 0.002225,
+  /** 252 / 30 — the horizon is 30 SESSIONS, not 30 days. */
+  rebalancesPerYear: 8.4,
+  /** At the ~0.6 turnover these orderings actually generate. */
+  annualDragTypical: 0.011,
+} as const;
+
+export type Book = {
+  id: string;
+  label: string;
+  /** Annualised, net of the measured Indian cost stack. */
+  netAnnual: number;
+  /** Against the equal-weighted panel — buy everything. Null for market-neutral. */
+  vsFloor: number | null;
+  sharpe: number;
+  maxDrawdown: number;
+  turnover: number;
+};
+
+/** The equal-weighted panel, 2019-2026. The floor every long-only row is read against. */
+export const PORTFOLIO_FLOOR = 0.188;
+
+export const BOOKS: Book[] = [
+  { id: "beta_market_lo", label: "beta_market · long-only", netAnnual: 0.2679, vsFloor: 0.0799, sharpe: 0.83, maxDrawdown: 0.592, turnover: 0.02 },
+  { id: "news_factor_lo", label: "news_factor · long-only", netAnnual: 0.2775, vsFloor: 0.0895, sharpe: 1.35, maxDrawdown: 0.211, turnover: 0.61 },
+  { id: "pooled_xgb_lo", label: "pooled_xgb · long-only", netAnnual: 0.2643, vsFloor: 0.0762, sharpe: 1.21, maxDrawdown: 0.245, turnover: 0.69 },
+  { id: "regime_factor_lo", label: "regime_factor · long-only", netAnnual: 0.2563, vsFloor: 0.0682, sharpe: 1.30, maxDrawdown: 0.239, turnover: 0.61 },
+  { id: "linear_factor_lo", label: "linear_factor · long-only", netAnnual: 0.2479, vsFloor: 0.0599, sharpe: 1.19, maxDrawdown: 0.248, turnover: 0.63 },
+  { id: "momentum_lo", label: "momentum_20d · long-only", netAnnual: 0.2017, vsFloor: 0.0137, sharpe: 0.77, maxDrawdown: 0.571, turnover: 0.79 },
+  { id: "reversal_lo", label: "reversal_5d · long-only", netAnnual: 0.1900, vsFloor: 0.0020, sharpe: 0.73, maxDrawdown: 0.499, turnover: 0.76 },
+  { id: "beta_market_ls", label: "beta_market · long-short", netAnnual: 0.1185, vsFloor: null, sharpe: 0.49, maxDrawdown: 0.599, turnover: 0.02 },
+  { id: "pooled_xgb_ls", label: "pooled_xgb · long-short", netAnnual: 0.0845, vsFloor: null, sharpe: 0.57, maxDrawdown: 0.220, turnover: 0.66 },
+  { id: "momentum_ls", label: "momentum_20d · long-short", netAnnual: -0.0443, vsFloor: null, sharpe: -0.33, maxDrawdown: 0.762, turnover: 0.79 },
+  { id: "reversal_ls", label: "reversal_5d · long-short", netAnnual: -0.0759, vsFloor: null, sharpe: -0.59, maxDrawdown: 1.101, turnover: 0.77 },
+];
+
+/** What rank IC would be needed just to cover costs, by assumed impact cost. */
+export const BREAK_EVEN: { impactBps: number; roundTrip: number; annualDrag: number; ic: number }[] = [
+  { impactBps: 0, roundTrip: 0.002225, annualDrag: 0.0151, ic: 0.0051 },
+  { impactBps: 10, roundTrip: 0.004225, annualDrag: 0.0288, ic: 0.0097 },
+  { impactBps: 25, roundTrip: 0.007225, annualDrag: 0.0497, ic: 0.0166 },
+  { impactBps: 50, roundTrip: 0.012225, annualDrag: 0.0856, ic: 0.0282 },
+];
+
+/** The deflated Sharpe, under both trial counts. The larger N is the honest one. */
+export const DEFLATED = {
+  best: "news_factor · long-only",
+  sharpeAnnual: 1.348,
+  sharpePerRebalance: 0.465,
+  nRebalances: 64,
+  /** Measured spread of per-rebalance Sharpes across the 14 books run. */
+  sharpeSpread: 0.199,
+  trials: [
+    { label: "P4's own variants", n: 24, expectedMax: 0.393, deflated: 0.57, clears: false },
+    { label: "every trial on this panel", n: 40, expectedMax: 0.435, deflated: 0.24, clears: false, honest: true },
+  ],
+} as const;
+
+/** Planted edges of known size, to prove the simulator can see one. */
+export const SYNTHETIC: { plantedIc: number; measuredIc: number; netSharpe: number }[] = [
+  { plantedIc: 0.0, measuredIc: -0.0227, netSharpe: -0.18 },
+  { plantedIc: 0.02, measuredIc: -0.0040, netSharpe: 0.04 },
+  { plantedIc: 0.05, measuredIc: 0.0249, netSharpe: 0.59 },
+  { plantedIc: 0.10, measuredIc: 0.0748, netSharpe: 1.37 },
+  { plantedIc: 0.20, measuredIc: 0.1698, netSharpe: 2.97 },
+];

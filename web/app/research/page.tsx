@@ -13,7 +13,13 @@ import {
 import { cx, signed } from "@/lib/format";
 import {
   BAR,
+  BOOKS,
+  BREAK_EVEN,
   COMPARATORS,
+  COSTS,
+  DEFLATED,
+  PORTFOLIO_FLOOR,
+  SYNTHETIC,
   FOLD_DISPERSION,
   LESSONS,
   LORA_FOLDS,
@@ -704,6 +710,208 @@ export default function ResearchPage() {
             </div>
           ))}
         </div>
+      </section>
+
+      {/* Phase 4 - what the ordering would have cost */}
+      <section className="space-y-6">
+        <SectionHead
+          title="What it would have cost"
+          right={<Badge tone="dim">4 Sep 2026</Badge>}
+          description={
+            <>
+              The same null as everything above, restated in money. Every book
+              here is historical and dated, scored against what actually
+              happened next &mdash; a measurement, not a track record and not a
+              recommendation. Costs are the measured Indian equity-delivery
+              stack: STT at {(COSTS.sttEachSide * 100).toFixed(1)}%{" "}
+              <em>on each side</em>, stamp duty{" "}
+              {(COSTS.stampDutyBuy * 100).toFixed(3)}% on the buy, plus
+              exchange, SEBI and GST &mdash;{" "}
+              {(COSTS.roundTrip * 100).toFixed(3)}% round trip, about{" "}
+              {(COSTS.annualDragTypical * 100).toFixed(1)}% a year at the
+              turnover these orderings generate.
+            </>
+          }
+        />
+
+        <Note tone="bar" title="Read the floor before you read the returns">
+          Every long-only book below beats the equal-weighted panel, and none of
+          that is skill. <strong>beta_market</strong> &mdash; which sorts by beta
+          and holds no company-specific view whatsoever &mdash; beats it by{" "}
+          {signed(7.99, 2)}%. The best of the rest manages {signed(8.95, 2)}%.
+          Indian equities rose a great deal over this window and the top fifth of
+          almost any ordering rose with them; what this table shows is that
+          tilting toward high beta captured essentially all of it.
+        </Note>
+
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Readout
+            label="Equal-weighted panel"
+            value={`${signed(PORTFOLIO_FLOOR * 100, 1)}%/yr`}
+            sub="Buy everything, hold 30 sessions. The floor."
+          />
+          <Readout
+            label="Round-trip cost"
+            value={`${(COSTS.roundTrip * 100).toFixed(3)}%`}
+            sub={`${COSTS.rebalancesPerYear} rebalances a year - the horizon is 30 sessions, not 30 days`}
+          />
+          <Readout
+            label="Deflated Sharpe"
+            value={DEFLATED.trials[1].deflated.toFixed(2)}
+            tone="neg"
+            sub={`Best book, deflated for ${DEFLATED.trials[1].n} trials. Needs 1.96.`}
+          />
+        </div>
+
+        <Panel className="overflow-x-auto px-4 py-4">
+          <Eyebrow>Net of costs, against the floor</Eyebrow>
+          <table className="mt-3 w-full text-[0.78rem]">
+            <thead className="text-dim">
+              <tr className="border-b border-rule text-left">
+                <th className="py-1.5 pr-3 font-normal">book</th>
+                <th className="py-1.5 pr-3 text-right font-normal">net/yr</th>
+                <th className="py-1.5 pr-3 text-right font-normal">vs floor</th>
+                <th className="py-1.5 pr-3 text-right font-normal">Sharpe</th>
+                <th className="py-1.5 pr-3 text-right font-normal">max DD</th>
+                <th className="py-1.5 text-right font-normal">turnover</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono">
+              {BOOKS.map((b) => (
+                <tr key={b.id} className="border-b border-rule/40">
+                  <td className="py-1.5 pr-3 font-sans">{b.label}</td>
+                  <td
+                    className={cx(
+                      "py-1.5 pr-3 text-right",
+                      b.netAnnual < 0 ? "text-neg" : "",
+                    )}
+                  >
+                    {signed(b.netAnnual * 100, 2)}%
+                  </td>
+                  <td className="py-1.5 pr-3 text-right text-dim">
+                    {b.vsFloor === null
+                      ? "n/a"
+                      : `${signed(b.vsFloor * 100, 2)}%`}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right">
+                    {b.sharpe.toFixed(2)}
+                  </td>
+                  <td className="py-1.5 pr-3 text-right text-dim">
+                    {(b.maxDrawdown * 100).toFixed(0)}%
+                  </td>
+                  <td className="py-1.5 text-right text-dim">
+                    {b.turnover.toFixed(2)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="mt-3 text-[0.7rem] leading-relaxed text-dim">
+            A long-short book is market-neutral by construction, so it has no
+            &ldquo;vs floor&rdquo;: differencing it against buy-everything would
+            report a loss that is nothing but the market it never held.
+          </p>
+        </Panel>
+
+        <div className="grid gap-6 lg:grid-cols-2">
+          <Panel className="px-4 py-4">
+            <Eyebrow>The break-even edge</Eyebrow>
+            <Prose className="mt-2">
+              <p>
+                Inverting the cost drag gives the number worth keeping: what
+                rank IC an ordering would need just to pay for itself. Impact
+                cost is swept rather than assumed, because it is the term that
+                varies by name and no fee schedule contains it.
+              </p>
+            </Prose>
+            <table className="mt-3 w-full text-[0.78rem] font-mono">
+              <thead className="text-dim">
+                <tr className="border-b border-rule text-left">
+                  <th className="py-1.5 pr-3 font-sans font-normal">impact</th>
+                  <th className="py-1.5 pr-3 text-right font-sans font-normal">
+                    cost/yr
+                  </th>
+                  <th className="py-1.5 text-right font-sans font-normal">
+                    break-even IC
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {BREAK_EVEN.map((r) => (
+                  <tr key={r.impactBps} className="border-b border-rule/40">
+                    <td className="py-1.5 pr-3">{r.impactBps} bp</td>
+                    <td className="py-1.5 pr-3 text-right">
+                      {(r.annualDrag * 100).toFixed(2)}%
+                    </td>
+                    <td className="py-1.5 text-right">{r.ic.toFixed(4)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="mt-3 text-[0.7rem] leading-relaxed text-dim">
+              The comparators on this panel run from +0.0464 (beta_market) down
+              to +0.0083 (news_factor) &mdash; above the bar at zero impact,
+              below it by 50bp. Clearing the bar is not the hard part. Clearing
+              it with something other than beta is.
+            </p>
+          </Panel>
+
+          <Panel className="px-4 py-4">
+            <Eyebrow>Can this simulator see an edge at all?</Eyebrow>
+            <Prose className="mt-2">
+              <p>
+                A null from an untested instrument is indistinguishable from a
+                broken one, so edges of known size were planted before any real
+                number was quoted. Net Sharpe rises monotonically with the
+                planted edge, and a planted IC of 0.02 lands at roughly zero
+                after costs &mdash; the break-even opposite, arrived at
+                independently.
+              </p>
+            </Prose>
+            <table className="mt-3 w-full text-[0.78rem] font-mono">
+              <thead className="text-dim">
+                <tr className="border-b border-rule text-left">
+                  <th className="py-1.5 pr-3 font-sans font-normal">
+                    planted IC
+                  </th>
+                  <th className="py-1.5 pr-3 text-right font-sans font-normal">
+                    measured
+                  </th>
+                  <th className="py-1.5 text-right font-sans font-normal">
+                    net Sharpe
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {SYNTHETIC.map((r) => (
+                  <tr key={r.plantedIc} className="border-b border-rule/40">
+                    <td className="py-1.5 pr-3">{r.plantedIc.toFixed(2)}</td>
+                    <td className="py-1.5 pr-3 text-right text-dim">
+                      {signed(r.measuredIc, 4)}
+                    </td>
+                    <td className="py-1.5 text-right">
+                      {signed(r.netSharpe, 2)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Panel>
+        </div>
+
+        <Note tone="neg" title="And the best Sharpe does not survive the search">
+          The strongest book reaches an annualised Sharpe of{" "}
+          {DEFLATED.sharpeAnnual.toFixed(2)} &mdash;{" "}
+          {DEFLATED.sharpePerRebalance.toFixed(3)} per rebalance over{" "}
+          {DEFLATED.nRebalances} independent windows. Deflated for the{" "}
+          {DEFLATED.trials[1].n} configurations this panel has been asked, the
+          statistic is {DEFLATED.trials[1].deflated.toFixed(2)} against a
+          threshold of 1.96. Under the flattering count of only this
+          phase&rsquo;s own variants it is{" "}
+          {DEFLATED.trials[0].deflated.toFixed(2)}. Neither clears, and the
+          larger count is the honest one: every comparator above was tried on
+          the same panel chasing the same target.
+        </Note>
       </section>
 
       {/* Provenance */}

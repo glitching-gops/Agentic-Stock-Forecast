@@ -649,6 +649,69 @@ def _mean_daily_rank_ic(preds: pd.DataFrame) -> float:
 # ── Cross-sectional evaluation ────────────────────────────────────────────────
 
 
+@dataclass
+class RebalanceBook:
+    """
+    One rebalance date's holdings, as the quantile sort actually selected them.
+
+    EXTRACTED SO TWO CALLERS CANNOT DRIFT. `cross_sectional_report` scores the
+    ordering and `pipeline.portfolio` trades it, and if each did its own
+    sorting, tie-breaking and degeneracy test, the portfolio would eventually be
+    holding names the report never scored — with nothing to see, because both
+    would still render. Same reason `tools/run_baselines.py` renders the
+    weekly job's own function rather than recomputing the table.
+    """
+
+    date: str
+    day: pd.DataFrame          # the full cross-section, sorted best-first
+    top: pd.DataFrame          # the long book
+    bottom: pd.DataFrame       # the short book
+    degenerate: bool = False   # no ordering to trade: skipped by both callers
+
+
+def rebalance_books(
+    panel: pd.DataFrame,
+    rebalance_every: int = 30,
+    quantiles: int = 5,
+) -> Iterator[RebalanceBook]:
+    """
+    Yields one book per rebalance date, applying the ordering rules ONCE.
+
+    `panel` needs `date`, `ticker`, `y_pred`, `y_true` and a `_tiebreak` column;
+    `cross_sectional_report` builds the last from a hash of the ticker, which is
+    what stops a stable sort turning tied predictions into an alphabetical
+    portfolio.
+
+    Dates striding by `rebalance_every` so successive books hold NON-OVERLAPPING
+    return windows. Anything sampled more often overlaps by 29 of 30 sessions
+    and inflates every t-statistic downstream by roughly 5x.
+    """
+    if "_tiebreak" not in panel.columns:
+        panel = panel.assign(
+            _tiebreak=pd.util.hash_pandas_object(panel["ticker"], index=False)
+            .to_numpy())
+
+    floor = max(10, quantiles * 2)
+    for dt in sorted(panel["date"].unique())[::rebalance_every]:
+        day = panel[panel["date"] == dt]
+        if len(day) < floor:
+            continue
+
+        pred = day["y_pred"].to_numpy(dtype=float)
+        finite = np.isfinite(pred)
+        if finite.sum() < floor or np.ptp(pred[finite]) == 0:
+            # A PREDICTION WITH NO ORDERING EARNS NO PORTFOLIO. Reported as
+            # degenerate so the caller can count it, never scored.
+            yield RebalanceBook(date=str(dt), day=day, top=day.iloc[:0],
+                                bottom=day.iloc[:0], degenerate=True)
+            continue
+
+        day = day.sort_values(["y_pred", "_tiebreak"], ascending=[False, True])
+        k = max(2, len(day) // quantiles)
+        yield RebalanceBook(date=str(dt), day=day,
+                            top=day.head(k), bottom=day.tail(k))
+
+
 def cross_sectional_report(
     panel: pd.DataFrame,
     rebalance_every: int = 30,
@@ -698,28 +761,19 @@ def cross_sectional_report(
     tie = pd.util.hash_pandas_object(panel["ticker"], index=False).to_numpy()
     panel = panel.assign(_tiebreak=tie)
 
-    dates = sorted(panel["date"].unique())[::rebalance_every]
     records = []
     degenerate = 0
 
-    for dt in dates:
-        day = panel[panel["date"] == dt]
-        if len(day) < max(10, quantiles * 2):
-            continue
-
-        pred = day["y_pred"].to_numpy(dtype=float)
-        finite = np.isfinite(pred)
-        if finite.sum() < max(10, quantiles * 2) or np.ptp(pred[finite]) == 0:
+    for book in rebalance_books(panel, rebalance_every, quantiles):
+        if book.degenerate:
             degenerate += 1
             continue
-
-        day = day.sort_values(["y_pred", "_tiebreak"], ascending=[False, True])
-        k = max(2, len(day) // quantiles)
+        day = book.day
         records.append({
-            "date": dt,
+            "date": book.date,
             "n": len(day),
-            "top": float(day.head(k)["y_true"].mean()),
-            "bottom": float(day.tail(k)["y_true"].mean()),
+            "top": float(book.top["y_true"].mean()),
+            "bottom": float(book.bottom["y_true"].mean()),
             "all": float(day["y_true"].mean()),
             "ic": rank_ic(day["y_true"].to_numpy(), day["y_pred"].to_numpy()),
         })
@@ -765,20 +819,41 @@ def cross_sectional_report(
     }
 
 
-def deflated_sharpe_note(n_trials: int, observed_sharpe: float, n_obs: int) -> dict:
+def deflated_sharpe_note(n_trials: int, observed_sharpe: float, n_obs: int,
+                         sharpe_std: float = 1.0) -> dict:
     """
     Reports how much of an observed Sharpe ratio is explained by having tried
     many configurations (Bailey & Lopez de Prado).
 
-    The expected maximum Sharpe under the null of no skill grows with the
-    number of trials, so a backtest that searched 50 Optuna configurations per
-    stock needs a materially higher bar than one that searched none.
+    The expected maximum Sharpe under the null of no skill grows with the number
+    of trials, so a backtest that searched 50 configurations needs a materially
+    higher bar than one that searched none.
+
+    `sharpe_std` IS NOT OPTIONAL IN PRACTICE and 1.0 is almost never right. The
+    expected-maximum term is a quantity in units of the DISPERSION OF SHARPE
+    RATIOS ACROSS THE TRIALS, not in raw Sharpe units:
+
+        SR_0 = sharpe_std * [(1-g)*Phi^-1(1-1/N) + g*Phi^-1(1-1/(N*e))]
+
+    Leaving it at 1.0 compares a per-period Sharpe against a hurdle expressed in
+    standard errors, which for N=24 puts the bar at +1.98 — a level no honest
+    per-rebalance Sharpe reaches, so EVERY strategy is deflated into the floor
+    for a units reason rather than a statistical one. This function had no
+    caller and no test until P4, which is why that went unnoticed; the caller
+    now passes the measured spread of its own trials' Sharpes.
+
+    That is the same class of error as reading `daily_IC` beside `reb_t`: two
+    numbers that look comparable and are not.
     """
     if n_trials < 2 or n_obs < 3:
         return {"n_trials": n_trials, "note": "too few trials or observations"}
+    if not np.isfinite(sharpe_std) or sharpe_std <= 0:
+        return {"n_trials": n_trials,
+                "note": "sharpe_std must be positive; pass the measured spread "
+                        "of the trials' Sharpe ratios"}
 
     euler = 0.5772156649
-    e_max = (
+    e_max = sharpe_std * (
         (1 - euler) * stats.norm.ppf(1 - 1.0 / n_trials)
         + euler * stats.norm.ppf(1 - 1.0 / (n_trials * np.e))
     )
@@ -787,12 +862,14 @@ def deflated_sharpe_note(n_trials: int, observed_sharpe: float, n_obs: int) -> d
     return {
         "n_trials": n_trials,
         "observed_sharpe": float(observed_sharpe),
+        "sharpe_std_across_trials": float(sharpe_std),
         "expected_max_sharpe_under_null": float(e_max),
         "deflated_statistic": float(deflated),
         "clears_null": bool(deflated > 1.96),
         "note": (
-            f"With {n_trials} configurations tried, a Sharpe of {e_max:.3f} is "
-            f"expected from luck alone."
+            f"With {n_trials} configurations tried and a Sharpe spread of "
+            f"{sharpe_std:.3f} across them, a Sharpe of {e_max:.3f} is expected "
+            f"from luck alone."
         ),
     }
 
