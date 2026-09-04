@@ -105,11 +105,18 @@ def _score(panel, columns, min_train, n_folds=5):
     splitter = PurgedPanelWalkForward(
         n_folds=n_folds, horizon=HORIZON_SESSIONS,
         embargo=HORIZON_SESSIONS, min_train=min_train)
-    preds = panel_walk_forward(
-        panel, splitter,
+    # Columns reach the CONSTRUCTOR as well as `feature_cols`.
+    # `LinearFactorModel` reads `self.columns`, not `X`, so passing them only
+    # through the harness silently fits FACTORS and produces a row identical to
+    # `linear_factor` — which reads as "news does not help" rather than "news
+    # was never supplied". That defect has already shipped once here, as
+    # `linear_factor+val`.
+    result = panel_walk_forward(
+        panel, list(columns),
         lambda: LinearFactorModel(columns=list(columns)),
-        feature_cols=list(columns), target=TARGET)
-    return preds
+        splitter=splitter, target=TARGET,
+        rebalance_every=HORIZON_SESSIONS)
+    return result.predictions
 
 
 def main() -> int:
@@ -222,8 +229,12 @@ def main() -> int:
           f"{'news reb_IC':>13} {'FACTORS reb_IC':>16} {'delta':>9}")
 
     for fold, grp in merged.groupby("fold"):
+        # `news_has_sentiment`, NOT `news_sent_mean` — the z-score has already
+        # filled the latter, so reading it here prints 100% on every fold. The
+        # header had this defect too and it is the same one this whole phase is
+        # about: a filled zero read back as a measurement.
         cov = panel.merge(grp[["date", "ticker"]], on=["date", "ticker"])
-        coverage = float(cov["news_sent_mean"].notna().mean()) if len(cov) else np.nan
+        coverage = float(cov["news_has_sentiment"].mean()) if len(cov) else np.nan
         ic_a = cross_sectional_report(
             grp.rename(columns={"y_pred_news": "y_pred"}),
             rebalance_every=HORIZON_SESSIONS).get("mean_rank_ic", np.nan)
