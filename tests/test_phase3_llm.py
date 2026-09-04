@@ -268,32 +268,6 @@ def test_preflight_can_check_configuration_without_spending_the_budget(monkeypat
     assert all(r["status"].startswith("configured") for r in report["routes"])
 
 
-def test_an_unreadable_review_is_recorded_as_unreadable_not_as_clean(callers):
-    """
-    THE SILENT FAILURE THIS WHOLE ROUTE EXISTS FOR.
-
-    `_llm_review` json.loads() the model's answer. When that fails it records NO
-    FLAGS — which, from the board, is indistinguishable from a careful review
-    that found nothing wrong. A failure that reads as a pass.
-
-    So "no flags" is not enough to assert. The RECORD has to say the answer was
-    unreadable, and name the model that produced it, or a recurring offender is
-    averaged into silence.
-    """
-    from agents.critic_agent import _llm_review
-
-    callers[GROQ] = "I think the RSI looks fine, honestly."
-    callers[OPENROUTER] = "I think the RSI looks fine, honestly."
-
-    flags, reasoning = _llm_review({"ticker": "ABB.NS"}, "ABB.NS")
-    assert flags == []
-    assert "not valid JSON" in reasoning, (
-        "an unreadable review must not be recorded the same way as a review "
-        "that genuinely found nothing"
-    )
-    assert "openrouter:" in reasoning or "groq:" in reasoning
-
-
 def test_a_missing_key_is_reported_as_such_rather_than_as_a_dead_model(monkeypatch):
     """
     "No API key" and "the model is gone" need different fixes, so they must not

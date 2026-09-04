@@ -32,21 +32,9 @@ small and its limits are stated rather than disguised.
 
 from __future__ import annotations
 
-import json
-import os
-import re
-
 from dotenv import load_dotenv
 
-from agents.llm import (
-    DEFAULT_GROQ_MODEL,
-    NoRouteAvailable,
-    complete,
-    extract_json,
-    groq_client,
-    strip_reasoning,
-)
-from agents.state import EVIDENCE_MULTIPLIER, AgentState
+from agents.state import AgentState
 
 load_dotenv(override=True)
 
@@ -114,8 +102,6 @@ MIN_CHECKS_FOR_WEAK = 2
 # rather than about skill.
 REQUIRED_CHECKS_FOR_STRONG = 3
 
-
-_groq_client = groq_client       # re-exported; see agents/llm.py
 
 
 def grade_evidence(state: dict) -> tuple[str, list[str]]:
@@ -219,144 +205,56 @@ def grade_evidence(state: dict) -> tuple[str, list[str]]:
     return grade, reasons
 
 
-def _llm_review(state: dict, ticker: str) -> tuple[list[str], str]:
-    """
-    Asks the LLM to flag internal contradictions in the signal snapshot.
-
-    Returns ``(flags, reasoning)``. Failure returns no flags rather than a
-    default verdict, so an API outage cannot silently change a stock's grade.
-    """
-
-    # THE QUANTITY NAMED HERE IS THE ONE P1 CHANGED. `pred_return` is the
-    # stock's OWN 30-session log return, not its distance from an index. The
-    # prompt used to call it an excess return, which asked the model to check a
-    # direction conflict against a number that means something else - and, like
-    # every other half of the rename, it would have failed by producing
-    # plausible prose rather than an error.
-    prompt = f"""You are reviewing the inputs to a 30-session absolute-return forecast for an Indian (NSE) stock.
-
-Stock: {state.get('company_name', ticker)} ({ticker})
-Sector benchmark, for context only - it is NOT subtracted from the forecast: {state.get('benchmark_ticker')}
-Predicted 30-session log return of the stock itself: {state.get('pred_return')}
-Calibrated probability the stock RISES (unconditional base rate on this universe is 0.577): {state.get('prob_up')}
-
-Signal snapshot:
-{state.get('latest_signals', {})}
-
-Narrative: {state.get('signal_narrative', '')}
-
-Raise a flag ONLY where a specific, checkable contradiction is present:
-1. SIGNAL CONFLICT — RSI above 75 AND MACD histogram strongly negative, simultaneously.
-2. DIRECTION CONFLICT — the narrative describes clear momentum in the opposite
-   direction to the predicted return.
-3. THIN TRADING — OBV essentially flat across the window AND volume ROC near zero.
-4. STALE OR DEGENERATE INPUT — signal values that are constant, zero, or implausible.
-
-You are reviewing inputs, not certifying the forecast. You cannot approve anything.
-Do not comment on whether the model is accurate; you have no way to verify that.
-
-Respond ONLY with JSON:
-{{"flags": ["..."], "reasoning": "2-3 sentences"}}"""
-
-    # THE SCHEMA IS THE POINT, not a nicety. This function `json.loads()` the
-    # model's content, and a parse failure records NO FLAGS - which from the
-    # outside is indistinguishable from a clean review that found nothing
-    # wrong. A silent failure that reads as a pass. Handing the route a schema
-    # makes the malformed answer unconstructable on a model that supports one,
-    # and `extract_json` still returns None rather than {} on a fallback route
-    # that does not, so the two states stay distinguishable either way.
-    try:
-        completion = complete(
-            "critic", prompt, temperature=0.2,
-            schema={
-                "type": "object",
-                "properties": {
-                    "flags": {"type": "array", "items": {"type": "string"}},
-                    "reasoning": {"type": "string"},
-                },
-                "required": ["flags", "reasoning"],
-                "additionalProperties": False,
-            },
-        )
-    except NoRouteAvailable as exc:
-        return [], f"LLM review unavailable: {exc}"
-
-    parsed = extract_json(completion.text)
-    if parsed is None:
-        # NOT the same as "no flags found", and it must not read that way in
-        # the record. The model that produced it is named so a recurring
-        # offender is visible rather than averaged away.
-        return [], (f"LLM response from {completion.source} was not valid "
-                    f"JSON; no flags recorded.")
-
-    flags = parsed.get("flags", [])
-    if not isinstance(flags, list):
-        flags = []
-    reasoning = str(parsed.get("reasoning", ""))
-    return [str(f) for f in flags], f"{reasoning} [{completion.source}]".strip()
-
-
 def critic_node(state: AgentState) -> dict:
     """
-    Grades held-out evidence, then lets the LLM add flags that can only downgrade.
+    Grades held-out evidence. The verdict is a relabelling of that grade.
 
-    The LLM is called only where a flag could change the published row. See the
-    comment below for why that is arithmetic rather than an optimisation.
+    THE LLM SIGNAL REVIEW IS GONE, RETIRED ON MEASUREMENT (2026-09-04).
+
+    It could reach a published row through exactly one channel — a flag
+    downgrading APPROVED to FLAGGED — and APPROVED requires STRONG, which
+    requires 3 of 3 evidence checks. Audited over all 1,152 forecast rows and
+    four model versions by `tools/audit_critic_effect.py`:
+
+        model_version                  rows  gate open  flagged  CHANGED
+        (null, pre-P0)                  207          0       50        0
+        phase0-excess-return-v1         270         19      118        0
+        phase1-benchmark-audited-v2     423         13        0        0
+        rebuild-absolute-return-v3      252          6        4        0
+        TOTAL                          1152         38      172        0
+
+    NO ROW HAS EVER BEEN GRADED STRONG. The review ran on 38 rows, raised flags
+    on 172 across the project's life, and moved ZERO of them. It was not merely
+    unhelpful, it was structurally incapable of helping.
+
+    The gate that gated it rested on two closed paths — the verdict and the
+    composite score — and the score went with the ranking layer, leaving one
+    leg. The audit settles the remaining leg by measurement: the leg holds, and
+    it holds so completely that the thing it was gating had no reachable effect.
+
+    The alternative was to re-point the flags at the written narrative, where a
+    reader would see them. That is a real option and was not taken here; the
+    LLM budget is spent on the narrative itself instead, which every reader
+    already sees. Retiring the dead path first keeps the two decisions separate.
+
+    What is left is deterministic: the verdict IS the grade, renamed. That
+    redundancy is deliberate and visible rather than hidden behind a step that
+    might have changed something.
     """
-    ticker = state["ticker"]
-
     grade, reasons = grade_evidence(dict(state))
 
-    # THE LLM ONLY RUNS WHERE ITS OUTPUT CAN CHANGE THE VERDICT.
-    #
-    # This gate was built when flags reached the published board through two
-    # paths, and it was justified by BOTH being closed for an INSUFFICIENT
-    # grade: the verdict (flags only downgrade APPROVED, which requires
-    # STRONG) and the score (compute_composite_score multiplied by
-    # EVIDENCE_MULTIPLIER before deducting per flag, and the multiplier is 0.0
-    # for INSUFFICIENT, so zero times anything less a deduction is zero).
-    #
-    # THE SCORE PATH IS GONE with the ranking layer, so the argument now rests
-    # on the verdict alone. That is still sound — a flag cannot move a REJECTED
-    # row — and it still saves ~91 of 95 Groq calls a day. But it is one leg
-    # rather than two, and it is narrower than it looks: what a flag can no
-    # longer change is a NUMBER, and the P4 forecast object is supposed to
-    # explain in words why a stock does or does not work. A raised flag is
-    # exactly that kind of content. When the written analysis lands, revisit
-    # whether "cannot change the verdict" is still the right test, or whether
-    # the cost is now buying something a reader wants to see.
-    #
-    # EVIDENCE_MULTIPLIER is retained as the single definition of "INSUFFICIENT
-    # means nothing survives". It no longer multiplies anything.
-    if EVIDENCE_MULTIPLIER.get(grade, 0.0) > 0.0:
-        flags, llm_reasoning = _llm_review(dict(state), ticker)
-    else:
-        # Recorded, not silent. A skipped step that says nothing reads as a step
-        # that ran and found nothing wrong.
-        flags = []
-        llm_reasoning = (f"LLM signal review skipped: evidence grade {grade} "
-                         f"scores zero, so no flag it raised could change this "
-                         f"row.")
-
-    # Map evidence grade to a verdict, then apply LLM flags as a downgrade only.
-    verdict = {"STRONG": "APPROVED", "WEAK": "FLAGGED", "INSUFFICIENT": "REJECTED"}[grade]
-    source = "evidence_gate"
-
-    if flags and verdict == "APPROVED":
-        verdict = "FLAGGED"
-        source = "evidence_gate+llm_flags"
-    elif flags:
-        source = "evidence_gate+llm_flags"
-
-    reasoning = " ".join(reasons)
-    if llm_reasoning:
-        reasoning = f"{reasoning} LLM signal review: {llm_reasoning}"
+    verdict = {"STRONG": "APPROVED", "WEAK": "FLAGGED",
+               "INSUFFICIENT": "REJECTED"}[grade]
 
     return {
         "evidence_grade": grade,
         "evidence_reasons": reasons,
         "critic_verdict": verdict,
-        "critic_reasoning": reasoning,
-        "critic_flags": flags,
-        "critic_source": source,
+        "critic_reasoning": " ".join(reasons),
+        # Kept as an EMPTY LIST rather than removed. `agents/graph.py` writes
+        # this column and the API serialises it; a missing key would become a
+        # null where every historical row holds `[]`, and a reader cannot tell
+        # "no flags" from "the field stopped being written".
+        "critic_flags": [],
+        "critic_source": "evidence_gate",
     }

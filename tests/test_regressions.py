@@ -1206,77 +1206,69 @@ def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
     }
 
 
-def test_the_llm_is_not_called_where_its_flags_cannot_change_anything():
+def test_the_critic_makes_no_llm_call_at_all():
     """
-    95 Groq calls a day, 91 of them incapable of changing what gets published.
+    THE LLM SIGNAL REVIEW IS RETIRED, and this is what stops it creeping back.
 
-    The gate was justified by TWO closed paths: the verdict downgrade only
-    applies to APPROVED (which needs STRONG, and the live board holds none),
-    and the composite multiplied by EVIDENCE_MULTIPLIER — 0.0 for INSUFFICIENT
-    — before deducting per flag. The score path went with the ranking layer, so
-    only the verdict remains, and this test is narrowed to what still holds:
-    a flag cannot move a REJECTED verdict, so the call is still free.
+    It reached a published row through exactly one channel — a flag downgrading
+    APPROVED to FLAGGED — and APPROVED requires STRONG, which requires 3 of 3
+    evidence checks. Audited over all 1,152 forecast rows and four model
+    versions: NO ROW HAS EVER BEEN GRADED STRONG, the review ran on 38 rows,
+    raised flags on 172 across the project's life, and moved ZERO of them.
 
-    Kept rather than deleted because the SKIP must stay visible in the output.
-    A skipped step that says nothing reads as a step that ran and found nothing
-    wrong, which is the opposite of what happened.
+    So `critic_node` is now a pure function of the evidence metrics. It must
+    make no network call, and the verdict must be a deterministic relabelling
+    of the grade — anything else is a second opinion nobody measured.
     """
     from agents import critic_agent as ca
-    from agents.state import EVIDENCE_MULTIPLIER
 
-    # The gate reads the same constant that defines "INSUFFICIENT carries no
-    # weight", so the two cannot drift into disagreeing.
-    assert EVIDENCE_MULTIPLIER["INSUFFICIENT"] == 0.0
-    assert EVIDENCE_MULTIPLIER["WEAK"] > 0.0
+    assert not hasattr(ca, "_llm_review"), (
+        "the LLM signal review is retired; re-adding it needs a measurement "
+        "showing a flag can change a published row")
 
-    calls: list[str] = []
+    source = (REPO / "agents" / "critic_agent.py").read_text(encoding="utf-8")
+    for banned in ("groq", "complete(", "extract_json", "OPENROUTER"):
+        assert banned not in source, (
+            f"critic_agent reaches for {banned!r} again — the node is supposed "
+            f"to be deterministic now")
 
-    def _spy(state, ticker):
-        calls.append(ticker)
-        return ["SIGNAL CONFLICT"], "spy"
-
-    original_review = ca._llm_review
-    original_grade = ca.grade_evidence
-    ca._llm_review = _spy
+    # And the verdict really is just the grade, renamed.
+    original = ca.grade_evidence
     try:
-        ca.grade_evidence = lambda st: ("INSUFFICIENT", ["no held-out evidence"])
-        skipped = ca.critic_node({"ticker": "NOSKILL.NS"})
-
-        ca.grade_evidence = lambda st: ("WEAK", ["ic and hit rate"])
-        reviewed = ca.critic_node({"ticker": "CANBK.NS"})
+        for grade, verdict in (("STRONG", "APPROVED"), ("WEAK", "FLAGGED"),
+                               ("INSUFFICIENT", "REJECTED")):
+            ca.grade_evidence = lambda st, _g=grade: (_g, ["stub"])
+            out = ca.critic_node({"ticker": "X.NS"})
+            assert out["critic_verdict"] == verdict
+            assert out["critic_flags"] == [], (
+                "flags must stay an EMPTY LIST, not vanish — every historical "
+                "row holds [] and a null would read as 'the field stopped "
+                "being written'")
+            assert out["critic_source"] == "evidence_gate"
     finally:
-        ca._llm_review = original_review
-        ca.grade_evidence = original_grade
-
-    assert calls == ["CANBK.NS"], (
-        f"the LLM must run only where a flag can change the row; called for "
-        f"{calls}")
-
-    # A skipped step that says nothing reads as a step that ran and found
-    # nothing wrong.
-    assert "skipped" in skipped["critic_reasoning"].lower()
-    assert skipped["critic_flags"] == []
-    assert skipped["critic_verdict"] == "REJECTED"
-
-    # And the reviewed row still takes the flags it was given.
-    assert reviewed["critic_flags"] == ["SIGNAL CONFLICT"]
-    assert reviewed["critic_source"] == "evidence_gate+llm_flags"
+        ca.grade_evidence = original
 
 
-def test_the_gate_and_the_score_read_the_same_multiplier():
+def test_the_evidence_multiplier_has_no_live_reader():
     """
-    Two copies of "INSUFFICIENT means zero" would be one untestable guard.
+    EVIDENCE_MULTIPLIER was the single definition of "INSUFFICIENT means nothing
+    survives". Its two readers were the composite score, removed with the
+    ranking layer, and the critic's LLM gate, retired on measurement. Nothing
+    reads it now.
 
-    If the gate held its own literal, raising INSUFFICIENT's multiplier above
-    zero would start scoring those rows while the LLM silently kept skipping
-    them — a real change in what is published, with nothing raising.
+    It is kept in agents/state.py rather than deleted because the ORDERING
+    STRONG > WEAK > INSUFFICIENT = 0 is still the project's statement about what
+    a grade is worth, and something will want it again. What must not happen is
+    a stale IMPORT that reads as a live dependency — that is how
+    `fii_net_flow` looked wired in while contributing nothing.
     """
-    from agents import critic_agent, graph, state
+    graph_src = (REPO / "agents" / "graph.py").read_text(encoding="utf-8")
+    assert "EVIDENCE_MULTIPLIER" not in graph_src, (
+        "graph.py imports EVIDENCE_MULTIPLIER but never uses it; a dead import "
+        "is indistinguishable from a live one at a glance")
 
-    assert critic_agent.EVIDENCE_MULTIPLIER is state.EVIDENCE_MULTIPLIER
-    assert graph.EVIDENCE_MULTIPLIER is state.EVIDENCE_MULTIPLIER
-
-
+    critic_src = (REPO / "agents" / "critic_agent.py").read_text(encoding="utf-8")
+    assert "EVIDENCE_MULTIPLIER" not in critic_src
 def test_weak_evidence_requires_two_independent_checks():
     """
     WEAK used to need ONE of three checks, so the +0.02 rank-IC floor alone
@@ -1520,9 +1512,6 @@ def test_a_reasoning_model_cannot_publish_its_own_working():
     The second is the dangerous one. It is the shape this project keeps
     hitting: a silent failure that reads as a pass.
     """
-    import json
-
-    from agents.critic_agent import _llm_review
     from agents.llm import strip_reasoning
 
     assert strip_reasoning("<think>working</think>\nThe RSI is 55.") == "The RSI is 55."
@@ -1547,64 +1536,44 @@ def test_a_reasoning_model_cannot_publish_its_own_working():
     assert strip_reasoning("a <thinker> tag") == "a <thinker> tag"
     assert strip_reasoning("a <thinker>x</thinker> tag") == "a <thinker>x</thinker> tag"
 
-    # End to end through the critic: a fenced, reasoning-prefixed response of
-    # the shape a reasoning model actually returns must still yield its flags.
-    payload = json.dumps({"flags": ["SIGNAL CONFLICT"], "reasoning": "rsi high"})
-
-    # Stubbed at the PROVIDER seam rather than at the client, so the whole
-    # router path runs: route selection, strip_reasoning, then extract_json.
-    # Patching `complete` itself would test nothing but the stub.
+    # End to end through the NARRATIVE, which is where strip_reasoning still
+    # lives. The critic's call site is retired, but the narrative publishes
+    # `content` verbatim to a reader, so an unstripped chain of thought would
+    # be presented as the analysis. That is the more visible of the two
+    # failures and it is still reachable.
     import agents.llm as llm
 
     original = llm._CALLERS
     llm._CALLERS = {
         p: (lambda route, prompt, temperature, schema, timeout:
-            "<think>Let me check the RSI first.</think>\n"
-            "```json\n" + payload + "\n```")
+            "<think>Let me weigh the RSI.</think>\nRSI is elevated at 71.")
         for p in original
     }
     try:
-        flags, reasoning = _llm_review({"ticker": "ABB.NS"}, "ABB.NS")
+        out = llm.complete("narrative", "write it")
     finally:
         llm._CALLERS = original
 
-    assert flags == ["SIGNAL CONFLICT"], \
-        "an inline reasoning block must not silently cost the review its flags"
-    assert reasoning.startswith("rsi high")
-    # The review carries WHICH MODEL produced it. Without that, swapping a
-    # model silently changes what reaches the board and nothing on record says
-    # so — the same defect as an unversioned MODEL_VERSION.
-    assert "openrouter:" in reasoning or "groq:" in reasoning
+    assert out.text == "RSI is elevated at 71.", (
+        "an inline reasoning block would be published to the dashboard as the "
+        "analysis")
 
-
-def test_the_critic_is_told_which_quantity_it_is_reviewing():
+def test_the_critic_no_longer_has_a_prompt_to_get_wrong():
     """
-    P1 renamed the forecast from an excess return to the stock's own absolute
-    return. The critic's PROMPT was not renamed with it: it announced a
-    "30-session relative-return forecast" and labelled the number "Predicted
-    excess return", while handing over `pred_return`.
+    The critic's prompt described the forecast's QUANTITY, and P1 renamed that
+    quantity without renaming the prompt — it announced a "30-session
+    relative-return forecast" while handing over an absolute one. That was
+    fixed, and the whole prompt is now gone with the LLM review.
 
-    That is the same failure shape as every other half of that rename - it
-    raises nothing, produces fluent prose, and is wrong. Check 2 in the prompt
-    asks the model to flag momentum running against the predicted direction,
-    which it cannot do correctly while it believes the number has an index
-    subtracted from it.
+    Recorded rather than silently dropped: the failure mode was real and would
+    return with any new prompt. A prompt that names the wrong quantity raises
+    nothing, produces fluent prose, and is wrong.
     """
     source = (REPO / "agents" / "critic_agent.py").read_text(encoding="utf-8")
-
-    prompt = source[source.index("prompt = f\"\"\"You are reviewing"):]
-    prompt = prompt[:prompt.index('Respond ONLY with JSON')]
-
-    assert "absolute-return forecast" in prompt
-    assert "excess return" not in prompt.lower(), \
-        "the prompt still describes the target P1 replaced"
-    assert "relative-return" not in prompt
-
-    # The benchmark is still shown - it is real context for a sector read - but
-    # it must be labelled as context rather than as part of the target.
-    assert "benchmark_ticker" in prompt
-    assert "NOT subtracted" in prompt
-
+    assert "prompt" not in source.lower(), (
+        "critic_agent has a prompt again — if the review is coming back, it "
+        "must name `pred_return` as the stock's OWN absolute 30-session log "
+        "return, never an excess return")
 
 def test_the_narrative_sample_is_chosen_without_looking_at_the_forecast():
     """
@@ -3270,3 +3239,193 @@ def test_the_ic_t_stat_behind_a_published_grade_travels_with_the_row(tmp_path):
     finally:
         (db_mod.get_engine, tickers_mod.get_company,
          tickers_mod.get_sector, tickers_mod.get_benchmark_name) = original
+
+
+def test_a_critic_flag_can_only_move_a_row_that_was_going_to_be_approved():
+    """
+    The critic's ONLY channel to a published row:
+
+        verdict = {"STRONG": "APPROVED", "WEAK": "FLAGGED",
+                   "INSUFFICIENT": "REJECTED"}[grade]
+        if flags and verdict == "APPROVED":
+            verdict = "FLAGGED"
+
+    So a flag changes something exactly when the grade was STRONG. Measured
+    2026-09-04 over all 1,152 forecast rows and four model versions: NO ROW HAS
+    EVER BEEN GRADED STRONG, the LLM review was invoked on 38 of them, and the
+    number of rows a flag changed is ZERO.
+
+    This pins the arithmetic the audit rests on. If the mapping ever changes so
+    that a flag can move a WEAK or INSUFFICIENT row, the audit's definition of
+    "changed" silently stops matching the code and would keep reporting zero.
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    import pandas as pd
+    from tools.audit_critic_effect import audit, has_flags
+
+    # The flag parser: `critic_flags` is a JSON list stored as TEXT.
+    assert has_flags('["SIGNAL CONFLICT"]')
+    assert not has_flags("[]")
+    assert not has_flags(None)
+    assert not has_flags("")
+    assert not has_flags("null")
+
+    class _Engine:
+        pass
+
+    frame = pd.DataFrame([
+        # STRONG + FLAGGED: the flag downgraded it. The only movable row.
+        {"model_version": "v", "forecast_confidence": "STRONG",
+         "critic_verdict": "FLAGGED", "critic_flags": '["X"]'},
+        # STRONG + APPROVED: reviewed, nothing found, nothing moved.
+        {"model_version": "v", "forecast_confidence": "STRONG",
+         "critic_verdict": "APPROVED", "critic_flags": "[]"},
+        # WEAK + FLAGGED: FLAGGED already, with or without the flag.
+        {"model_version": "v", "forecast_confidence": "WEAK",
+         "critic_verdict": "FLAGGED", "critic_flags": '["X"]'},
+        # INSUFFICIENT: the gate never even opened.
+        {"model_version": "v", "forecast_confidence": "INSUFFICIENT",
+         "critic_verdict": "REJECTED", "critic_flags": "[]"},
+    ])
+
+    import tools.audit_critic_effect as mod
+    original = pd.read_sql
+    pd.read_sql = lambda *a, **k: frame.copy()
+    try:
+        out = audit(engine=_Engine())
+    finally:
+        pd.read_sql = original
+
+    assert list(out["changed"]) == [True, False, False, False], (
+        "only a STRONG row published as FLAGGED was moved by its flag")
+    assert list(out["gate_open"]) == [True, True, True, False], (
+        "the LLM review runs on STRONG and WEAK, never on INSUFFICIENT")
+
+
+def test_a_matured_forecast_actually_resolves_into_forecast_outcomes():
+    """
+    `forecast_outcomes` IS THE ONLY MEASUREMENT THIS PROJECT TAKES ON PUBLISHED
+    OUTPUT, and as of 2026-09-04 it holds zero rows — not because anything is
+    broken, but because forecasts under the current MODEL_VERSION begin
+    2026-09-02 and resolution needs 30 sessions. The first one matures in
+    mid-October.
+
+    That is a six-week gap in which a silent no-op here would be invisible, and
+    the cost of discovering it in October is the whole first batch. So this
+    drives the real `resolve_due_forecasts` against a synthetic forecast whose
+    horizon HAS closed and asserts a row comes out with the right realised
+    return — turning a calendar wait into a check that passes today or names
+    the defect today.
+
+    Everything is built from `init_db()` rather than hand-written DDL. A fixture
+    carrying its own CREATE TABLE passes happily while the production schema is
+    wrong, which is exactly how `forecast_outcomes` once shipped missing a
+    column its own writer needed.
+    """
+    from datetime import datetime, timedelta
+
+    import pandas as pd
+    from sqlalchemy import create_engine, text
+
+    import data.db as db
+    from pipeline.outcomes import resolve_due_forecasts
+    from pipeline.signals import HORIZON_SESSIONS
+
+    engine = create_engine("sqlite://")
+    original = getattr(db, "_ENGINE", None)
+    db._ENGINE = engine
+    try:
+        db.init_db()
+
+        # A forecast made on day 0, and 30+ sessions of signals after it so the
+        # horizon has genuinely closed.
+        days = [(datetime(2026, 1, 5) + timedelta(days=i)).strftime("%Y-%m-%d")
+                for i in range(HORIZON_SESSIONS + 10)]
+        made_on = days[0]
+
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO forecasts
+                    (ticker, company, current_price, pred_return, interval_low,
+                     interval_high, benchmark_ticker, model_version,
+                     forecast_confidence, critic_verdict, last_updated)
+                VALUES ('AAA.NS','Acme',100.0,0.05,95.0,115.0,'^NSEI',
+                        'test-v1','WEAK','FLAGGED', :ts)
+            """), {"ts": f"{made_on} 10:00:00"})
+            for i, d in enumerate(days):
+                conn.execute(text("""
+                    INSERT INTO signals (date, ticker, close, target_return,
+                                         target_excess_return, benchmark_return,
+                                         benchmark_ticker)
+                    VALUES (:d,'AAA.NS',:c,:tr,:te,:br,'^NSEI')
+                """), {"d": d, "c": 100.0 + i,
+                       # The realised label on the forecast date is what the
+                       # outcome must pick up — 0.08 against a predicted 0.05.
+                       "tr": 0.08 if d == made_on else 0.01,
+                       "te": 0.03 if d == made_on else 0.00,
+                       "br": 0.05 if d == made_on else 0.01})
+            conn.commit()
+
+        report = resolve_due_forecasts(engine=engine)
+
+        rows = pd.read_sql(text("SELECT * FROM forecast_outcomes"), engine)
+        assert len(rows) == 1, (
+            f"a forecast whose {HORIZON_SESSIONS}-session horizon has closed "
+            f"did not resolve; resolve_due_forecasts reported {report.summary()}")
+
+        row = rows.iloc[0]
+        assert row["ticker"] == "AAA.NS"
+        assert row["forecast_date"] == made_on
+        assert float(row["realised_return"]) == pytest.approx(0.08)
+        assert float(row["pred_return"]) == pytest.approx(0.05)
+        # Predicted +0.05, realised +0.08 — same sign, so the direction was right.
+        assert bool(row["direction_correct"]) is True
+        # THE INTERVAL IS A PRICE BAND, not a return band, and it resolves
+        # against `price_at_forecast * exp(realised)`. The first version of this
+        # test passed return-space bounds and the coverage check failed — the
+        # fixture was wrong, not the code, and the distinction is worth pinning
+        # because the two are the same shape and only one is right.
+        # 100 * exp(0.08) = 108.33, inside [95, 115].
+        assert bool(row["inside_interval"]) is True
+
+        # AND IT IS APPEND-ONLY. Re-running must not write a second row or
+        # revise the first: a published claim that can be quietly improved
+        # after the fact is not evidence.
+        again = resolve_due_forecasts(engine=engine)
+        assert len(pd.read_sql(text("SELECT * FROM forecast_outcomes"), engine)) == 1
+        assert again.resolved == 0
+    finally:
+        db._ENGINE = original
+
+
+def test_the_grade_predictiveness_bar_refuses_a_sample_it_cannot_resolve():
+    """
+    PRE-REGISTERED 2026-09-04, before any outcome existed. The tool must refuse
+    to report a margin the sample cannot separate, rather than printing one with
+    a caveat — a caveat above a number does not survive the number being quoted,
+    which is the same reason `score_news_feature` withholds below its coverage
+    floor.
+
+    The Wilson interval is used rather than the normal approximation because at
+    ~30 rows and a hit rate near 0.5 the textbook interval is wrong in the
+    direction that flatters a result.
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    from tools.score_grade_predictiveness import MIN_ROWS_PER_GROUP, wilson
+
+    assert MIN_ROWS_PER_GROUP >= 30
+
+    lo, hi = wilson(15, 30)
+    assert lo < 0.5 < hi, "a coin flip over 30 rows must not look decisive"
+    assert hi - lo > 0.3, (
+        "the interval at n=30 is wide, which is the fact the floor exists for")
+
+    # It narrows with evidence, and never leaves [0, 1].
+    lo2, hi2 = wilson(500, 1000)
+    assert hi2 - lo2 < 0.07
+    lo3, hi3 = wilson(0, 10)
+    assert lo3 >= 0.0 and hi3 <= 1.0, "Wilson must stay inside [0, 1]"
