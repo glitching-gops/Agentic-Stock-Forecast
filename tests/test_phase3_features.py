@@ -482,3 +482,50 @@ def test_importing_the_scorer_does_not_import_torch():
          "print('torch' in sys.modules or 'transformers' in sys.modules)"],
         capture_output=True, text=True)
     assert result.stdout.strip() == "False", result.stdout + result.stderr
+
+
+# ── 8. The relevance audit ────────────────────────────────────────────────────
+
+def test_the_relevance_audit_counts_the_four_cells_correctly():
+    """
+    The audit is a MEASUREMENT tool, so its arithmetic is the thing to pin. A
+    precision figure that is quietly wrong is worse than none: it would be
+    quoted as evidence that the alias filter is fine.
+
+    Measured on the real archive 2026-09-04: precision 0.680, recall 0.723 over
+    100 hand-labelled articles, with 13 of 16 false positives coming from two
+    tickers whose company name is a common word (TRENT, LTM).
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    from tools.audit_news_relevance import score
+
+    rows = [
+        {"kept_by_filter": True,  "label": 1},   # TP
+        {"kept_by_filter": True,  "label": 1},   # TP
+        {"kept_by_filter": True,  "label": 0},   # FP
+        {"kept_by_filter": False, "label": 1},   # FN
+        {"kept_by_filter": False, "label": 0},   # TN
+        {"kept_by_filter": False, "label": None},  # unlabelled: ignored
+    ]
+    m = score(rows)
+    assert (m["tp"], m["fp"], m["fn"], m["tn"]) == (2, 1, 1, 1)
+    assert m["n_labelled"] == 5, "an unlabelled row must not count as a zero"
+    assert m["precision"] == pytest.approx(2 / 3)
+    assert m["recall"] == pytest.approx(2 / 3)
+
+
+def test_an_unlabelled_worksheet_refuses_rather_than_reporting_zero():
+    """
+    Reporting precision 0.000 on an unlabelled sheet would read as "the filter
+    keeps nothing right" instead of "nobody has labelled it yet" — the same
+    None-vs-0.0 confusion this whole phase is about.
+    """
+    import sys, os
+    if os.getcwd() not in sys.path:
+        sys.path.append(os.getcwd())
+    from tools.audit_news_relevance import score
+
+    with pytest.raises(SystemExit):
+        score([{"kept_by_filter": True, "label": None}])

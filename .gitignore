@@ -84,3 +84,5 @@ baselines_*.json
 # Serena MCP server's per-project cache and memories — machine-local, and it
 # re-derives itself from the source tree on demand.
 .serena/
+news_relevance_sample.json
+news_relevance_subsample_idx.json

@@ -400,10 +400,15 @@ def main() -> int:
                 kept_for_ticker += len(keep)
 
                 if not args.dry_run:
-                    matched = keep[0][1] if keep else None
-                    store_window(result, ticker,
-                                 matched_by=f"alias:{matched}" if matched else None,
-                                 engine=engine)
+                    # PER ARTICLE, not per window. Stamping the first kept
+                    # article's alias onto every other one made `matched_by`
+                    # wrong for any window where two different aliases fired,
+                    # which is exactly the attribution a precision measurement
+                    # needs.
+                    store_window(
+                        result, ticker, engine=engine,
+                        matched_by_article={a.article_id: f"alias:{alias}"
+                                            for a, alias in keep})
 
         rate = totals["requests"] / max(time.time() - began, 1e-9)
         print(f"  [{i:>3}/{len(tickers)}] {ticker:<18} "

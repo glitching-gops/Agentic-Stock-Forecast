@@ -502,7 +502,7 @@ def match_ticker(title: str, aliases: Iterable[str]) -> str | None:
 # ── Storage ───────────────────────────────────────────────────────────────────
 
 def store_window(result: WindowResult, ticker: str, matched_by: str | None = None,
-                 engine=None) -> dict:
+                 engine=None, matched_by_article: dict[str, str] | None = None) -> dict:
     """
     Persists one window's articles, mentions and its coverage row.
 
@@ -510,6 +510,15 @@ def store_window(result: WindowResult, ticker: str, matched_by: str | None = Non
     errored fetch. That is the whole point: a window with no row is a window
     nobody looked at, and a feature reading zero articles has to be able to
     tell that from a window that was searched and genuinely held none.
+
+    `matched_by_article` maps article_id -> the alias that actually fired, and
+    it is what should be passed. THE SCALAR `matched_by` IS PER-WINDOW AND WAS
+    A DEFECT: the backfill computed it once from the FIRST kept article and
+    stamped it on every other article in the same window, so a story matched by
+    "Tata Steel" could be recorded as matched by "Tata Consultancy Services".
+    That silently broke the one thing the column exists for — attributing a
+    precision measurement back to the rule that produced it. The scalar is kept
+    only as a fallback for callers with genuinely one rule for the whole batch.
     """
     engine = engine or get_engine()
     now = datetime.now(timezone.utc).isoformat()
@@ -534,7 +543,9 @@ def store_window(result: WindowResult, ticker: str, matched_by: str | None = Non
                 VALUES (:aid, :t, :m, :seen)
                 ON CONFLICT (article_id, ticker) DO NOTHING
             """), {"aid": art.article_id, "t": ticker,
-                   "m": matched_by or "query", "seen": now})
+                   "m": ((matched_by_article or {}).get(art.article_id)
+                         or matched_by or "query"),
+                   "seen": now})
             mentions += 1
 
         conn.execute(text("""
