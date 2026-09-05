@@ -190,6 +190,29 @@ def _metrics(book: BookResult, benchmark: list[float] | None = None) -> dict:
     return out
 
 
+def _turn(new: set[str], old: set[str]) -> float:
+    """
+    Fraction of a book doing a ROUND TRIP, the unit costs are charged in.
+
+    A rebalance that replaces half the names sells 50% and buys 50% — one round
+    trip on half the book, so 0.5. Opening the book buys 100% and sells nothing,
+    which is half a round trip, so 0.5 as well; reporting it as 1.0 there would
+    double-charge the first rebalance.
+
+    AT MODULE SCOPE BECAUSE TWO SIMULATORS CHARGE COSTS. `simulate` and
+    `simulate_hedged` must agree on what a round trip is, and two copies of this
+    rule would drift with nothing to see — both books would still render, and
+    only the cost drag would silently disagree. Same argument that pulled
+    `rebalance_books` out of `cross_sectional_report`.
+    """
+    if not new and not old:
+        return 0.0
+    entered = len(new - old)
+    exited = len(old - new)
+    base = max(len(new), len(old), 1)
+    return (entered + exited) / (2.0 * base)
+
+
 def simulate(predictions: pd.DataFrame, costs: CostModel | None = None,
              rebalance_every: int = HORIZON_SESSIONS, quantiles: int = 5,
              long_only: bool = True) -> BookResult:
@@ -224,20 +247,6 @@ def simulate(predictions: pd.DataFrame, costs: CostModel | None = None,
         gross = float(rb.top["y_true"].mean())
         if not long_only:
             gross -= float(rb.bottom["y_true"].mean())
-
-        # Fraction of the book doing a ROUND TRIP, which is the unit costs are
-        # charged in. A rebalance that replaces half the names sells 50% and
-        # buys 50% — one round trip on half the book, so 0.5. Opening the book
-        # buys 100% and sells nothing, which is half a round trip, so 0.5 as
-        # well. Reporting it as 1.0 there would double-charge the first
-        # rebalance.
-        def _turn(new: set[str], old: set[str]) -> float:
-            if not new and not old:
-                return 0.0
-            entered = len(new - old)
-            exited = len(old - new)
-            base = max(len(new), len(old), 1)
-            return (entered + exited) / (2.0 * base)
 
         turn = _turn(longs, held)
         if not long_only:
@@ -306,3 +315,86 @@ def synthetic_predictions(truth: pd.DataFrame, target_ic: float,
         d["y_pred"] = blended
         parts.append(d)
     return pd.concat(parts, ignore_index=True)
+
+
+def simulate_hedged(predictions: pd.DataFrame, beta: pd.DataFrame,
+                    costs: CostModel | None = None,
+                    rebalance_every: int = HORIZON_SESSIONS,
+                    quantiles: int = 5) -> BookResult:
+    """
+    The same ordering, held BETA-NEUTRAL. The money-space twin of
+    `pipeline.neutralise`.
+
+    P4's finding was that the long-only excess over the equal-weighted floor is
+    almost entirely a beta tilt: `beta_market`, which holds no company-specific
+    view at all, took +7.99%/yr of the best book's +8.95%. This holds the top
+    quintile and shorts the equal-weighted panel sized to the book's own mean
+    beta, so the market channel is removed by construction and what remains is
+    whatever the ordering knew about individual companies.
+
+    WHY THIS NEEDS A REAL BETA AND `neutralise` DOES NOT. Rank IC is
+    scale-invariant, so §1 can residualise on `beta_market`'s prediction
+    (``beta_i * mu_market``) and get numerically identical answers to
+    residualising on ``beta_i``. A HEDGE RATIO IS NOT SCALE-FREE: shorting
+    ``beta_i * mu_market`` units of the market is shorting the wrong amount by a
+    factor of mu_market, which is ~0.02. So this takes a dimensionally real beta
+    — `regime.rolling_beta`, trailing, and the only estimate a live book could
+    actually have used.
+
+    COSTS ARE DENOMINATED IN LONG-BOOK UNITS, and so is the return: both are per
+    unit of long notional, which keeps them comparable to each other and to
+    `simulate`. The hedge leg is charged the full equity round trip, which
+    OVERSTATES it — an index future or ETF pays no STT on the buy side and lower
+    exchange fees. Modelling a second cost schedule for one leg would be a
+    second set of numbers to keep true; erring against the strategy is the safe
+    direction for a measurement whose expected answer is a null.
+
+    Returns a `BookResult` whose series is a SPREAD, not a self-financing
+    portfolio. It therefore has no meaningful "vs floor" and its drawdown is not
+    the quantity that word usually names — the same suppression the P4 table
+    applies to its long-short rows.
+    """
+    costs = costs or CostModel()
+    if "beta" not in beta.columns:
+        raise ValueError("simulate_hedged needs a 'beta' column (a real slope, "
+                         "not beta_market's scaled prediction)")
+
+    lookup = {(str(d), str(t)): float(b) for d, t, b
+              in zip(beta["date"], beta["ticker"], beta["beta"])
+              if np.isfinite(b)}
+
+    book = BookResult(name=f"beta_neutral@{quantiles}", n_rebalances=0)
+    held: set[str] = set()
+    prev_hedge = 0.0
+
+    for rb in rebalance_books(predictions, rebalance_every, quantiles):
+        if rb.degenerate:
+            book.n_no_ordering += 1
+            continue
+
+        longs = set(rb.top["ticker"])
+        # A name with no trailing beta gets 1.0 — the market's own exposure,
+        # which is the least assertive available answer. Dropping it instead
+        # would change which names the book holds and stop it trading the
+        # ordering `cross_sectional_report` scored.
+        betas = [lookup.get((rb.date, str(t)), 1.0) for t in rb.top["ticker"]]
+        hedge = float(np.mean(betas)) if betas else 0.0
+
+        long_ret = float(rb.top["y_true"].mean())
+        market_ret = float(rb.day["y_true"].mean())
+        gross = long_ret - hedge * market_ret
+
+        # Long leg trades names; hedge leg trades NOTIONAL. A one-sided notional
+        # change of size |d| against a book of 1.0 is half a round trip, which is
+        # the same convention `_turn` uses for entering a full book.
+        turn = _turn(longs, held) + abs(hedge - prev_hedge) / 2.0
+        cost = turn * costs.round_trip
+
+        book.gross_returns.append(gross)
+        book.net_returns.append(gross - cost)
+        book.turnover.append(turn)
+        book.dates.append(rb.date)
+        book.n_rebalances += 1
+        held, prev_hedge = longs, hedge
+
+    return book

@@ -574,6 +574,33 @@ export const DEFLATED = {
   ],
 } as const;
 
+/**
+ * Phase 5 — what happens to the ordering once the beta channel is removed from
+ * the target, within each date. The question P4 forced, and the answer is not
+ * the one it was asked in expectation of.
+ */
+export const NEUTRALISED = {
+  /** Share of within-date target variance the beta channel actually explains. */
+  betaChannelR2: 0.065,
+  floor: { label: "beta_market", rawIc: 0.0464, residualIc: -0.0045 },
+  best: { label: "pooled_xgb", rawIc: 0.0389, residualIc: 0.041, residualT: 2.71 },
+  /** The same residual t across the min_train grid. The headline is the spike. */
+  sweep: [
+    { minTrain: 380, t: 2.08, headline: false },
+    { minTrain: 420, t: 0.93, headline: false },
+    { minTrain: 460, t: 1.26, headline: false },
+    { minTrain: 500, t: 2.71, headline: true },
+    { minTrain: 540, t: 1.67, headline: false },
+    { minTrain: 580, t: 1.47, headline: false },
+  ],
+  /** A pre-registered regime split, at one cell of the same grid. */
+  regimeArtifactT: 5.21,
+  /** Best beta-neutral book, deflated at the cumulative trial count. */
+  hedgedBestSharpe: 0.79,
+  deflatedAtCumulative: -1.03,
+  cumulativeTrials: 103,
+} as const;
+
 /** Planted edges of known size, to prove the simulator can see one. */
 export const SYNTHETIC: { plantedIc: number; measuredIc: number; netSharpe: number }[] = [
   { plantedIc: 0.0, measuredIc: -0.0227, netSharpe: -0.18 },

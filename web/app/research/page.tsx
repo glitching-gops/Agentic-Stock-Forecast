@@ -20,6 +20,7 @@ import {
   COMPARATORS,
   COSTS,
   DEFLATED,
+  NEUTRALISED,
   PANEL_IC_RANGE,
   PORTFOLIO_FLOOR,
   PORTFOLIO_WINDOW,
@@ -952,6 +953,38 @@ export default function ResearchPage() {
           the same panel chasing the same target.
         </Note>
       </section>
+
+      <Note tone="bar" title="And it is not the beta either">
+        The obvious reading of the table above is that these orderings are just a
+        beta tilt. That was tested directly, by removing the beta channel from the
+        target within each date and re-scoring every ordering against what was
+        left &mdash; and it is <strong>not</strong> what is happening.{" "}
+        <strong>{NEUTRALISED.floor.label}</strong> loses all of its ordering
+        ({signed(NEUTRALISED.floor.rawIc, 4)} &rarr;{" "}
+        {signed(NEUTRALISED.floor.residualIc, 4)}), while{" "}
+        <strong>{NEUTRALISED.best.label}</strong> loses none of its own
+        ({signed(NEUTRALISED.best.rawIc, 4)} &rarr;{" "}
+        {signed(NEUTRALISED.best.residualIc, 4)}). The two are close to
+        independent, and the beta channel explains only{" "}
+        {(NEUTRALISED.betaChannelR2 * 100).toFixed(1)}% of within-date variance
+        in the first place. So the models were never tracking beta. They are
+        weak on their own account, which is the worse of the two explanations.
+        <br />
+        <br />
+        Nothing survives anyway. The best residual reading of{" "}
+        t {signed(NEUTRALISED.best.residualT, 2)} is a single cell: across the
+        same grid it reads{" "}
+        {NEUTRALISED.sweep.filter((c) => !c.headline)
+          .map((c) => signed(c.t, 2)).join(", ")}. A pre-registered
+        volatility split pushed one cell to t{" "}
+        {signed(NEUTRALISED.regimeArtifactT, 2)} &mdash; a one-in-a-million
+        p-value whose immediate neighbours on the same rows sit near{" "}
+        {signed(1.5, 1)}. Held beta-neutral, the best book reaches a Sharpe of{" "}
+        {NEUTRALISED.hedgedBestSharpe.toFixed(2)} and deflates to{" "}
+        {signed(NEUTRALISED.deflatedAtCumulative, 2)} against{" "}
+        {DEFLATED.threshold} once all {NEUTRALISED.cumulativeTrials} trials this
+        panel has been asked are counted.
+      </Note>
 
       {/* Provenance */}
       <section>
