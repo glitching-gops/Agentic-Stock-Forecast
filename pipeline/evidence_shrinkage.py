@@ -424,11 +424,42 @@ def rank_ic_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
+def contiguous_segments(fold_ids: np.ndarray) -> list[tuple[int, int]]:
+    """
+    Half-open [start, stop) runs of rows that are ADJACENT IN TIME.
+
+    Fold ids are consecutive integers assigned by `PurgedWalkForward` in date
+    order, and its test windows abut, so rows carrying folds 3 and 4 are
+    neighbours in the calendar. A run therefore breaks only where the fold id
+    JUMPS BY MORE THAN ONE - which is exactly what dropping fold 2 from
+    {0,1,2,3,4} leaves behind. It also breaks on any decrease, which cannot
+    happen in a date-ordered series and is treated as a seam rather than
+    silently accepted.
+    """
+    if fold_ids.size == 0:
+        return []
+    breaks = np.nonzero(np.diff(fold_ids) != 0)[0]
+    seams = [i for i in breaks if fold_ids[i + 1] - fold_ids[i] != 1]
+    bounds = [0] + [int(i) + 1 for i in seams] + [int(fold_ids.size)]
+    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+
+
+def _block_start_pool(n_valid: int, block: int,
+                      fold_ids: np.ndarray | None) -> np.ndarray:
+    """Every index a full block fits into without crossing a seam."""
+    if fold_ids is None:
+        return np.arange(0, max(n_valid - block + 1, 0))
+    pools = [np.arange(lo, hi - block + 1)
+             for lo, hi in contiguous_segments(fold_ids) if hi - lo >= block]
+    return np.concatenate(pools) if pools else np.array([], dtype=int)
+
+
 def block_bootstrap_ic(
     track: TickerTrack,
     block: int = BLOCK_LENGTH_SESSIONS,
     n_resamples: int = BOOTSTRAP_N_RESAMPLES,
     seed: int = BOOTSTRAP_SEED,
+    respect_fold_gaps: bool = False,
 ) -> BootstrapEstimate:
     """
     Point estimate and sampling variance of one ticker's out-of-sample rank IC.
@@ -503,11 +534,37 @@ def block_bootstrap_ic(
                 f"against the realised period returns")
 
     n_blocks = int(np.ceil(n_valid / block))
-    n_starts = n_valid - block + 1
+
+    # LEGAL BLOCK START POSITIONS.
+    #
+    # Ordinarily this is every position a full block fits into,
+    # `arange(0, n_valid - block + 1)`, because the out-of-sample series is
+    # contiguous (see the module docstring). `respect_fold_gaps` is for the
+    # Stage 0 ADDENDUM, which drops whole degenerate folds and hands back a
+    # series with SEAMS in it: rows either side of a removed fold are months
+    # apart, and a block spanning that join would splice two non-adjacent
+    # periods together and manufacture continuity that is not there.
+    #
+    # STRICTLY ADDITIVE AND BIT-IDENTICAL BY DEFAULT. With no gaps the pool is
+    # `arange(0, n_valid - block + 1)`, so `pool[rng.integers(0, len(pool))]`
+    # draws exactly the values `rng.integers(0, n_starts)` drew before - same
+    # bounds, same shape, same stream, same result. A test pins that equality,
+    # and the addendum's tau = 1.00 cell re-derives Stage 0's mu_hat to the last
+    # digit as a second check.
+    starts_pool = _block_start_pool(
+        n_valid, block,
+        np.asarray(track.folds)[valid] if (respect_fold_gaps
+                                           and track.folds is not None) else None)
+    if starts_pool.size == 0:
+        return BootstrapEstimate(
+            track.ticker, n, n_blocks, float(hat), float("nan"), 0, False,
+            f"no surviving contiguous run is as long as the {block}-session "
+            f"block, so no resample can be drawn")
 
     rng = np.random.default_rng(
         [seed, int.from_bytes(track.ticker.encode("utf-8"), "little")])
-    starts = rng.integers(0, n_starts, size=(n_resamples, n_blocks))
+    starts = starts_pool[rng.integers(0, len(starts_pool),
+                                      size=(n_resamples, n_blocks))]
     # (n_resamples, n_blocks, block) -> (n_resamples, n_blocks * block), then
     # truncated back to the original length so every resample is the same size
     # as the sample it estimates.
@@ -803,6 +860,7 @@ def grade_panel(
     posterior_threshold: float = STRONG_POSTERIOR_THRESHOLD,
     spread_per_ic: float | None = None,
     break_even: float | None = None,
+    respect_fold_gaps: bool = False,
 ) -> PanelGrading:
     """
     Bootstrap, pool, shrink, control and grade — the whole Stage 0 layer.
@@ -817,7 +875,9 @@ def grade_panel(
     from pipeline.model import MODEL_VERSION
 
     estimates = [block_bootstrap_ic(t, block=block, n_resamples=n_resamples,
-                                    seed=seed) for t in tracks]
+                                    seed=seed,
+                                    respect_fold_gaps=respect_fold_gaps)
+                 for t in tracks]
     usable = [e for e in estimates if e.usable]
     if len(usable) < 2:
         raise EvidenceGradingRefused(

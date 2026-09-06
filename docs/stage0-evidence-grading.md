@@ -9,6 +9,12 @@
 Pre-registration: [`stage0-preregistration.md`](stage0-preregistration.md),
 committed before the layer was run on a single real ticker.
 
+Addendum: [`stage0-addendum-degeneracy-sweep.md`](stage0-addendum-degeneracy-sweep.md)
+— a sensitivity sweep over the degenerate folds. It does not revise any
+number below; it establishes that `mu_hat = -0.05988` is a diagnostic of a
+broken model rather than a measurement of skill, and surfaces a positive
+within-fold time-series IC underneath it.
+
 ---
 
 ## What this is

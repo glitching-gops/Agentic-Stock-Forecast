@@ -93,3 +93,6 @@ news_relevance_subsample_idx.json
 # tools/run_evidence_grading.py. The findings live in docs/, not here.
 stage0_report.txt
 evidence_grades_v2.csv
+stage0_addendum.txt
+stage0_addendum.md
+stage0_addendum.csv
