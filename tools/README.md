@@ -39,3 +39,35 @@ history that could be mistaken for complete. Re-run it periodically:
 ```bash
 python -c "from data.universe import backfill_membership_from_wayback as b; print(b())"
 ```
+
+## Evidence-Grading Redesign — Stage 0
+
+**Separate track from the project's Phase 0-6 roadmap; neither renumbers the
+other.**
+
+### run_evidence_grading.py
+
+Runs the Stage 0 shadow grading layer (`pipeline/evidence_shrinkage.py`) and
+prints the old-grade against new-grade crosstab plus the panel diagnostics
+`mu_hat` and `tau2_hat` — which are the finding, not an intermediate number.
+
+Empirical-Bayes partial pooling (James-Stein / Efron-Morris shrinkage,
+DerSimonian-Laird between-ticker variance, block bootstrap at the 30-session
+label horizon, Benjamini-Hochberg FDR across the panel) replaces the live
+gate's per-ticker frequentist checks, which at `n_effective ≈ 64` per name
+demand a rank IC of ~0.25 to reach t = 2 — an effect size that does not exist
+in monthly cross-sectional equity prediction.
+
+**Shadow only.** Writes `evidence_grades_v2` and nothing the public API serves;
+`forecast_confidence` and the old gate are untouched. No Render redeploy.
+
+```bash
+python tools/run_evidence_grading.py --rebuild --store --block-sweep
+python tools/run_evidence_grading.py --no-rebuild        # re-grade a cache
+```
+
+The first form re-runs the per-ticker walk-forward (~65 min for 84 tickers)
+because `evaluate_and_persist_ticker` does not persist its out-of-sample
+predictions — see `docs/stage0-evidence-grading.md`. Method, decision table and
+reproduction commands live there; the pre-registration is
+`docs/stage0-preregistration.md`.
