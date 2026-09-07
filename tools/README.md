@@ -15,6 +15,30 @@ Utility script to verify the health of the FastAPI endpoints.
 ## verify_stage1.py & verify_stage2.py
 Validation scripts used during initial pipeline execution and universe scaling to verify system outputs.
 
+## stage2a_gamma_spotcheck.py & stage2a_pilot.py
+
+Stage 2a — the tuner-objective pilot. Diagnostic, sandboxed, and **not** wired
+into the daily or weekly job.
+
+`stage2a_gamma_spotcheck.py` (Step A) takes ten fully-constant (ticker, fold)
+cells from the Stage 0 out-of-sample cache, holds every hyperparameter at
+whatever the nested Optuna search chose for that exact cell, and sweeps `gamma`
+alone. It refuses to report anything unless the as-tuned refit reproduces the
+cached prediction — the same role `tau = 1.00` played in the Stage 0 addendum.
+
+`stage2a_pilot.py` (Step B) runs both tuning objectives over a stratified
+sample of 14 tickers and reports degeneracy, within-fold rank IC, MAE and the
+train/out-of-sample gap side by side. It writes a markdown report and a CSV and
+nothing else: no hyperparameter cache, no `model_metadata`, no table.
+
+```bash
+python tools/stage2a_gamma_spotcheck.py --markdown docs/stage2a-step-a.md
+python tools/stage2a_pilot.py --markdown docs/stage2a-step-b.md
+```
+
+Method and both decision rules are fixed in `docs/stage2a-preregistration.md`,
+written before either was run on real data.
+
 ## Phase 0 changes
 
 - `select_top_50.py` — **deleted.** It ranked stocks by composite score and kept
