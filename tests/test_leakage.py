@@ -119,6 +119,184 @@ def test_tuner_never_sees_the_rows_its_own_fold_is_scored_on():
         )
 
 
+# ── Stage 2b: the POOLED training path ────────────────────────────────────────
+#
+# The per-ticker tests above do not generalise to it automatically. Pooling
+# introduces a failure mode they cannot see: one ticker's future rows reaching
+# another ticker's training fold through the pooling itself, which no
+# single-series purge check would notice because within each series the
+# boundary still looks correct.
+
+
+def _synthetic_panel(n_dates: int = 900, n_tickers: int = 12,
+                     seed: int = 0) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    dates = np.repeat([f"d{i:04d}" for i in range(n_dates)], n_tickers)
+    tickers = np.tile([f"T{j:02d}.NS" for j in range(n_tickers)], n_dates)
+    n = dates.size
+    return pd.DataFrame({
+        "date": dates, "ticker": tickers,
+        "a": rng.normal(size=n), "b": rng.normal(size=n),
+        "target_return": rng.normal(size=n),
+    })
+
+
+def test_the_pooled_tuner_never_sees_any_tickers_rows_from_its_own_test_window():
+    """
+    The pooled counterpart of the F2 contract.
+
+    A per-ticker purge that holds for every series individually can still be
+    violated in a pooled fit if the boundary is computed per series: tickers
+    join the panel on different dates, so a row-position boundary lands on a
+    different CALENDAR date for each of them, and a training row for ticker A
+    can then postdate the test window that ticker B is scored on. The fix is
+    that ``PurgedPanelWalkForward`` splits the shared DATE grid, and this
+    asserts the consequence directly — across the whole cross-section, not
+    ticker by ticker.
+    """
+    from pipeline.evaluation import PurgedPanelWalkForward
+
+    panel = _synthetic_panel()
+    dates = panel["date"].to_numpy()
+    splitter = PurgedPanelWalkForward(n_folds=4, horizon=HORIZON,
+                                      embargo=HORIZON, min_train=300)
+
+    folds = list(splitter.split(dates))
+    assert folds, "the splitter yielded nothing; the test would be vacuous"
+
+    for fold, (train_idx, test_idx) in enumerate(folds):
+        train_dates = set(dates[train_idx])
+        test_dates = set(dates[test_idx])
+
+        assert not (train_dates & test_dates), (
+            f"fold {fold}: {len(train_dates & test_dates)} dates appear in both "
+            f"the pooled training and test sets")
+
+        # The purge, measured on the shared grid rather than per series.
+        grid = np.unique(dates)
+        last_train = np.searchsorted(grid, max(train_dates))
+        first_test = np.searchsorted(grid, min(test_dates))
+        gap = first_test - last_train - 1
+        assert gap >= HORIZON, (
+            f"fold {fold}: only {gap} grid dates between the pooled training "
+            f"data and its test window; a {HORIZON}-session label spans it")
+
+        # And the pooled-specific one: no ticker's training row may postdate
+        # ANY ticker's test row.
+        assert max(train_dates) < min(test_dates), (
+            f"fold {fold}: a training row dated {max(train_dates)} sits at or "
+            f"after the test window opening at {min(test_dates)} — pooled "
+            f"across tickers, that is one name's future in another's past")
+
+
+def test_the_pooled_search_is_handed_only_its_own_training_slice():
+    """
+    ``tune_pooled`` must be structurally incapable of seeing outer test rows,
+    the same contract ``tune`` has. Asserted by spying on what the scorer is
+    actually given, not by reading the call site.
+    """
+    import pipeline.tuning as tuning
+    from pipeline.evaluation import PurgedPanelWalkForward
+
+    panel = _synthetic_panel(n_dates=800)
+    dates = panel["date"].to_numpy()
+    splitter = PurgedPanelWalkForward(n_folds=3, horizon=HORIZON,
+                                      embargo=HORIZON, min_train=400)
+    train_idx, test_idx = list(splitter.split(dates))[0]
+    test_dates = set(dates[test_idx])
+
+    seen: list[set] = []
+    real = tuning.purged_panel_cv_score
+
+    def spy(frame, *a, **kw):
+        seen.append(set(frame["date"]))
+        return real(frame, *a, **kw)
+
+    tuning.purged_panel_cv_score = spy
+    try:
+        tuning.tune_pooled(panel.iloc[train_idx], ["a", "b"],
+                           horizon=HORIZON, n_trials=2)
+    finally:
+        tuning.purged_panel_cv_score = real
+
+    assert seen, "the scorer was never called; the spy proves nothing"
+    for call in seen:
+        assert not (call & test_dates), (
+            f"the pooled search was handed {len(call & test_dates)} dates from "
+            f"the fold it is later scored on")
+
+
+def test_the_pooled_inner_cv_purges_too():
+    """
+    Nesting is not automatic. The inner CV that scores each trial splits the
+    training slice again, and if IT were contiguous the search would be
+    selected on leaked labels even though the outer fold is clean — which is
+    exactly F3 one level down.
+    """
+    from pipeline.evaluation import PurgedPanelWalkForward
+
+    panel = _synthetic_panel(n_dates=800)
+    inner = PurgedPanelWalkForward(
+        n_folds=3, horizon=HORIZON, embargo=HORIZON,
+        min_train=max(2 * HORIZON, panel["date"].nunique() // 2))
+
+    splits = list(inner.split(panel["date"].to_numpy()))
+    assert splits, "no inner folds; the test would be vacuous"
+    grid = np.unique(panel["date"].to_numpy())
+    for train_idx, test_idx in splits:
+        d = panel["date"].to_numpy()
+        last_train = np.searchsorted(grid, d[train_idx].max())
+        first_test = np.searchsorted(grid, d[test_idx].min())
+        assert first_test - last_train - 1 >= HORIZON
+
+
+def test_the_ticker_feature_needs_no_encoding_fitted_across_a_fold():
+    """
+    XGBoost 3.x reads a pandas category natively, so the ticker feature carries
+    NO fitted statistic — there is no target or frequency encoding that could
+    be computed with sight of held-out rows. Pinned because switching to an
+    encoding would silently reintroduce exactly that, in the one part of this
+    pipeline that has been leakage-tested hardest.
+    """
+    import xgboost
+    from tools.stage2b_pooled import TICKER_COL, with_ticker
+
+    assert int(xgboost.__version__.split(".")[0]) >= 2, (
+        "native categorical support is assumed; below XGBoost 1.5 this path "
+        "would need an encoding, and that encoding would need fold discipline")
+
+    panel = _synthetic_panel(n_dates=60, n_tickers=5)
+    tagged = with_ticker(panel, "identity")
+    assert str(tagged[TICKER_COL].dtype) == "category"
+    # Categories come from the ticker column alone — nothing derived from the
+    # target, which is what makes the feature fold-independent.
+    assert list(tagged[TICKER_COL].cat.categories) == sorted(panel["ticker"].unique())
+    assert (tagged[TICKER_COL].astype(str).to_numpy() == panel["ticker"].to_numpy()).all()
+
+
+def test_the_placebo_preserves_frequency_and_breaks_identity():
+    """
+    The within-date shuffle must keep every date's label multiset intact — a
+    placebo that also changed the cross-section's composition would be testing
+    two things at once.
+    """
+    from tools.stage2b_pooled import TICKER_COL, with_ticker
+
+    panel = _synthetic_panel(n_dates=40, n_tickers=8)
+    placebo = with_ticker(panel, "shuffled")
+
+    for date, g in placebo.groupby("date"):
+        assert sorted(g[TICKER_COL].astype(str)) == sorted(
+            panel[panel["date"] == date]["ticker"]), (
+            f"{date}: the placebo changed which names are present")
+
+    matches = (placebo[TICKER_COL].astype(str).to_numpy()
+               == panel["ticker"].to_numpy()).mean()
+    assert matches < 0.5, (
+        "the placebo left most rows carrying their own ticker; it is not "
+        "breaking the identity-to-return link")
+
+
 # ── Overlapping-label t-statistic correction ──────────────────────────────────
 
 def test_effective_sample_size_discounts_overlap():

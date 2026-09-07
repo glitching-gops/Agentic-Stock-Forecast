@@ -106,3 +106,20 @@ stage2a_step_b.md
 stage2a_step_a.csv
 stage2a_step_b.csv
 stage2a_pilot.log
+
+# Stage 2b — the pooled-model run artifacts, and the one Stage 0 module this
+# branch borrows. `pipeline/evidence_shrinkage.py` lives on
+# `stage0-evidence-grading`, which is deliberately not merged here; it is
+# materialised into the working tree to run the panel diagnostic and must
+# never be committed into this lineage. See tools/stage2b_panel_diagnostic.py.
+pipeline/evidence_shrinkage.py
+panel_cache.parquet
+stage2b_pooled_oos.npz
+stage2b_report.md
+stage2b_cells.csv
+stage2b_panel.md
+stage2b_run.log
+stage2b_sweep.md
+stage2b_sweep.csv
+stage2b_sweep.log
+stage2b_panel.log
