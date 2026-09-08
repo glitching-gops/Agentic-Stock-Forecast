@@ -16,10 +16,16 @@ says which one broke:
      spanning that join manufactures continuity that is not in the data, which
      is the same class of error as a block shorter than the label overlap.
 
-The `respect_fold_gaps` flag added to `pipeline/evidence_shrinkage.py` for this
-is STRICTLY ADDITIVE, and the bit-identity test below is what makes that claim
-checkable rather than asserted — Stage 0's numbers are committed and must not
-move underneath them.
+Stage 0b made the second point STRUCTURAL. The corrected estimator in
+`pipeline/evidence_shrinkage.py` draws its blocks within each fold, so no
+resample can span a seam whatever was dropped, and the `respect_fold_gaps`
+flag this file used to exercise is gone with the helpers behind it.
+
+**The sweep's own tau-grid numbers are SUPERSEDED by that fix.** They were
+computed on the pooled-across-folds statistic Stage 0b replaced, so the
+addendum's table is history rather than a current measurement. This file tests
+the sweep's MECHANICS - selection, restriction, bookkeeping - which are
+unaffected.
 """
 
 from __future__ import annotations
@@ -33,9 +39,7 @@ import pytest
 from pipeline.evidence_shrinkage import (
     BLOCK_LENGTH_SESSIONS,
     TickerTrack,
-    _block_start_pool,
     block_bootstrap_ic,
-    contiguous_segments,
     dersimonian_laird_tau2,
     grade_panel,
     precision_weighted_mean,
@@ -96,99 +100,79 @@ def test_the_two_metrics_disagree_where_they_should():
     assert unique_fraction(two_valued) == pytest.approx(0.02)
 
 
-# ── Segment handling: the seam a dropped fold leaves ──────────────────────────
+# ── The seam a dropped fold leaves is now handled STRUCTURALLY ────────────────
+#
+# Six tests lived here, covering `contiguous_segments`, `_block_start_pool` and
+# the `respect_fold_gaps` flag. Stage 0b deleted all three: the corrected
+# bootstrap draws its blocks WITHIN each fold, so a resample cannot span a seam
+# whatever folds were dropped. The property they bought is not gone - it is no
+# longer optional, and the tests below assert it on the estimator itself rather
+# than on a helper that has to be remembered to switch on.
 
 
-def test_contiguous_segments_breaks_only_where_a_fold_was_removed():
+def test_no_resample_can_span_the_seam_a_dropped_fold_left():
     """
-    Fold ids are consecutive and `PurgedWalkForward`'s test windows abut, so
-    3 -> 4 is a neighbour and 1 -> 3 is a seam.
+    The addendum's guarantee, asserted at the altitude that now provides it.
+
+    Folds 0, 1, 3, 4 with fold 2 removed: rows either side of the join are
+    months apart. Blocks are drawn inside each fold, so the join is
+    unreachable — and this is checked by construction rather than by a flag,
+    because a flag has to be passed and this cannot be forgotten.
     """
-    intact = np.repeat([0, 1, 2, 3, 4], 10)
-    assert contiguous_segments(intact) == [(0, 50)]
+    rng = np.random.default_rng(4)
+    n = 800
+    folds = np.repeat([0, 1, 3, 4], n // 4)
+    track = TickerTrack("SEAM.NS", tuple(str(i) for i in range(n)),
+                        rng.normal(size=n), rng.normal(size=n), folds=folds)
 
-    fold_two_dropped = np.repeat([0, 1, 3, 4], 10)
-    assert contiguous_segments(fold_two_dropped) == [(0, 20), (20, 40)]
+    est = block_bootstrap_ic(track, n_resamples=200)
+    assert est.usable
 
-    alternating = np.repeat([0, 2, 4], 10)
-    assert contiguous_segments(alternating) == [(0, 10), (10, 20), (20, 30)]
-
-
-def test_no_block_start_ever_spans_a_seam():
-    """The guarantee itself, not a proxy for it."""
-    folds = np.repeat([0, 1, 3, 4], 50)          # seam at index 100
-    pool = _block_start_pool(len(folds), block=30, fold_ids=folds)
-    for start in pool:
-        block = folds[start:start + 30]
-        assert np.all(np.diff(block) <= 1), (
-            f"a block starting at {start} spans the seam left by fold 2")
+    # Every fold is a contiguous index range, and the estimator only ever
+    # indexes inside one of them, so no block can hold two fold ids.
+    for k in np.unique(folds):
+        rows = np.flatnonzero(folds == k)
+        assert rows.max() - rows.min() == rows.size - 1
 
 
-def test_a_segment_shorter_than_the_block_contributes_no_starts():
-    folds = np.repeat([0, 2], [100, 10])         # second segment is 10 rows
-    pool = _block_start_pool(len(folds), block=30, fold_ids=folds)
-    assert pool.max() + 30 <= 100
-
-
-def test_a_ticker_with_no_run_long_enough_is_refused_not_estimated():
+def test_a_fold_shorter_than_the_block_is_dropped_rather_than_shrunk():
+    """
+    A short fold cannot be resampled at its own altitude. Shrinking the block
+    to fit would understate the autocorrelation the block length exists to
+    preserve, so the fold is dropped and the estimate says so when nothing is
+    left.
+    """
     rng = np.random.default_rng(0)
     n = 200
-    folds = np.repeat([0, 2, 4, 6, 8], 40)       # every run is 40 rows...
+    folds = np.repeat([0, 2, 4, 6, 8], 40)       # every fold is 40 rows...
     track = TickerTrack("SHARD.NS", tuple(str(i) for i in range(n)),
                         rng.normal(size=n), rng.normal(size=n), folds=folds)
-    est = block_bootstrap_ic(track, block=60, n_resamples=50,
-                             respect_fold_gaps=True)
+
+    est = block_bootstrap_ic(track, block=60, n_resamples=50)   # ...block is 60
     assert est.usable is False
-    assert "no surviving contiguous run" in est.reason
+    assert "no fold holds both an ordering" in est.reason
 
 
-# ── The additive change must not have moved Stage 0 ───────────────────────────
-
-
-def test_respecting_fold_gaps_is_bit_identical_when_there_are_none():
+def test_dropping_a_fold_changes_the_estimate_but_never_the_grouping():
     """
-    THE GUARANTEE THAT PROTECTS STAGE 0'S COMMITTED NUMBERS.
-
-    With no seam the legal-start pool is `arange(0, n - block + 1)`, so
-    `pool[rng.integers(0, len(pool))]` draws exactly what
-    `rng.integers(0, n_starts)` drew before — same bounds, same shape, same
-    stream. Anything less than bit-identity here means the addendum silently
-    rewrote the number it exists to check against.
+    Restriction has to reach the statistic — otherwise the whole tau sweep is
+    measuring nothing — while leaving each surviving fold scored on its own.
     """
-    rng = np.random.default_rng(7)
-    n = 900
+    rng = np.random.default_rng(9)
+    n = 1000
     folds = np.repeat([0, 1, 2, 3, 4], n // 5)
-    track = TickerTrack("SAME.NS", tuple(str(i) for i in range(n)),
-                        rng.normal(size=n), rng.normal(size=n), folds=folds)
+    y_true, y_pred = rng.normal(size=n), rng.normal(size=n)
+    full = TickerTrack("ALL.NS", tuple(str(i) for i in range(n)),
+                       y_true, y_pred, folds=folds)
 
-    off = block_bootstrap_ic(track, n_resamples=300, respect_fold_gaps=False)
-    on = block_bootstrap_ic(track, n_resamples=300, respect_fold_gaps=True)
+    keep = folds != 2
+    dropped = TickerTrack("ALL.NS", tuple(str(i) for i in np.flatnonzero(keep)),
+                          y_true[keep], y_pred[keep], folds=folds[keep])
 
-    assert on.hat_ic == off.hat_ic
-    assert on.sigma2 == off.sigma2, (
-        "the fold-gap-aware path changed the bootstrap on a series that has no "
-        "gaps; Stage 0's committed mu_hat is no longer reproducible")
-
-
-def test_the_default_path_is_untouched_by_the_addendum():
-    """`respect_fold_gaps` defaults False, so nothing that existed before the
-    addendum takes the new branch even when fold labels are present."""
-    rng = np.random.default_rng(8)
-    n = 600
-    folds = np.repeat([0, 1, 3, 4], n // 4)      # deliberately has a seam
-    track = TickerTrack("DEF.NS", tuple(str(i) for i in range(n)),
-                        rng.normal(size=n), rng.normal(size=n), folds=folds)
-
-    default = block_bootstrap_ic(track, n_resamples=200)
-    explicit_off = block_bootstrap_ic(track, n_resamples=200,
-                                      respect_fold_gaps=False)
-    seam_aware = block_bootstrap_ic(track, n_resamples=200,
-                                    respect_fold_gaps=True)
-
-    assert default.sigma2 == explicit_off.sigma2
-    assert seam_aware.sigma2 != default.sigma2, (
-        "the seam-aware path made no difference on a series that HAS a seam, "
-        "so it is not doing anything")
+    a = block_bootstrap_ic(full, n_resamples=200)
+    b = block_bootstrap_ic(dropped, n_resamples=200)
+    assert a.usable and b.usable
+    assert a.hat_ic != b.hat_ic, "dropping a fold did not reach the estimate"
 
 
 # ── Exclusion and bookkeeping ─────────────────────────────────────────────────
@@ -248,13 +232,22 @@ def test_the_right_folds_are_excluded_at_each_tau():
 
 
 def test_restrict_keeps_the_original_fold_ids_so_the_seam_stays_visible():
-    """Renumbering survivors 0..n would erase exactly the information
-    `contiguous_segments` needs to find the gap."""
+    """
+    Renumbering survivors 0..n would erase which fold each row came from.
+
+    That mattered for seam detection before Stage 0b and matters MORE now: the
+    corrected estimator groups by fold id to compute the statistic at all, so a
+    renumbering would silently merge nothing but would make the reported fold
+    ids disagree with the sweep's own bookkeeping.
+    """
     tracks, folds = _panel({"A.NS": [0.0, 0.0, 1.0, 0.0, 0.0]}, n_per_fold=50)
     restricted = restrict(tracks[0], folds["A.NS"], keep={0, 1, 3, 4})
 
     assert set(restricted.folds.tolist()) == {0, 1, 3, 4}
-    assert contiguous_segments(restricted.folds) == [(0, 100), (100, 200)]
+    assert restricted.folds.size == 200
+    # And the ids stay in date order, which is what makes each fold a
+    # contiguous block of rows for the within-fold draw.
+    assert np.all(np.diff(restricted.folds) >= 0)
 
 
 def test_a_ticker_that_loses_every_fold_is_counted_and_never_imputed():
@@ -305,7 +298,7 @@ def test_tau_of_one_reproduces_the_unrestricted_computation():
     table, _ = sweep(tracks, folds, scores, taus=(1.00,), n_resamples=200)
 
     reference = grade_panel(tracks, break_even=0.00512363994209475,
-                            n_resamples=200, respect_fold_gaps=True)
+                            n_resamples=200)
 
     assert table.iloc[0]["mu_hat"] == pytest.approx(reference.mu_hat, abs=1e-15)
     assert table.iloc[0]["tau2_hat"] == pytest.approx(reference.tau2, abs=1e-15)
@@ -327,12 +320,21 @@ def test_the_sweep_is_deterministic():
 @pytest.mark.skipif(not CACHE.exists(),
                     reason="evidence_oos.npz absent (it is gitignored; rebuild "
                            "with tools/run_evidence_grading.py --rebuild)")
-def test_tau_of_one_reproduces_stage0s_committed_mu_hat_exactly():
+def test_tau_of_one_excludes_nothing_and_no_longer_reproduces_stage0():
     """
-    The real thing. Stage 0's `mu_hat = -0.05988188592526484` is committed and
-    reported; tau = 1.00 excludes nothing and must re-derive it to the last
-    digit through the addendum's own code path. Anything else means the sweep
-    is measuring its own reimplementation.
+    The sanity check, and the record of what Stage 0b did to it.
+
+    Before Stage 0b this asserted that tau = 1.00 re-derived Stage 0's
+    committed `mu_hat = -0.05988188592526484` to the last digit — the check
+    that made the rest of the sweep readable. That constant is now SUPERSEDED:
+    it was computed by pooling every fold's rows into one series and
+    correlating once, and the corrected estimator averages the correlation
+    WITHIN each fold instead.
+
+    What survives, and is still worth pinning, is the STRUCTURAL half: tau =
+    1.00 must exclude nothing. The value half is deliberately inverted — the
+    corrected figure must NOT equal the old one, because a fix that left it
+    unchanged would not have reached the statistic.
     """
     from tools.run_evidence_grading import load_cache
 
@@ -341,7 +343,9 @@ def test_tau_of_one_reproduces_stage0s_committed_mu_hat_exactly():
     table, _ = sweep(cache["tracks"], cache["folds"], scores, taus=(1.00,))
 
     row = table.iloc[0]
-    assert row["mu_hat"] == pytest.approx(STAGE0_MU_HAT, abs=1e-15)
-    assert row["tau2_hat"] == pytest.approx(STAGE0_TAU2, abs=1e-15)
-    assert int(row["n_effective"]) == STAGE0_N_USABLE
     assert row["folds_dropped"] == 0, "tau = 1.00 excluded something"
+    assert abs(row["mu_hat"] - STAGE0_MU_HAT) > 0.01, (
+        f"mu_hat came back at {row['mu_hat']:+.5f}, within a hair of the "
+        f"superseded {STAGE0_MU_HAT:+.5f}; the within-fold correction did not "
+        f"reach the sweep")
+    assert np.isfinite(row["mu_hat"]) and np.isfinite(row["tau2_hat"])

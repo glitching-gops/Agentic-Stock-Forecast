@@ -11,19 +11,18 @@ Stage 2b's pooled model emits no constants at all. So the question this answers
 is narrow and worth asking: with the artifact gone by construction rather than
 by exclusion, what does the panel's measured skill actually look like?
 
-A NOTE ON WHERE THE CODE LIVES, AND WHY THIS IMPORTS LAZILY
------------------------------------------------------------
-`pipeline/evidence_shrinkage.py` is Stage 0's module and it lives on the branch
-`stage0-evidence-grading`, which is deliberately NOT merged into `main` and not
-into this lineage. This tool REUSES it rather than reimplementing the shrinkage
-— reimplementing an empirical-Bayes estimator to avoid a branch switch is how
-two versions of a number start disagreeing — so it must be materialised in the
-working tree first:
+SUPERSEDED BY STAGE 0b, AND KEPT AS THE RECORD OF WHAT IT FOUND
+---------------------------------------------------------------
+The numbers this tool produced are what opened Stage 0b: `mu_hat` barely moved
+when the constants went away, which is how the pooled-across-folds IC was
+finally identified as the cause. Stage 0b fixed that statistic, so re-running
+this now reports the CORRECTED figures rather than the ones in the Stage 2b
+findings — read `tools/stage0b_regrade.py` for the current table.
 
-    git show stage0-evidence-grading:pipeline/evidence_shrinkage.py > pipeline/evidence_shrinkage.py
-
-That file is gitignored on this branch, so materialising it cannot accidentally
-commit Stage 0's code into Stage 2b's history. Delete it when done.
+`pipeline/evidence_shrinkage.py` used to live on an unmerged branch and be
+materialised into the working tree by hand; the Stage 0b branch merges it, so
+the lazy import below now always succeeds and its remediation message is a
+leftover for anyone running this on an older branch.
 
 Usage
 -----

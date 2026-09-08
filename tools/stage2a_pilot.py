@@ -94,6 +94,12 @@ def arm(ticker: str, df: pd.DataFrame, objective: str,
     """
     X, y = df[FEATURES], df[TARGET]
     rows: list[dict] = []
+    # The held-out predictions themselves, not just their summaries. Stage 2a
+    # kept only the per-cell metrics, which made its arm ungradeable when
+    # Stage 0b came to re-grade every variant on the corrected IC — a cheap
+    # omission that cost a re-run. Same lesson as `WalkForwardResult` dropping
+    # `predictions` and forcing Stage 0 to re-derive them.
+    predictions: list[pd.DataFrame] = []
 
     for fold, (train_idx, test_idx) in enumerate(fold_slices(len(X))):
         X_tr, y_tr = X.iloc[train_idx], y.iloc[train_idx]
@@ -111,6 +117,11 @@ def arm(ticker: str, df: pd.DataFrame, objective: str,
         pred = _fit_predict(X_tr, y_tr, X_te, params)
         in_sample = _fit_predict(X_tr, y_tr, X_tr, params)
 
+        predictions.append(pd.DataFrame({
+            "ticker": ticker, "fold": fold,
+            "date": df["date"].to_numpy()[test_idx][finite],
+            "y_true": y_true, "y_pred": pred,
+        }))
         rows.append({
             "ticker": ticker,
             "fold": fold,
@@ -124,7 +135,8 @@ def arm(ticker: str, df: pd.DataFrame, objective: str,
             "mae": float(np.mean(np.abs(y_true - pred))),
             "train_mae": float(np.mean(np.abs(y_tr.to_numpy(dtype=float) - in_sample))),
         })
-    return rows
+    return rows, (pd.concat(predictions, ignore_index=True)
+                  if predictions else pd.DataFrame())
 
 
 def verify_against_cache(rows: list[dict], ticker: str,
@@ -162,10 +174,11 @@ def run(limit: int | None = None, tune_trials: int = EVAL_TUNE_TRIALS,
         plan = plan[:limit]
 
     rows: list[dict] = []
+    kept: dict[str, list[pd.DataFrame]] = {"mae": [], "rank_ic": []}
     for n, (stratum, ticker) in enumerate(plan, 1):
         t0 = time.time()
         df = load_features_for_ticker(ticker)
-        before = arm(ticker, df, "mae", tune_trials)
+        before, before_preds = arm(ticker, df, "mae", tune_trials)
         drift = verify_against_cache(before, ticker, cache_path)
         if drift > REPRODUCTION_TOL:
             raise RuntimeError(
@@ -173,10 +186,12 @@ def run(limit: int | None = None, tune_trials: int = EVAL_TUNE_TRIALS,
                 f"cache. STOP — the 'before' column would not be the number "
                 f"Stage 0 reported."
             )
-        after = arm(ticker, df, "rank_ic", tune_trials)
+        after, after_preds = arm(ticker, df, "rank_ic", tune_trials)
         for r in before + after:
             r["stratum"] = stratum
         rows.extend(before + after)
+        kept["mae"].append(before_preds)
+        kept["rank_ic"].append(after_preds)
 
         b = pd.DataFrame(before)
         a = pd.DataFrame(after)
@@ -184,7 +199,8 @@ def run(limit: int | None = None, tune_trials: int = EVAL_TUNE_TRIALS,
               f"{int(b['constant'].sum())} -> {int(a['constant'].sum())}, "
               f"drift {drift:.1e} ({time.time() - t0:.0f}s)", flush=True)
 
-    return pd.DataFrame(rows), strata
+    return pd.DataFrame(rows), strata, {
+        k: pd.concat(v, ignore_index=True) for k, v in kept.items() if v}
 
 
 # ── reporting ─────────────────────────────────────────────────────────────────
@@ -271,11 +287,15 @@ def main() -> None:
     ap.add_argument("--trials", type=int, default=EVAL_TUNE_TRIALS)
     ap.add_argument("--markdown", default=None)
     ap.add_argument("--csv", default=None)
+    ap.add_argument("--npz", default=None,
+                    help="persist one arm's held-out predictions, in the "
+                         "Stage 0 cache layout")
+    ap.add_argument("--npz-arm", default="rank_ic", choices=("mae", "rank_ic"))
     args = ap.parse_args()
 
     print("Stage 2a Step B — pilot re-tune under the rank-IC objective")
-    d, strata = run(limit=args.limit, tune_trials=args.trials,
-                    cache_path=args.cache)
+    d, strata, preds = run(limit=args.limit, tune_trials=args.trials,
+                           cache_path=args.cache)
     text = render(d, strata)
     print("\n" + text)
 
@@ -286,6 +306,24 @@ def main() -> None:
     if args.csv:
         d.to_csv(args.csv, index=False)
         print(f"wrote {args.csv}")
+    if args.npz and preds:
+        # The Stage 0 cache layout — flat columns plus per-ticker offsets — so
+        # `tools/stage0b_regrade.py` can read this arm with the same loader it
+        # uses for the production one.
+        p = preds[args.npz_arm].sort_values(["ticker", "date"])
+        tickers = sorted(p["ticker"].unique())
+        offsets = np.cumsum([0] + [int((p["ticker"] == t).sum())
+                                   for t in tickers])
+        np.savez_compressed(
+            args.npz,
+            tickers=np.array(tickers, dtype=object),
+            offsets=offsets.astype(np.int64),
+            dates=p["date"].to_numpy().astype(object),
+            y_true=p["y_true"].to_numpy(dtype=float),
+            y_pred=p["y_pred"].to_numpy(dtype=float),
+            fold=p["fold"].to_numpy().astype(np.int32),
+        )
+        print(f"wrote {args.npz} ({args.npz_arm} arm, {len(tickers)} tickers)")
 
 
 if __name__ == "__main__":

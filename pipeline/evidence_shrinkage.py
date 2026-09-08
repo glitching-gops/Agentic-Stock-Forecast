@@ -138,6 +138,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -180,6 +182,17 @@ MIN_OOS_ROWS = 3 * BLOCK_LENGTH_SESSIONS
 #: say so rather than return a variance computed from the survivors.
 MIN_USABLE_RESAMPLE_FRACTION = 0.5
 
+# The corrected statistic is a MEAN OVER FOLDS, so a ticker with one or two
+# scored folds is not a track record — it is one or two numbers, and the
+# variance of a mean over two points is not a measurement of anything.
+#
+# This binds hardest on the model that most needs it: the production per-ticker
+# fits emit a constant in 316 of 420 (ticker, fold) cells, so the median ticker
+# has TWO folds carrying an ordering at all. Grading those on a mean of two
+# survivors, selected on the model having chosen to split, is exactly the
+# survivorship the Stage 0 addendum flagged and declined to treat as a result.
+MIN_FOLDS_FOR_ESTIMATE = 3
+
 #: Benjamini-Hochberg false-discovery rate across the panel. FDR rather than
 #: Bonferroni because the goal is to surface as many REAL weak effects as the
 #: data support while controlling the proportion of discoveries that are false
@@ -212,7 +225,12 @@ ASSUMED_TURNOVER = 0.80
 #:       guard: WIPRO.NS was graded ANTI_SIGNAL on a pooled IC built entirely
 #:       from five fold-level constants.
 #:   v2  adds the no-within-fold-ordering guard in `block_bootstrap_ic`.
-GRADER_VERSION = "stage0-eb-shrinkage-v2"
+# v3: the per-ticker IC is the mean of WITHIN-FOLD rank ICs, not one
+# correlation over the pooled series, and the bootstrap resamples within
+# folds to match. Stage 0b. The version is part of the stored row, so v2
+# grades stay distinguishable from v3 ones rather than being silently
+# reinterpreted.
+GRADER_VERSION = "stage0b-eb-within-fold-v3"
 
 GRADES = ("STRONG", "WEAK", "INSUFFICIENT", "ANTI_SIGNAL")
 
@@ -266,6 +284,14 @@ class BootstrapEstimate:
     n_valid_resamples: int
     usable: bool
     reason: str = ""
+    #: The two components `sigma2` is the maximum of, reported so a reader can
+    #: see WHICH one bound. They answer different questions — how much one
+    #: period's IC would move if that period were re-sampled, against how much
+    #: the periods differ from each other — and on this panel the second is a
+    #: median of 1.5x the first, which is what made reporting only the first a
+    #: defect rather than a simplification.
+    sigma2_within: float = float("nan")
+    sigma2_between: float = float("nan")
 
 
 @dataclass
@@ -424,34 +450,57 @@ def rank_ic_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return out
 
 
-def contiguous_segments(fold_ids: np.ndarray) -> list[tuple[int, int]]:
+# `contiguous_segments` and `_block_start_pool` lived here and are GONE.
+#
+# They existed so a moving block drawn from a series with a dropped fold in it
+# could not span the seam that removal left behind. The within-fold bootstrap
+# below never draws across a fold boundary at all, so the property they bought
+# is structural now rather than optional, and keeping them would leave two
+# mechanisms covering one failure - the arrangement this project has twice
+# recorded as ONE UNTESTABLE GUARD rather than belt and braces. Their tests
+# went with them.
+
+
+def within_fold_rank_ic(y_true: np.ndarray, y_pred: np.ndarray,
+                        fold_ids: np.ndarray) -> tuple[float, int, int]:
     """
-    Half-open [start, stop) runs of rows that are ADJACENT IN TIME.
+    Mean rank IC computed WITHIN each walk-forward fold, then averaged.
 
-    Fold ids are consecutive integers assigned by `PurgedWalkForward` in date
-    order, and its test windows abut, so rows carrying folds 3 and 4 are
-    neighbours in the calendar. A run therefore breaks only where the fold id
-    JUMPS BY MORE THAN ONE - which is exactly what dropping fold 2 from
-    {0,1,2,3,4} leaves behind. It also breaks on any decrease, which cannot
-    happen in a date-ordered series and is treated as a seam rather than
-    silently accepted.
+    Returns ``(mean_ic, folds_scored, folds_undefined)``.
+
+    THIS REPLACES A POOLED CORRELATION, AND THE DIFFERENCE IS NOT COSMETIC.
+    Concatenating every fold's rows and correlating once conflates
+    between-fold variation with within-fold variation. When the folds' own
+    average prediction levels run opposite to their own average realised
+    returns, the pooled figure comes out strongly negative while every fold's
+    internal ranking is positive.
+
+    That is not hypothetical. Measured on this panel, the SAME model over the
+    SAME rows reads **-0.0512 pooled over folds and +0.0120 within them**, with
+    rho(fold prediction level, fold realised return) = **-0.600** across the
+    five folds. Stage 0's ``mu_hat = -0.05988`` and the whole
+    degeneracy-threshold sweep built on top of it were measuring that
+    arrangement of five numbers rather than per-company skill: swapping in a
+    model that emits ZERO constant predictions moved it only to -0.052.
+
+    ``pipeline.evaluation._mean_daily_rank_ic`` applies the identical
+    correction one level up, grouping by DATE for a panel, and its docstring
+    names the same failure. This is the per-ticker equivalent, and its absence
+    here is what Stage 0b was opened to fix.
+
+    A fold with no ordering on either side has an UNDEFINED correlation and is
+    counted rather than scored - an undefined IC is not a measured zero.
     """
-    if fold_ids.size == 0:
-        return []
-    breaks = np.nonzero(np.diff(fold_ids) != 0)[0]
-    seams = [i for i in breaks if fold_ids[i + 1] - fold_ids[i] != 1]
-    bounds = [0] + [int(i) + 1 for i in seams] + [int(fold_ids.size)]
-    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
-
-
-def _block_start_pool(n_valid: int, block: int,
-                      fold_ids: np.ndarray | None) -> np.ndarray:
-    """Every index a full block fits into without crossing a seam."""
-    if fold_ids is None:
-        return np.arange(0, max(n_valid - block + 1, 0))
-    pools = [np.arange(lo, hi - block + 1)
-             for lo, hi in contiguous_segments(fold_ids) if hi - lo >= block]
-    return np.concatenate(pools) if pools else np.array([], dtype=int)
+    ics: list[float] = []
+    undefined = 0
+    for k in np.unique(fold_ids):
+        m = fold_ids == k
+        ic = rank_ic_rows(y_true[m][None, :], y_pred[m][None, :])[0]
+        if np.isfinite(ic):
+            ics.append(float(ic))
+        else:
+            undefined += 1
+    return (float(np.mean(ics)) if ics else float("nan"), len(ics), undefined)
 
 
 def block_bootstrap_ic(
@@ -459,25 +508,54 @@ def block_bootstrap_ic(
     block: int = BLOCK_LENGTH_SESSIONS,
     n_resamples: int = BOOTSTRAP_N_RESAMPLES,
     seed: int = BOOTSTRAP_SEED,
-    respect_fold_gaps: bool = False,
 ) -> BootstrapEstimate:
     """
-    Point estimate and sampling variance of one ticker's out-of-sample rank IC.
+    Point estimate and sampling variance of one ticker's WITHIN-FOLD rank IC.
 
-    Moving-block bootstrap: ``ceil(n / block)`` blocks of ``block`` consecutive
-    rows are drawn with replacement from every position the series admits, and
-    concatenated to length n. Both series are resampled with the SAME index, so
-    a prediction always travels with the outcome it was made for — resampling
-    them independently would destroy the very correlation being measured and
-    return a null variance around a null estimate.
+    The point estimate is ``within_fold_rank_ic`` - see there for why pooling
+    across folds is wrong.
 
-    The seed is derived from the TICKER as well as the base seed, so the run is
-    reproducible and independent of the order tickers are processed in.
+    **The bootstrap had to change with it, not just the point estimate.** The
+    previous version drew moving blocks from the whole concatenated series and
+    computed a POOLED correlation on each resample, which estimates the
+    sampling variance of the pooled statistic. That is the wrong quantity once
+    the estimate is a mean of within-fold correlations: a resample that mixes
+    rows across folds destroys the very grouping the statistic is defined on,
+    and its spread is dominated by the between-fold arrangement the estimate no
+    longer contains.
+
+    So blocks are now drawn WITHIN EACH FOLD and the fold ICs are averaged
+    exactly as the point estimate averages them - the bootstrap analogue of the
+    estimator, which is the condition for it to estimate that estimator's
+    variance. Two consequences fall out and both are improvements:
+
+      * A block can no longer span a fold boundary, so the ``respect_fold_gaps``
+        flag the Stage 0 addendum needed is GONE - the property it bought is
+        structural now rather than optional. A caller may drop whole folds and
+        no resample will splice two non-adjacent periods together.
+      * Fold-level variation is not resampled at all, which is correct: the
+        five folds are the five periods this panel has, not a sample from a
+        population of periods, and resampling them would understate the
+        uncertainty in exactly the direction that flatters a result.
+
+    Both series are resampled with the SAME index, so a prediction always
+    travels with the outcome it was made for. The seed is derived from the
+    TICKER as well as the base seed, so the run is reproducible and independent
+    of the order tickers are processed in.
     """
     n = len(track.y_true)
+    if track.folds is None:
+        raise EvidenceGradingRefused(
+            f"{track.ticker}: fold labels are required. The per-ticker IC is "
+            f"defined WITHIN each walk-forward fold and averaged; without the "
+            f"labels the only thing computable is the pooled correlation this "
+            f"module was fixed to stop reporting."
+        )
+
     valid = np.isfinite(track.y_true) & np.isfinite(track.y_pred)
     y_true = track.y_true[valid]
     y_pred = track.y_pred[valid]
+    fold_ids = np.asarray(track.folds)[valid]
     n_valid = len(y_true)
 
     if n_valid < MIN_OOS_ROWS:
@@ -486,108 +564,112 @@ def block_bootstrap_ic(
             f"only {n_valid} finite out-of-sample rows, need {MIN_OOS_ROWS} "
             f"({MIN_OOS_ROWS // block} blocks of {block})")
 
-    hat = rank_ic_rows(y_true[None, :], y_pred[None, :])[0]
+    hat, n_scored, n_undefined = within_fold_rank_ic(y_true, y_pred, fold_ids)
     if not np.isfinite(hat):
         return BootstrapEstimate(
             track.ticker, n, 0, float("nan"), float("nan"), 0, False,
-            "the out-of-sample prediction (or the outcome) is constant, so "
-            "rank IC is undefined rather than zero")
+            f"the prediction (or the outcome) has no ordering inside ANY of "
+            f"its {n_undefined} walk-forward folds, so the within-fold rank IC "
+            f"is undefined rather than zero")
 
-    # A PREDICTION WITH NO ORDERING MUST EARN NO RANKING RESULT, and the check
-    # above is not enough to enforce it.
-    #
-    # It asks whether the prediction is constant over the WHOLE out-of-sample
-    # series. A per-ticker model that emits one constant per FOLD passes that
-    # test easily — the five constants differ — while containing no ordering
-    # information anywhere. Its pooled rank IC is then 100% the arrangement of
-    # five fold-level constants against five realised period returns: a
-    # correlation over FIVE points, reported as a per-company track record.
-    #
-    # THIS IS NOT HYPOTHETICAL, AND IT COST THIS RUN ITS ONLY NON-NULL GRADE.
-    # Measured 2026-09-06 over the 84-ticker panel: 316 of 420 (ticker, fold)
-    # cells emit a constant, 21 tickers do so in ALL FIVE folds, and the panel's
-    # mean per-ticker IC is -0.070 pooled against +0.126 within folds — opposite
-    # signs. WIPRO.NS was graded ANTI_SIGNAL on a pooled IC of -0.3914 whose
-    # within-fold IC is UNDEFINED in every one of its five folds.
-    #
-    # It is the `TrainMeanForecast` finding in a new place: that comparator
-    # scored a pooled IC of -0.007 while emitting one constant per fold and
-    # holding no ranking information at all, and `daily_rank_ic` was added to
-    # the baseline table precisely because the pooled figure could not tell the
-    # difference. This guard is the per-ticker equivalent.
-    #
-    # Added AFTER the first run of this layer, and it can only REMOVE a grade,
-    # never create one — the same property that made the live gate's signed-t
-    # fix safe to ship mid-flight. It is not a pre-registered threshold and
-    # moves none of them.
-    if track.folds is not None:
-        fold_ids = np.asarray(track.folds)[valid]
-        if fold_ids.size and all(
-                np.ptp(y_pred[fold_ids == k]) == 0
-                for k in np.unique(fold_ids)):
-            return BootstrapEstimate(
-                track.ticker, n, 0, float("nan"), float("nan"), 0, False,
-                f"the prediction is CONSTANT within every one of its "
-                f"{len(np.unique(fold_ids))} walk-forward folds, so it holds no "
-                f"ordering anywhere; the pooled rank IC of {hat:+.4f} is "
-                f"entirely the arrangement of those fold-level constants "
-                f"against the realised period returns")
-
-    n_blocks = int(np.ceil(n_valid / block))
-
-    # LEGAL BLOCK START POSITIONS.
-    #
-    # Ordinarily this is every position a full block fits into,
-    # `arange(0, n_valid - block + 1)`, because the out-of-sample series is
-    # contiguous (see the module docstring). `respect_fold_gaps` is for the
-    # Stage 0 ADDENDUM, which drops whole degenerate folds and hands back a
-    # series with SEAMS in it: rows either side of a removed fold are months
-    # apart, and a block spanning that join would splice two non-adjacent
-    # periods together and manufacture continuity that is not there.
-    #
-    # STRICTLY ADDITIVE AND BIT-IDENTICAL BY DEFAULT. With no gaps the pool is
-    # `arange(0, n_valid - block + 1)`, so `pool[rng.integers(0, len(pool))]`
-    # draws exactly the values `rng.integers(0, n_starts)` drew before - same
-    # bounds, same shape, same stream, same result. A test pins that equality,
-    # and the addendum's tau = 1.00 cell re-derives Stage 0's mu_hat to the last
-    # digit as a second check.
-    starts_pool = _block_start_pool(
-        n_valid, block,
-        np.asarray(track.folds)[valid] if (respect_fold_gaps
-                                           and track.folds is not None) else None)
-    if starts_pool.size == 0:
+    if n_scored < MIN_FOLDS_FOR_ESTIMATE:
         return BootstrapEstimate(
-            track.ticker, n, n_blocks, float(hat), float("nan"), 0, False,
-            f"no surviving contiguous run is as long as the {block}-session "
-            f"block, so no resample can be drawn")
+            track.ticker, n, 0, float(hat), float("nan"), 0, False,
+            f"only {n_scored} of {n_scored + n_undefined} walk-forward folds "
+            f"carry an ordering, and a mean over {n_scored} is not a track "
+            f"record; {MIN_FOLDS_FOR_ESTIMATE} are required")
+
+    # A fold shorter than one block cannot be resampled at its own altitude, so
+    # it is dropped from the bootstrap with a count rather than resampled at a
+    # shorter block length - a shorter block would understate the
+    # autocorrelation the block length exists to preserve.
+    #
+    # A flat fold needs no explicit exclusion: its resampled correlation is NaN
+    # and the `nanmean` below skips it, exactly as the point estimate skips it.
+    # An `np.ptp(y_pred[rows]) > 0` clause was written here and REMOVED once
+    # mutation testing showed no input could distinguish it — the case where it
+    # would have mattered, every fold flat, is already returned above. Two
+    # mechanisms covering one failure are one untestable guard.
+    fold_slices: list[tuple[np.ndarray, int]] = []
+    for k in np.unique(fold_ids):
+        rows = np.flatnonzero(fold_ids == k)
+        if rows.size >= block:
+            fold_slices.append((rows, int(np.ceil(rows.size / block))))
+
+    if not fold_slices:
+        return BootstrapEstimate(
+            track.ticker, n, 0, float(hat), float("nan"), 0, False,
+            f"no fold holds both an ordering and the {block} rows a block "
+            f"needs, so no resample can be drawn")
 
     rng = np.random.default_rng(
         [seed, int.from_bytes(track.ticker.encode("utf-8"), "little")])
-    starts = starts_pool[rng.integers(0, len(starts_pool),
-                                      size=(n_resamples, n_blocks))]
-    # (n_resamples, n_blocks, block) -> (n_resamples, n_blocks * block), then
-    # truncated back to the original length so every resample is the same size
-    # as the sample it estimates.
-    idx = (starts[:, :, None] + np.arange(block)[None, None, :])
-    idx = idx.reshape(n_resamples, n_blocks * block)[:, :n_valid]
 
-    boot = rank_ic_rows(y_true[idx], y_pred[idx])
+    per_fold = np.full((n_resamples, len(fold_slices)), np.nan)
+    for j, (rows, n_blocks) in enumerate(fold_slices):
+        n_k = rows.size
+        starts = rng.integers(0, n_k - block + 1, size=(n_resamples, n_blocks))
+        idx = starts[:, :, None] + np.arange(block)[None, None, :]
+        idx = idx.reshape(n_resamples, n_blocks * block)[:, :n_k]
+        take = rows[idx]
+        per_fold[:, j] = rank_ic_rows(y_true[take], y_pred[take])
+
+    # A resample is usable when at least one of its folds produced a defined
+    # correlation, and the mean then skips the rest exactly as the point
+    # estimate does. An all-NaN row correctly yields NaN.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        boot = np.nanmean(per_fold, axis=1)
     n_ok = int(np.isfinite(boot).sum())
 
+    n_blocks_total = int(sum(b for _, b in fold_slices))
     if n_ok < MIN_USABLE_RESAMPLE_FRACTION * n_resamples:
         return BootstrapEstimate(
-            track.ticker, n, n_blocks, float(hat), float("nan"), n_ok, False,
+            track.ticker, n, n_blocks_total, float(hat), float("nan"), n_ok,
+            False,
             f"only {n_ok} of {n_resamples} bootstrap resamples produced a "
-            f"defined rank IC")
+            f"defined within-fold rank IC")
 
-    sigma2 = float(np.nanvar(boot, ddof=1))
+    within = float(np.nanvar(boot, ddof=1))
+
+    # THE WITHIN-FOLD BOOTSTRAP ALONE UNDERSTATES THIS STATISTIC'S VARIANCE,
+    # and that was measured rather than reasoned about.
+    #
+    # Resampling inside each fold estimates how much each fold's own IC would
+    # move if that period were re-sampled. It says nothing about how much the
+    # ICs differ BETWEEN periods — and the estimate is a mean over periods, so
+    # that difference is part of its uncertainty. Measured on the 84-ticker
+    # panel with the pooled model's predictions, the between-fold component is
+    # a median of 1.5x the within-fold bootstrap: ignoring it turned 0 STRONG
+    # into 12, which is how this was caught.
+    #
+    # The sample variance of the K fold ICs divided by K estimates the TOTAL —
+    # each fold IC already carries its own sampling noise, so the spread
+    # between them contains both components. It is unbiased and, at K = 5,
+    # extremely noisy, which is why it is not used alone: the bootstrap is the
+    # floor, and a ticker whose few fold ICs happen to land close together
+    # cannot buy a near-zero variance from that coincidence.
+    #
+    # Taking the larger of the two is deliberately conservative. A variance
+    # estimator for a gate that publishes evidence should err toward refusing.
+    fold_ics = np.array([
+        rank_ic_rows(y_true[fold_ids == k][None, :],
+                     y_pred[fold_ids == k][None, :])[0]
+        for k in np.unique(fold_ids)], dtype=float)
+    fold_ics = fold_ics[np.isfinite(fold_ics)]
+    between = (float(np.var(fold_ics, ddof=1) / fold_ics.size)
+               if fold_ics.size >= 2 else float("nan"))
+
+    sigma2 = float(np.nanmax([within, between]))
     if not np.isfinite(sigma2) or sigma2 <= 0:
         return BootstrapEstimate(
-            track.ticker, n, n_blocks, float(hat), float("nan"), n_ok, False,
-            "bootstrap sampling variance is zero or non-finite")
+            track.ticker, n, n_blocks_total, float(hat), float("nan"), n_ok,
+            False, "sampling variance is zero or non-finite",
+            sigma2_within=within, sigma2_between=between)
 
-    return BootstrapEstimate(track.ticker, n, n_blocks, float(hat), sigma2,
-                             n_ok, True)
+    return BootstrapEstimate(track.ticker, n, n_blocks_total, float(hat),
+                             sigma2, n_ok, True,
+                             sigma2_within=within, sigma2_between=between)
 
 
 # ── Empirical Bayes ───────────────────────────────────────────────────────────
@@ -860,7 +942,6 @@ def grade_panel(
     posterior_threshold: float = STRONG_POSTERIOR_THRESHOLD,
     spread_per_ic: float | None = None,
     break_even: float | None = None,
-    respect_fold_gaps: bool = False,
 ) -> PanelGrading:
     """
     Bootstrap, pool, shrink, control and grade — the whole Stage 0 layer.
@@ -876,7 +957,7 @@ def grade_panel(
 
     estimates = [block_bootstrap_ic(t, block=block, n_resamples=n_resamples,
                                     seed=seed,
-                                    respect_fold_gaps=respect_fold_gaps)
+                                    )
                  for t in tracks]
     usable = [e for e in estimates if e.usable]
     if len(usable) < 2:

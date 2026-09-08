@@ -48,7 +48,8 @@ classify the same cells and says so.
 
 EXCLUSION IS BY WHOLE FOLD, AND THE BOOTSTRAP IS TOLD ABOUT THE SEAM. Dropping
 fold 2 of 5 leaves rows either side that are months apart. `block_bootstrap_ic`
-is called with `respect_fold_gaps=True` so no resampled block spans that join —
+draws its blocks WITHIN each surviving fold, so no resample can span that
+join —
 otherwise the sweep would manufacture continuity that is not in the data, which
 is the same class of error as the too-short block the main run swept for.
 
@@ -268,7 +269,7 @@ def sweep(tracks, folds: dict, scores: pd.DataFrame,
 
             est = block_bootstrap_ic(restricted, block=block,
                                      n_resamples=n_resamples, seed=seed,
-                                     respect_fold_gaps=True)
+                                     )
             if not est.usable:
                 n_refused += 1
                 per_ticker.append({"tau": tau, "ticker": ticker,

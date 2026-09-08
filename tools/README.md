@@ -15,6 +15,31 @@ Utility script to verify the health of the FastAPI endpoints.
 ## verify_stage1.py & verify_stage2.py
 Validation scripts used during initial pipeline execution and universe scaling to verify system outputs.
 
+## stage0b_regrade.py
+
+Stage 0b — the audit and fix of the grading methodology's IC.
+
+`pipeline/evidence_shrinkage.py` (and `pipeline/evaluation.compute_metrics`,
+which feeds the LIVE gate) computed each ticker's rank IC by concatenating
+every walk-forward fold into one series and correlating once. Pooling across
+groups conflates between-group with within-group variation, and on this panel
+the folds' prediction levels run against their realised returns at rho -0.600 —
+so the pooled figure came out negative while every fold's internal ranking was
+positive.
+
+The shrinkage module is FIXED: the point estimate is the mean of the
+within-fold rank ICs, and the bootstrap resamples within folds and takes the
+larger of the within-fold and between-fold variance components. The live gate
+is NOT fixed — changing it changes `forecast_confidence`, which is a production
+change — but this tool measures exactly what correcting it would do.
+
+```bash
+python tools/stage0b_regrade.py --markdown stage0b_regrade.md
+```
+
+Method and decision rule are fixed in `docs/stage0b-preregistration.md`;
+the results are in `docs/stage0b-findings.md`.
+
 ## stage2a_gamma_spotcheck.py & stage2a_pilot.py
 
 Stage 2a — the tuner-objective pilot. Diagnostic, sandboxed, and **not** wired

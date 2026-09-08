@@ -48,6 +48,7 @@ from pipeline.evidence_shrinkage import (
     posterior_probability_positive,
     precision_weighted_mean,
     rank_ic_rows,
+    within_fold_rank_ic,
     shrink,
     store_grading,
 )
@@ -59,7 +60,8 @@ BREAK_EVEN = 0.0051          # the P4-measured bar, pinned so tests are offline
 
 
 def _track(ticker: str, n: int = 600, ic: float = 0.0, seed: int = 0,
-           autocorr: int = BLOCK_LENGTH_SESSIONS) -> TickerTrack:
+           autocorr: int = BLOCK_LENGTH_SESSIONS,
+           n_folds: int = 5) -> TickerTrack:
     """
     A synthetic track record with a PLANTED rank IC and realistic overlap.
 
@@ -93,7 +95,20 @@ def _track(ticker: str, n: int = 600, ic: float = 0.0, seed: int = 0,
     y_pred = ic * y_true + np.sqrt(max(1e-12, 1 - ic ** 2)) * noise
     dates = tuple(str(pd.Timestamp("2019-01-01") + pd.Timedelta(days=i))[:10]
                   for i in range(n))
-    return TickerTrack(ticker, dates, y_true, y_pred)
+
+    # FOLD LABELS ARE NOT DECORATION SINCE STAGE 0b. The per-ticker IC is
+    # defined WITHIN each walk-forward fold and averaged, so a track without
+    # them cannot be scored at all and `block_bootstrap_ic` refuses one. Five
+    # equal contiguous folds, matching EVAL_N_FOLDS and the abutting test
+    # windows `PurgedWalkForward` produces.
+    #
+    # The planted IC survives the split: it is planted per ROW, so every fold
+    # carries it and the within-fold average recovers it. What the fixture
+    # deliberately does NOT contain is a fold-level level shift — that lives in
+    # tests/test_stage0b_within_fold_ic.py, which is where the pooled/within
+    # distinction is the thing under test.
+    folds = np.repeat(np.arange(n_folds), int(np.ceil(n / n_folds)))[:n]
+    return TickerTrack(ticker, dates, y_true, y_pred, folds=folds)
 
 
 def _sqlite_engine(tmp_path):
@@ -461,8 +476,9 @@ def test_the_point_estimate_is_the_real_series_not_a_bootstrap_average():
     being graded."""
     track = _track("PT.NS", ic=0.4, seed=7)
     est = block_bootstrap_ic(track, n_resamples=300)
-    assert est.hat_ic == pytest.approx(rank_ic(track.y_true, track.y_pred),
-                                       abs=1e-12)
+    expected, _, _ = within_fold_rank_ic(track.y_true, track.y_pred,
+                                         np.asarray(track.folds))
+    assert est.hat_ic == pytest.approx(expected, abs=1e-12)
 
 
 def test_prediction_and_outcome_are_resampled_with_the_SAME_index():
@@ -523,15 +539,37 @@ def test_a_shorter_block_understates_the_sampling_variance():
     outcome is a 30-session rolling sum, so neighbouring rows share 29 of their
     30 sessions. A block of 1 treats them as independent, returns a sigma2 that
     is too small, and every posterior downstream becomes too confident.
+
+    ASSERTED ON THE WITHIN-FOLD COMPONENT SINCE STAGE 0b. The reported sigma2
+    is now the LARGER of that bootstrap and the between-fold spread of the fold
+    ICs, and the between-fold term does not depend on the block length at all.
+    So on a ticker whose folds happen to disagree, the between term dominates
+    at both block lengths and the reported figures tie — which would fail this
+    test for a reason that has nothing to do with the block. The block's job is
+    inside the bootstrap, so that is where it is checked.
     """
+    # The block's job is inside the BOOTSTRAP component, and that is where it
+    # is checked. Since Stage 0b the reported `sigma2` is the larger of that
+    # bootstrap and the between-fold spread of the fold ICs, and the
+    # between-fold term does not depend on the block length at all — so on a
+    # ticker whose periods disagree it dominates at every block length and the
+    # reported figures tie. That is the estimator behaving correctly, not the
+    # block being ignored, which is exactly why both components are reported.
     track = _track("BLK.NS", ic=0.0, seed=17)
     short = block_bootstrap_ic(track, block=1, n_resamples=400)
     proper = block_bootstrap_ic(track, block=BLOCK_LENGTH_SESSIONS,
                                 n_resamples=400)
-    assert short.sigma2 < proper.sigma2, (
+
+    assert short.usable and proper.usable
+    assert short.sigma2_within < proper.sigma2_within, (
         "a block of 1 did not understate the variance on an autocorrelated "
         "series, which means the fixture has no autocorrelation and this test "
         "is blind to the defect it exists to catch")
+
+    # And the reported figure can never fall below either component.
+    for est in (short, proper):
+        assert est.sigma2 >= est.sigma2_within
+        assert est.sigma2 >= est.sigma2_between
 
 
 # ── Small samples, and the tickers that cannot be measured at all ─────────────
@@ -579,54 +617,73 @@ def test_a_prediction_constant_within_every_fold_earns_no_ranking_result():
     y_pred = np.concatenate(y_pred)
     dates = tuple(str(i) for i in range(len(y_true)))
 
-    # Without the fold labels the layer cannot see the problem and estimates a
-    # confident, entirely spurious negative IC.
-    blind = block_bootstrap_ic(TickerTrack("BLIND.NS", dates, y_true, y_pred),
-                               n_resamples=200)
-    assert blind.usable is True
-    assert blind.hat_ic < -0.8, (
+    # The statistic Stage 0b REPLACED, computed here so the guard below is
+    # visibly being tested against something. Pooling every fold into one
+    # series and correlating once reads the five constants against the five
+    # period returns and reports a confident, entirely spurious -0.9.
+    pooled = float(rank_ic_rows(y_true[None, :], y_pred[None, :])[0])
+    assert pooled < -0.8, (
         "the fixture does not reproduce the artifact, so the guard below is "
         "being tested against nothing")
 
-    # With them, it is refused.
+    # The corrected estimator refuses it instead: no fold holds an ordering.
     seeing = block_bootstrap_ic(
         TickerTrack("SEEING.NS", dates, y_true, y_pred,
                     folds=np.concatenate(folds)),
         n_resamples=200)
     assert seeing.usable is False
-    assert "CONSTANT within every one of its 5 walk-forward folds" in seeing.reason
+    assert "no ordering inside ANY of its 5 walk-forward folds" in seeing.reason
 
 
 def test_the_within_fold_guard_spares_a_ticker_that_does_order_somewhere():
-    """It must refuse only the genuinely empty case. A ticker with real
-    ordering in even one fold is still measurable, contamination and all —
-    the broader contamination is REPORTED by the fold diagnostic, not gated."""
-    n_per_fold = 80
-    rng = np.random.default_rng(3)
-    y_true, y_pred, folds = [], [], []
-    for k in range(5):
-        truth = rng.normal(size=n_per_fold)
-        y_true.append(truth)
-        # fold 2 carries a real ordering; the rest are flat constants
-        y_pred.append(truth * 0.5 if k == 2 else np.full(n_per_fold, 0.01 * k))
-        folds.append(np.full(n_per_fold, k))
+    """
+    It must refuse only what is genuinely unmeasurable.
 
-    est = block_bootstrap_ic(
-        TickerTrack("MIXED.NS", tuple(str(i) for i in range(5 * n_per_fold)),
-                    np.concatenate(y_true), np.concatenate(y_pred),
-                    folds=np.concatenate(folds)),
-        n_resamples=200)
-    assert est.usable is True
+    STAGE 0b MOVED THIS LINE, deliberately. The estimate is now a MEAN over
+    folds, so a ticker ordering in ONE fold has a mean of one number and no
+    spread at all; `MIN_FOLDS_FOR_ESTIMATE` refuses it. A ticker ordering in
+    three is still spared, flat folds and all — the broader contamination is
+    REPORTED by the fold diagnostic, not gated.
+    """
+    n_per_fold = 80
+
+    def _ordering_in(ordered: set[int]) -> TickerTrack:
+        rng = np.random.default_rng(3)
+        y_true, y_pred, folds = [], [], []
+        for k in range(5):
+            truth = rng.normal(size=n_per_fold)
+            y_true.append(truth)
+            if k in ordered:
+                # IMPERFECTLY. A noiseless copy of the outcome gives every
+                # resample an IC of exactly 1.0, so the variance collapses and
+                # the estimate is refused for that reason instead — which would
+                # make this test pass or fail for the wrong one.
+                y_pred.append(truth * 0.5 + 0.8 * rng.normal(size=n_per_fold))
+            else:
+                y_pred.append(np.full(n_per_fold, 0.01 * k))
+            folds.append(np.full(n_per_fold, k))
+        return TickerTrack("MIXED.NS",
+                           tuple(str(i) for i in range(5 * n_per_fold)),
+                           np.concatenate(y_true), np.concatenate(y_pred),
+                           folds=np.concatenate(folds))
+
+    spared = block_bootstrap_ic(_ordering_in({1, 2, 3}), n_resamples=200)
+    assert spared.usable is True
+
+    refused = block_bootstrap_ic(_ordering_in({2}), n_resamples=200)
+    assert refused.usable is False
+    assert "is not a track record" in refused.reason
 
 
 def test_a_constant_prediction_is_undefined_rather_than_a_measured_zero():
     n = 400
+    flat_folds = np.repeat(np.arange(5), int(np.ceil(n / 5)))[:n]
     track = TickerTrack("FLAT.NS", tuple(str(i) for i in range(n)),
                         np.random.default_rng(0).normal(size=n),
-                        np.full(n, 0.017))
+                        np.full(n, 0.017), folds=flat_folds)
     est = block_bootstrap_ic(track, n_resamples=100)
     assert est.usable is False
-    assert "constant" in est.reason
+    assert "no ordering inside ANY" in est.reason
 
 
 def test_an_unmeasurable_ticker_is_graded_INSUFFICIENT_and_left_out_of_the_family():
@@ -819,8 +876,10 @@ def test_the_fold_diagnostic_detects_a_pooled_IC_made_of_fold_levels():
         y_true = np.concatenate(y_true)
         y_pred = np.concatenate(y_pred)
         name = f"F{t}.NS"
+        panel_folds = np.repeat(np.arange(5),
+                                int(np.ceil(len(y_true) / 5)))[:len(y_true)]
         tracks.append(TickerTrack(name, tuple(str(i) for i in range(len(y_true))),
-                                  y_true, y_pred))
+                                  y_true, y_pred, folds=panel_folds))
         folds[name] = np.concatenate(fold)
 
     out = tool.fold_diagnostic(tracks, folds)
