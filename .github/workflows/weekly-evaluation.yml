@@ -71,3 +71,35 @@ jobs:
         with:
           path: tuned_params/
           key: tuned-params-${{ github.run_id }}
+
+      # ── Evidence-Grading Redesign, Stage 0 — SHADOW ONLY ──────────────────
+      #
+      # A SEPARATE TRACK from the project's Phase 0-6 roadmap; neither
+      # renumbers the other. This step grades the same held-out track record
+      # the live gate grades, using empirical-Bayes shrinkage across the panel,
+      # and writes it to `evidence_grades_v2`. It touches NOTHING the public
+      # API serves: `forecast_confidence`, `forecast_current` and `forecasts`
+      # are written by the step above and are not read or rewritten here.
+      #
+      # LAST, AND `continue-on-error`, for the same reason the baseline
+      # comparison is non-fatal: it publishes nothing, so a defect in it must
+      # cost a recorded skip rather than an hour of persisted per-ticker
+      # evaluation. It runs after the tuned-parameter cache has been saved so
+      # a slow grading run cannot cost the cache either.
+      #
+      # IT COSTS A SECOND FULL WALK-FORWARD (~65 min for 84 tickers), and that
+      # is a known, temporary waste. `evaluate_and_persist_ticker` keeps only
+      # the four scalar metrics and drops `WalkForwardResult.predictions`, so
+      # there is no stored track record to bootstrap and the tool regenerates
+      # it by re-running the same seeded, deterministic evaluation. Persisting
+      # those predictions in the weekly job would remove this step entirely;
+      # `pipeline/model.py` is out of scope for Stage 0, so it is flagged in
+      # docs/stage0-evidence-grading.md instead of done here. Total budget:
+      # ~56 min evaluation + ~65 min grading against a 300-minute timeout.
+      - name: Shadow evidence grading (Stage 0)
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python tools/run_evidence_grading.py \
+            --rebuild --store --block-sweep --verify-against-persisted
