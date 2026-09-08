@@ -15,6 +15,34 @@ Utility script to verify the health of the FastAPI endpoints.
 ## verify_stage1.py & verify_stage2.py
 Validation scripts used during initial pipeline execution and universe scaling to verify system outputs.
 
+## stage0c_close.py
+
+Stage 0c — the closing session of the evidence-grading track. Runs the
+corrected layer (`pipeline/evidence_panel.py`) over every variant whose
+held-out predictions already exist. Nothing is retrained.
+
+Four corrections land at once, and every one of them is expected to REDUCE the
+graded count: cross-sectional rank-demeaning of both sides, a date-level
+circular block bootstrap that re-runs the whole empirical-Bayes pipeline per
+replicate, Romano-Wolf stepdown across the 84 simultaneous tests, and REML with
+an explicit tau2 ~ 0 detector that emits ONE panel statement instead of 84
+duplicated ones.
+
+Two placebos run by default and they are the point of the tool. Predictions
+permuted **within each date** preserve the demeaning geometry exactly and
+destroy only the name-to-outcome link; per-ticker constants carry no
+information at all. If either grades names, the layer is manufacturing grades
+rather than revealing them.
+
+```bash
+pip install -r requirements-evidence.txt      # arch + linearmodels, lazily imported
+python tools/stage0c_close.py --markdown stage0c_report.md
+python tools/stage0c_close.py --block 63 --markdown stage0c_report_block63.md
+```
+
+Method and decision rule are fixed in `docs/stage0c-preregistration.md`; the
+closing document is `docs/stage0-closing.md`.
+
 ## stage0b_regrade.py
 
 Stage 0b — the audit and fix of the grading methodology's IC.

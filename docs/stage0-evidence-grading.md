@@ -1,3 +1,30 @@
+<!-- stage0c-correction-notice -->
+> ## ⚠ CORRECTION NOTICE — superseded 2026-09-08
+>
+> **`mu_hat = -0.05988` and every number derived from it in this document are
+> ARTIFACTS of a defect in how the per-ticker IC was computed, not measurements
+> of model skill.**
+>
+> `block_bootstrap_ic` concatenated all five walk-forward folds into one series
+> and correlated once. Pooling across groups conflates between-group with
+> within-group variation, and on this panel the fold prediction LEVELS run
+> against the fold realised returns at rho = **-0.600** — so the pooled figure
+> came out strongly negative while every fold's internal ranking was positive.
+> The same model over the same rows reads **-0.0512 pooled and +0.0120 within**.
+>
+> Found and fixed in **Stage 0b** (2026-09-08); the graded quantity was then
+> corrected again in **Stage 0c** (cross-sectional rank-demeaning, a date-level
+> block bootstrap, and Romano-Wolf multiplicity control).
+>
+> **What still stands from this document:** the power arithmetic that motivated
+> partial pooling, the method, the guards, the shadow-mode discipline, and the
+> pre-registered finding that the constraint is SIGNAL rather than measurement.
+> **What does not:** every value of `mu_hat`, `tau2_hat` and the grade counts.
+>
+> Read [`stage0-closing.md`](stage0-closing.md) for the corrected numbers and
+> the consolidated list of what replaced what. This document is kept unedited
+> as the record of what was measured at the time.
+
 # Evidence-Grading Redesign — Stage 0: partial pooling, in shadow
 
 > **Numbering.** This is Stage 0 of a five-stage (0-4) evidence-grading

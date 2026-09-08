@@ -1,3 +1,34 @@
+<!-- stage0c-correction-notice -->
+> ## ⚠ CORRECTION NOTICE — superseded 2026-09-08
+>
+> **The entire tau sweep in this document is computed on a broken statistic.**
+>
+> Every row of the tau grid — including the `tau = 1.00` cell that reproduces
+> Stage 0's `mu_hat = -0.05988` "to the last digit" — was produced by a
+> per-ticker IC that pooled across walk-forward folds and correlated once. That
+> reproduction was a genuine check of the code path and a false reassurance
+> about the number: both sides of the comparison carried the same defect.
+>
+> **And this document's central attribution is WRONG.** It concluded that
+> `mu_hat` is "dominated by fold-level constants" and flips sign when they are
+> excluded. Stage 2b then graded a model that emits **zero** constant
+> predictions and `mu_hat` moved only to **-0.052**, with the identical
+> rho = -0.600. The fold LEVEL was the mechanism; constancy was only its most
+> extreme form, and removing the constants was never going to fix it.
+>
+> **What still stands:** that the degeneracy distribution is bimodal (316 cells
+> at mode-share exactly 1.000, only 16 in (0.90, 1.00)); that the constant IS
+> the training mean, a median 0.043 sd from the preceding period's mean; and
+> the root-cause reading that the tuner optimises a metric under which a
+> constant is near-optimal. Stage 2a and Stage 2b confirmed all three.
+>
+> **What does not:** every `mu_hat`, `tau2_hat`, z-statistic and grade count in
+> the sweep table, and the within-fold `+0.1444` — which Stage 0c shows was
+> measured on a raw time-series IC that a common market factor inflates, and on
+> survivor cells selected by the model's own choice to split.
+>
+> See [`stage0-closing.md`](stage0-closing.md).
+
 # Stage 0 Addendum — degeneracy sensitivity sweep
 
 > **This is an ADDENDUM, not an amendment.** Stage 0's committed numbers —

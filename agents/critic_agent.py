@@ -174,6 +174,41 @@ def grade_evidence(state: dict) -> tuple[str, list[str]]:
     else:
         grade = "INSUFFICIENT"
 
+    # STAGE 0c: STRONG REQUIRES MULTIPLE-TESTING-ADJUSTED SIGNIFICANCE.
+    #
+    # Grading 84 tickers is 84 simultaneous tests, and the three checks above
+    # are all NOMINAL, per-ticker rules. A raw t > 2 on one name out of 84 is
+    # what chance produces several times over — the gate's own measured yield
+    # was 3 names against 3.12 expected under independence.
+    #
+    # `eval_rw_significant` is written by the WEEKLY panel grading
+    # (`pipeline.evidence_panel.grade_panel_v3`), which is the only altitude the
+    # adjustment can be computed at: Romano-Wolf stepdown reads the joint
+    # dependence off a date-level bootstrap across all 84 names at once, and a
+    # single ticker's row cannot see it.
+    #
+    # ABSENT means NOT ESTABLISHED, never "assume yes". A ticker whose panel
+    # grading has not run yet is capped at WEAK rather than promoted on
+    # unadjusted evidence, which is the same direction the `abs(ic_t)` fix took
+    # in 2026-09-02: the change can only remove a STRONG, never create one.
+    #
+    # Harvey, Liu & Zhu (2016) argue t > 3.0 for a genuinely new factor given
+    # the volume of testing already done in the literature; this project has run
+    # 103+ configurations of its own on this one panel.
+    if grade == "STRONG":
+        adjusted = state.get("eval_rw_significant")
+        if adjusted is not True:
+            grade = "WEAK"
+            reasons.append(
+                "All held-out checks passed, but they are NOMINAL per-ticker "
+                "checks and this is one of 84 simultaneous tests. "
+                + ("The panel-level Romano-Wolf stepdown does not reject this "
+                   "ticker's null once that multiplicity is controlled."
+                   if adjusted is False else
+                   "No panel-level multiple-testing adjustment has been "
+                   "computed for this ticker yet.")
+                + " Grade capped at WEAK.")
+
     reasons.append(
         f"{passed} of {checks} held-out checks passed "
         f"({MIN_CHECKS_FOR_WEAK} needed for WEAK, "

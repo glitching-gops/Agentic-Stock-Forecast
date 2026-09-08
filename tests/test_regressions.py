@@ -401,7 +401,10 @@ def test_evidence_grade_is_deterministic_and_needs_no_llm():
 
     strong = {"forecast_available": True, "eval_rank_ic": 0.08,
               "eval_rank_ic_t": 2.6, "eval_hit_rate": 58.0,
-              "eval_baseline_hit_rate": 52.0, "eval_beats_naive": True}
+              "eval_baseline_hit_rate": 52.0, "eval_beats_naive": True,
+              # Stage 0c: STRONG additionally requires the panel-level
+              # multiple-testing adjustment. See grade_evidence.
+              "eval_rw_significant": True}
     assert grade_evidence(strong)[0] == "STRONG"
 
     weak = dict(strong, eval_rank_ic_t=0.4)
@@ -1195,7 +1198,19 @@ def test_an_unscored_headline_serialises_as_null_and_never_as_zero():
 
 # ── The evidence gate must need more than one weak correlation ────────────────
 
-def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
+def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True,
+                    rw_significant=True):
+    """
+    STAGE 0c ADDED `eval_rw_significant`, AND IT DEFAULTS TO TRUE HERE ON
+    PURPOSE.
+
+    STRONG now requires panel-level Romano-Wolf significance on top of the
+    three nominal per-ticker checks, because grading 84 tickers is 84
+    simultaneous tests. These fixtures are about the OTHER checks, so they hand
+    the adjustment over and let each test isolate the rule it is actually
+    about; `test_strong_requires_the_panel_level_multiplicity_adjustment` is
+    where the new rule itself is exercised.
+    """
     return {
         "forecast_available": True,
         "eval_rank_ic": ic,
@@ -1203,6 +1218,7 @@ def _evidence_state(ic, ic_t, hit, baseline, beats_naive=True):
         "eval_hit_rate": hit,
         "eval_baseline_hit_rate": baseline,
         "eval_beats_naive": beats_naive,
+        "eval_rw_significant": rw_significant,
     }
 
 
@@ -1359,6 +1375,46 @@ def test_an_anti_signal_is_not_evidence_however_significant_it_is():
         ic=0.05, ic_t=-0.4, hit=56.0, baseline=52.0))
     assert noisy == "WEAK"
     assert not any("NEGATIVE" in r for r in noisy_reasons)
+
+
+def test_strong_requires_the_panel_level_multiplicity_adjustment():
+    """
+    STAGE 0c. Three nominal per-ticker checks are not evidence when 84 tickers
+    are graded at once — the gate's own measured yield was 3 names against the
+    3.12 chance produces under independence.
+
+    `eval_rw_significant` comes from the weekly panel grading, which is the only
+    altitude Romano-Wolf can be computed at: the stepdown reads the joint
+    dependence off a date-level bootstrap across all 84 names, and one ticker's
+    row cannot see it.
+
+    ABSENT MEANS NOT ESTABLISHED. A ticker whose panel grading has not run is
+    capped at WEAK rather than promoted on unadjusted evidence — the change can
+    only remove a STRONG, never create one, which is the same property that made
+    the `abs(ic_t)` fix safe to ship mid-flight.
+    """
+    from agents.critic_agent import grade_evidence
+
+    passes_everything = dict(ic=0.30, ic_t=3.1, hit=61.0, baseline=52.0)
+
+    adjusted, _ = grade_evidence(_evidence_state(**passes_everything,
+                                                 rw_significant=True))
+    assert adjusted == "STRONG"
+
+    not_adjusted, reasons = grade_evidence(
+        _evidence_state(**passes_everything, rw_significant=False))
+    assert not_adjusted == "WEAK", (
+        "a ticker the panel-level stepdown does not reject was still graded "
+        "STRONG on nominal per-ticker checks")
+    assert any("Romano-Wolf" in r for r in reasons)
+
+    missing = _evidence_state(**passes_everything)
+    del missing["eval_rw_significant"]
+    unknown, unknown_reasons = grade_evidence(missing)
+    assert unknown == "WEAK", (
+        "an unmeasured adjustment was treated as a passed one")
+    assert any("has been computed" in r or "No panel-level" in r
+               for r in unknown_reasons)
 
 
 def test_strong_requires_every_check_to_have_actually_run():

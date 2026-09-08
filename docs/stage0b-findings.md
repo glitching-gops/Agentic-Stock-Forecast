@@ -1,3 +1,28 @@
+<!-- stage0c-correction-notice -->
+> ## ⚠ CORRECTION NOTICE — extended 2026-09-08
+>
+> **This document's fix was correct and incomplete.** Stage 0b replaced the
+> pooled-across-folds IC with a within-fold average, which was right. Two
+> problems it explicitly left open have since been closed in **Stage 0c**, and
+> both change the numbers in section 6:
+>
+> - the graded quantity was still a RAW per-ticker time-series IC, which a
+>   common market factor inflates for every name at once. Stage 0c
+>   cross-sectionally rank-demeans both predictions and targets.
+> - `mu_hat`'s standard error treated 84 tickers as independent, producing the
+>   z of +5.72 this document itself flagged as not credible. Stage 0c replaces
+>   it with a date-level block bootstrap that re-runs the whole empirical-Bayes
+>   pipeline per replicate, plus Romano-Wolf multiplicity control.
+>
+> **What still stands:** the audit in sections 1 and 2 — including the finding
+> that `pipeline/baselines.py`'s headline comparator table is CLEAN — the
+> synthetic proof, the two-component variance argument, and the live-gate
+> impact measurement.
+>
+> **What does not:** the `mu_hat`, z and grade counts in section 6.
+>
+> See [`stage0-closing.md`](stage0-closing.md).
+
 # Stage 0b — the grading IC was pooled across folds, and it is fixed
 
 > Closes a loop across four sessions. Stage 2b found that swapping in a model

@@ -1,0 +1,23 @@
+# Grading-time dependencies for the evidence layer (Stage 0c).
+#
+# DELIBERATELY NOT IN requirements.txt. That file is installed by Render, by
+# the daily pipeline and by the weekly evaluation. Render serves reads and
+# never grades a panel, and the rule torch's Phase 0 removal established is not
+# "no large libraries" but "nothing on the serving path that the serving path
+# does not use" — the instance had already been OOM-killed once.
+#
+# `pipeline/evidence_panel.py` imports both lazily, inside the two functions
+# that need them, and a test asserts neither is in sys.modules after the module
+# is imported. Install this file only where a panel is actually graded:
+#
+#     pip install -r requirements-evidence.txt
+
+# Romano-Wolf stepdown inputs and the Politis-White automatic block length
+# (2004, with the Patton-Politis-White 2009 correction). Actively maintained,
+# pure Python, same author as linearmodels.
+arch>=7.0
+
+# Driscoll-Kraay standard errors via PanelOLS(cov_type="kernel") — robust to
+# both cross-sectional dependence and serial correlation, which is exactly the
+# pair this panel has.
+linearmodels>=6.0

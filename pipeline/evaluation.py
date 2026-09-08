@@ -289,15 +289,43 @@ def effective_sample_size(n: int, horizon: int) -> float:
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
-                    horizon: int = 30) -> dict:
-    """Forecast-quality metrics for an excess-return target, with baselines."""
+                    horizon: int = 30,
+                    folds: np.ndarray | None = None) -> dict:
+    """
+    Forecast-quality metrics for an absolute-return target, with baselines.
+
+    ``folds`` IS THE STAGE 0c CORRECTION AND IT IS NOT OPTIONAL IN PRACTICE.
+    Without it ``rank_ic`` is one correlation over the concatenated
+    walk-forward folds, and pooling across folds conflates between-fold with
+    within-fold variation: on this panel the fold prediction LEVELS run against
+    the fold realised returns at rho = -0.600, so the pooled figure came back
+    -0.05988 while the within-fold average of the same model over the same rows
+    was +0.1262. Stage 0's headline, the addendum's whole tau sweep and this
+    gate's own `eval_rank_ic` were all measuring that arrangement of five
+    numbers.
+
+    With ``folds`` the correlation is computed WITHIN each fold and averaged,
+    which is what `_mean_daily_rank_ic` already does one level up and what
+    `pipeline.evidence_shrinkage.within_fold_rank_ic` does per ticker. The
+    argument defaults to None only so that callers scoring a single block —
+    the baseline comparators, which have no folds — keep working unchanged.
+    """
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     yt, yp = y_true[valid], y_pred[valid]
 
     if len(yt) < 3:
         return {"n": int(len(yt))}
 
-    ic = rank_ic(yt, yp)
+    if folds is None:
+        ic = rank_ic(yt, yp)
+        n_folds_scored = 0
+    else:
+        fold_ids = np.asarray(folds)[valid]
+        per_fold = [rank_ic(yt[fold_ids == k], yp[fold_ids == k])
+                    for k in np.unique(fold_ids)]
+        defined = [v for v in per_fold if np.isfinite(v)]
+        ic = float(np.mean(defined)) if defined else float("nan")
+        n_folds_scored = len(defined)
     # Under the null of no skill IC is approximately N(0, 1/sqrt(n_eff - 1)),
     # where n_eff discounts the overlap between successive labels.
     n_eff = effective_sample_size(len(yt), horizon)
@@ -322,6 +350,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         "n_effective": round(n_eff, 1),
         "rank_ic": ic,
         "rank_ic_t": ic_t,
+        "n_folds_scored": n_folds_scored,
         "hit_rate": hit_rate(yt, yp),
         "majority_hit_rate": majority_hit_rate(yt),
         "mae": mae_model,
@@ -436,8 +465,12 @@ def walk_forward(
     preds = preds[np.isfinite(preds["y_true"])].reset_index(drop=True)
 
     y_true = preds["y_true"].to_numpy()
+    # The fold labels reach the metric, which is what makes `rank_ic` the
+    # within-fold average rather than the pooled correlation. See
+    # `compute_metrics` for why that distinction is the whole of Stage 0b.
     metrics = compute_metrics(y_true, preds["y_pred"].to_numpy(),
-                              horizon=splitter.horizon)
+                              horizon=splitter.horizon,
+                              folds=preds["fold"].to_numpy())
 
     features = preds[["sector_rel_20d"]] if "sector_rel_20d" in preds.columns else None
     baselines = {

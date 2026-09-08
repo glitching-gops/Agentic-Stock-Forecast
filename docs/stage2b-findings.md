@@ -1,3 +1,24 @@
+<!-- stage0c-correction-notice -->
+> ## ⚠ CORRECTION NOTICE — partially superseded 2026-09-08
+>
+> **Section 8's panel diagnostic table is computed on the pooled-across-folds
+> IC that Stage 0b then fixed.** Its `mu_hat` figures (-0.052, -0.055, -0.026)
+> and the "84 ANTI_SIGNAL" row are artifacts of that statistic, not
+> measurements of the pooled model.
+>
+> The section's ARGUMENT, however, is what opened Stage 0b and it stands
+> exactly as written: `mu_hat` barely moved when the constants went away, and
+> rho(fold level, fold return) was -0.600 in both. That was the observation that
+> located the bug.
+>
+> **Everything else in this document is unaffected.** The 2x2, the placebo
+> arms, the min_train sweep, the effective-sample-size measurement and the
+> cross-sectional `reb_IC`/`reb_t` figures all come from
+> `cross_sectional_report` and `per_date_rank_ic`, which were audited clean in
+> Stage 0b and are within-group-then-averaged.
+>
+> See [`stage0-closing.md`](stage0-closing.md).
+
 # Stage 2b — pooling removes the degeneracy completely, and finds nothing underneath it
 
 > The first slice of the full Stage 2 (pooled model consolidation), triggered by
