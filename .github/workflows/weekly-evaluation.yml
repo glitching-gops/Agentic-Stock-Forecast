@@ -43,6 +43,22 @@ jobs:
         continue-on-error: true
         run: pip install -r requirements-scoring.txt
 
+      # The evidence layer's grading-time extras (Stage 0c): `arch` and
+      # `linearmodels`. NOT in requirements.txt for torch's reason — Render
+      # installs that file and never grades a panel. `pipeline/evidence_panel.py`
+      # imports both lazily, so the per-ticker evaluation above never needs them.
+      #
+      # NO STEP IN THIS WORKFLOW CALLS `grade_panel_v3` YET; this lands ahead of
+      # the one that will. Without it that step would NOT go red: the
+      # linearmodels Driscoll-Kraay cross-check and the arch Politis-White block
+      # length are each caught and recorded as "unavailable" in the grading
+      # notes, so a missing install costs both cross-checks SILENTLY.
+      # `continue-on-error` for the scorer's reason: an install failure must
+      # cost a recorded skip, never the persisted per-ticker evaluation.
+      - name: Install evidence-grading extras
+        continue-on-error: true
+        run: pip install -r requirements-evidence.txt
+
       - name: Restore tuned hyperparameters cache
         uses: actions/cache/restore@v4
         with:
