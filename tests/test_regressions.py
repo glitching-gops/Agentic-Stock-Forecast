@@ -2624,13 +2624,29 @@ def test_daily_job_raises_when_every_ticker_was_skipped_or_refused(monkeypatch):
         scheduler.run_pipeline_job()
 
 
-def test_weekly_job_raises_when_labels_would_regress(monkeypatch):
+def test_weekly_job_raises_when_labels_would_regress(monkeypatch, tmp_path):
+    import sqlalchemy as sa
+
+    import data.db as db_mod
     import data.tickers
     import data.universe
     import pipeline.fetch
     import pipeline.model
     import pipeline.signals
+    import pipeline.tracking
     import scheduler
+
+    # The job opens a run in experiment_runs before it aborts, and that write
+    # must land in a throwaway database carrying the REAL schema. This test
+    # used to stub every step except the run log, so in any checkout whose .env
+    # pointed at Supabase it wrote a fake ABORTED weekly run into PRODUCTION on
+    # every suite run: 221 of the table's 250 rows by 2026-09-13.
+    # tests/conftest.py now makes that impossible for the whole suite; this
+    # makes the test self-sufficient, whatever database the suite is pinned to.
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'runs.db'}")
+    monkeypatch.setattr(db_mod, "get_engine", lambda: engine)
+    db_mod.init_db()
+    monkeypatch.setattr(pipeline.tracking, "get_engine", lambda: engine)
 
     counts = iter([100, 40])
     monkeypatch.setattr(data.universe, "sync_current_membership", lambda: None)
@@ -2647,6 +2663,12 @@ def test_weekly_job_raises_when_labels_would_regress(monkeypatch):
 
     with pytest.raises(scheduler.PipelineAbort):
         scheduler.run_weekly_evaluation_job()
+
+    # The abort is still recorded, and recorded HERE.
+    with engine.connect() as conn:
+        rows = conn.execute(sa.text(
+            "SELECT job, status, notes FROM experiment_runs")).fetchall()
+    assert [tuple(r) for r in rows] == [("weekly", "ABORTED", "labelled rows regressed (F6)")]
 
 # ── Phase 1: forecast_outcomes must actually be written ───────────────────────
 #
