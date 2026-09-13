@@ -341,6 +341,24 @@ means.**
 
 The change is prepared and **not deployed**. No push, no Render redeploy.
 
+> **Correction, 2026-09-13: the table above does not describe the code that
+> shipped.** Its right-hand column handed `grade_evidence` the rank-DEMEANED
+> within-fold IC from `grade_panel_v3`, which production never computes — a
+> single ticker's walk-forward has no cross-section to demean against. The code
+> merged to `main` handed it the within-fold RAW IC instead, averaged over
+> however many folds carried an ordering, with a t-statistic built from ALL
+> rows. Graded from the live `model_metadata` after the 2026-09-12 weekly run,
+> that path would have published **0 STRONG / 19 WEAK / 65 INSUFFICIENT**, 11
+> of the 19 resting on a single fold of five (PNB.NS: IC +0.60, t +4.78).
+>
+> The fix carries Stage 0b's `MIN_FOLDS_FOR_ESTIMATE = 3` onto the live path
+> and builds the t from the scored folds' rows only. On the 2026-09-06
+> predictions it grades **0 / 1 / 83** — the same count as the table above,
+> reached by a different mechanism (the one WEAK is AXISBANK.NS, on three
+> scored folds). The `eval_rw_significant` producer is still unwired; it
+> changes no grade today, because no ticker passes all three checks for the
+> flag to unlock.
+
 ## 8. What a Render redeploy would change on the live dashboard
 
 Stated plainly for the hand-back, and it is less than it sounds:

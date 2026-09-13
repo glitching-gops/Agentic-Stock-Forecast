@@ -191,7 +191,13 @@ MIN_USABLE_RESAMPLE_FRACTION = 0.5
 # has TWO folds carrying an ordering at all. Grading those on a mean of two
 # survivors, selected on the model having chosen to split, is exactly the
 # survivorship the Stage 0 addendum flagged and declined to treat as a result.
-MIN_FOLDS_FOR_ESTIMATE = 3
+#
+# ONE COPY, and it lives in `pipeline.evaluation`, because the LIVE gate needs
+# the same guard: `compute_metrics` feeds `eval_rank_ic` to `grade_evidence`,
+# and until 2026-09-13 it averaged over however many folds had scored — graded
+# 19 names WEAK, 11 of them on a single fold. Two copies of one threshold drift
+# with nothing to see, because both still run.
+from pipeline.evaluation import MIN_FOLDS_FOR_ESTIMATE  # noqa: E402
 
 #: Benjamini-Hochberg false-discovery rate across the panel. FDR rather than
 #: Bonferroni because the goal is to surface as many REAL weak effects as the

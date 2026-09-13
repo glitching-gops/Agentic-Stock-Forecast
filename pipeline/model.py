@@ -257,6 +257,48 @@ def evaluate_ticker(
 # ── Persistence: weekly writes, daily reads ────────────────────────────────────
 
 
+def _finite_or_none(value):
+    """None for a missing or non-finite number; the value itself otherwise.
+
+    A NaN bound to Postgres is stored as ``'NaN'::float8``, not NULL — the
+    Stage 0 write-boundary landmine, where SQLite converts it silently and
+    the round-trip test launders the defect. Measured on the live table on
+    2026-09-13: of 24 tickers with no rank IC, 20 held NULL and 4 held a
+    stored NaN, so one quantity had two representations depending on how it
+    went missing.
+    """
+    if value is None:
+        return None
+    try:
+        return value if np.isfinite(float(value)) else None
+    except (TypeError, ValueError):
+        return value
+
+
+def _evaluation_params(ticker: str, payload: dict) -> dict:
+    """Bind parameters for one ``model_metadata`` upsert, NaN already NULL."""
+    num = _finite_or_none
+    return to_native_params({
+        "ticker": ticker,
+        "ic": num(payload.get("rank_ic")),
+        "ic_t": num(payload.get("rank_ic_t")),
+        "hit": num(payload.get("hit_rate")),
+        "baseline": num(payload.get("majority_hit_rate")),
+        "mae": num(payload.get("mae")),
+        "mae_naive": num(payload.get("mae_naive_zero")),
+        "n_oos": num(payload.get("n_oos_predictions")),
+        "n_eff": num(payload.get("n_effective")),
+        "protocol": json.dumps(payload.get("protocol", {})),
+        "cq": num(payload.get("conformal_quantile")),
+        "cc": num(payload.get("conformal_coverage")),
+        "cn": num(payload.get("conformal_n")),
+        "cr": json.dumps(payload.get("conformal_residuals"))
+              if payload.get("conformal_residuals") is not None else None,
+        "version": MODEL_VERSION,
+        "evaluated_at": payload.get("evaluated_at"),
+    })
+
+
 def _persist_evaluation(ticker: str, payload: dict) -> None:
     """Upserts the weekly evaluation + conformal calibration for one ticker."""
     engine = get_engine()
@@ -290,25 +332,7 @@ def _persist_evaluation(ticker: str, payload: dict) -> None:
                 conformal_residuals    = EXCLUDED.conformal_residuals,
                 model_version          = EXCLUDED.model_version,
                 evaluated_at           = EXCLUDED.evaluated_at
-        """), to_native_params({
-            "ticker": ticker,
-            "ic": payload.get("rank_ic"),
-            "ic_t": payload.get("rank_ic_t"),
-            "hit": payload.get("hit_rate"),
-            "baseline": payload.get("majority_hit_rate"),
-            "mae": payload.get("mae"),
-            "mae_naive": payload.get("mae_naive_zero"),
-            "n_oos": payload.get("n_oos_predictions"),
-            "n_eff": payload.get("n_effective"),
-            "protocol": json.dumps(payload.get("protocol", {})),
-            "cq": payload.get("conformal_quantile"),
-            "cc": payload.get("conformal_coverage"),
-            "cn": payload.get("conformal_n"),
-            "cr": json.dumps(payload.get("conformal_residuals"))
-                  if payload.get("conformal_residuals") is not None else None,
-            "version": MODEL_VERSION,
-            "evaluated_at": payload.get("evaluated_at"),
-        }))
+        """), _evaluation_params(ticker, payload))
         conn.commit()
 
 
@@ -325,7 +349,16 @@ def _load_persisted_evaluation(ticker: str) -> dict | None:
         text("SELECT * FROM model_metadata WHERE ticker = :t"),
         engine, params={"t": ticker},
     )
-    if row.empty or pd.isna(row.iloc[0].get("eval_rank_ic")):
+    # NEVER EVALUATED means NO evaluation metric at all, not "no rank IC".
+    # Since 2026-09-13 a rank IC is legitimately absent for a ticker whose model
+    # split in fewer than MIN_FOLDS_FOR_ESTIMATE folds, and that ticker HAS been
+    # evaluated: it has a hit rate and a conformal calibration. Keying on the IC
+    # alone discarded both, and the published price interval went with them —
+    # 24 live tickers were already in that state after the 2026-09-12 run. The
+    # rows this guard exists for are `_record_daily_fit` placeholders, which
+    # carry none of these three columns.
+    if row.empty or all(pd.isna(row.iloc[0].get(c))
+                        for c in ("eval_rank_ic", "eval_hit_rate", "evaluated_at")):
         return None
 
     r = row.iloc[0]
@@ -373,10 +406,12 @@ def _load_persisted_evaluation(ticker: str) -> dict | None:
     # exist. Converting at the read boundary keeps numpy inside the modelling
     # code, where it belongs, rather than leaking into transport.
     return {
-        "rank_ic": to_native(r.get("eval_rank_ic")),
-        "rank_ic_t": to_native(r.get("eval_rank_ic_t")),
-        "hit_rate": to_native(r.get("eval_hit_rate")),
-        "majority_hit_rate": to_native(r.get("eval_baseline_hit_rate")),
+        # A NaN here would reach the gate as a check that RAN and failed
+        # (`nan >= floor` is False); None is a check that did not run.
+        "rank_ic": _finite_or_none(to_native(r.get("eval_rank_ic"))),
+        "rank_ic_t": _finite_or_none(to_native(r.get("eval_rank_ic_t"))),
+        "hit_rate": _finite_or_none(to_native(r.get("eval_hit_rate"))),
+        "majority_hit_rate": _finite_or_none(to_native(r.get("eval_baseline_hit_rate"))),
         "mae": to_native(r.get("eval_mae")),
         "mae_naive_zero": to_native(r.get("eval_mae_naive")),
         "beats_naive": (bool(r["eval_mae"] < r["eval_mae_naive"])

@@ -288,6 +288,15 @@ def effective_sample_size(n: int, horizon: int) -> float:
     return max(float(n) / max(horizon, 1), 1.0)
 
 
+# A MEAN OVER FOLDS NEEDS FOLDS. The within-fold rank IC averages one number per
+# walk-forward fold that carries an ordering, and the per-ticker fits emit a
+# constant prediction in most folds (316 of 420 cells, measured in Stage 0). One
+# or two survivors, selected on the model having CHOSEN to split, are not a
+# track record. Stage 0b set this threshold for the evidence track; this is the
+# one copy, and `pipeline.evidence_shrinkage` imports it from here.
+MIN_FOLDS_FOR_ESTIMATE = 3
+
+
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
                     horizon: int = 30,
                     folds: np.ndarray | None = None) -> dict:
@@ -309,6 +318,15 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     `pipeline.evidence_shrinkage.within_fold_rank_ic` does per ticker. The
     argument defaults to None only so that callers scoring a single block —
     the baseline comparators, which have no folds — keep working unchanged.
+
+    THE FOLD GUARD (2026-09-13). The within-fold average is taken only when at
+    least ``MIN_FOLDS_FOR_ESTIMATE`` folds carry an ordering, and its t is
+    built from the rows of THOSE folds. Without it the live gate, on the
+    2026-09-12 weekly evaluation, would have graded 19 tickers WEAK — 11 of
+    them on a single fold, with a t computed as though all five folds had been
+    measured. Below the threshold ``rank_ic`` is NaN, which the write boundary
+    turns into NULL and the gate reads as a check that did not RUN: "not
+    measured", never "measured and failed".
     """
     valid = np.isfinite(y_true) & np.isfinite(y_pred)
     yt, yp = y_true[valid], y_pred[valid]
@@ -319,17 +337,29 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
     if folds is None:
         ic = rank_ic(yt, yp)
         n_folds_scored = 0
+        n_ic_rows = len(yt)
     else:
         fold_ids = np.asarray(folds)[valid]
-        per_fold = [rank_ic(yt[fold_ids == k], yp[fold_ids == k])
-                    for k in np.unique(fold_ids)]
-        defined = [v for v in per_fold if np.isfinite(v)]
-        ic = float(np.mean(defined)) if defined else float("nan")
-        n_folds_scored = len(defined)
+        per_fold = {k: rank_ic(yt[fold_ids == k], yp[fold_ids == k])
+                    for k in np.unique(fold_ids)}
+        scored = [k for k, v in per_fold.items() if np.isfinite(v)]
+        n_folds_scored = len(scored)
+        if n_folds_scored >= MIN_FOLDS_FOR_ESTIMATE:
+            ic = float(np.mean([per_fold[k] for k in scored]))
+            n_ic_rows = int(np.isin(fold_ids, scored).sum())
+        else:
+            ic = float("nan")
+            n_ic_rows = 0
     # Under the null of no skill IC is approximately N(0, 1/sqrt(n_eff - 1)),
-    # where n_eff discounts the overlap between successive labels.
+    # where n_eff discounts the overlap between successive labels. It is the
+    # n_eff of the rows the IC was MEASURED ON: an IC averaged over three scored
+    # folds carries three folds of evidence, not five, and a t built from all
+    # five folds' rows is too large by sqrt(5/3) — by sqrt(5) for a one-fold IC.
     n_eff = effective_sample_size(len(yt), horizon)
-    ic_t = float(ic * np.sqrt(max(n_eff - 1, 1))) if np.isfinite(ic) else float("nan")
+    n_eff_ic = (effective_sample_size(n_ic_rows, horizon)
+                if n_ic_rows else float("nan"))
+    ic_t = (float(ic * np.sqrt(max(n_eff_ic - 1, 1)))
+            if np.isfinite(ic) else float("nan"))
 
     # mae_naive_zero is the MAE of predicting ZERO. It is knowable without
     # running any comparator at all, which is the only reason it can live in a
@@ -351,6 +381,9 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray,
         "rank_ic": ic,
         "rank_ic_t": ic_t,
         "n_folds_scored": n_folds_scored,
+        # The n_eff behind rank_ic_t: the scored folds' rows, not every row.
+        "n_effective_ic": (round(n_eff_ic, 1) if np.isfinite(n_eff_ic)
+                           else float("nan")),
         "hit_rate": hit_rate(yt, yp),
         "majority_hit_rate": majority_hit_rate(yt),
         "mae": mae_model,
