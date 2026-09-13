@@ -139,3 +139,17 @@ stage0c_block_sensitivity.log
 stage0c_live_gate.md
 stage0c_null.log
 stage0c_gate.log
+
+# Stage 1, Pilot 1 — the reversal run's own artifacts. The held-out predictions
+# (stage1_reversal_oos.npz) are covered by *.npz above; the findings live in
+# docs/stage1-findings.md, not in these.
+stage1_report.md
+stage1_smoke.md
+stage1_run.log
+stage1_smoke.log
+
+# graphify — the local knowledge-graph tool's output: graph.json, graph.html,
+# GRAPH_REPORT.md and a content-addressed AST cache (12.5 MB, 175 files on
+# 2026-09-11). Regenerated from the source tree by /graphify, and it records
+# absolute local paths, so it is machine-local rather than project truth.
+graphify-out/

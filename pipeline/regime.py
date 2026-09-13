@@ -77,6 +77,32 @@ REGIME_INTERACTIONS: list[str] = [
 ]
 
 
+def close_matrix(panel: pd.DataFrame) -> pd.DataFrame:
+    """Closes on the shared date grid: one row per date, one column per ticker.
+
+    A ticker missing a session holds NaN there rather than being stepped over,
+    so any window spanning the hole is void instead of one session longer.
+    """
+    return (panel.pivot_table(index="date", columns="ticker", values="close",
+                              aggfunc="last").sort_index())
+
+
+def market_log_returns(panel: pd.DataFrame, wide: pd.DataFrame | None = None
+                       ) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Per-ticker daily log returns, and the equal-weighted universe return.
+
+    THE ONE DEFINITION OF "THE MARKET" behind this project's features.
+    `rolling_beta`, `compute_market_state` and the Stage 1 reversal residual
+    (`pipeline.reversal`) all read it here. Before 2026-09-13 the first two each
+    computed it inline, and a third inline copy would have been one more place
+    for three supposedly identical market series to drift apart.
+    """
+    wide = close_matrix(panel) if wide is None else wide
+    rets = np.log(wide / wide.shift(1))
+    return rets, rets.mean(axis=1)                  # equal-weighted, this universe
+
+
 def compute_market_state(panel: pd.DataFrame, engine=None) -> pd.DataFrame:
     """
     One row per date: the market's state as of that session's close.
@@ -94,11 +120,8 @@ def compute_market_state(panel: pd.DataFrame, engine=None) -> pd.DataFrame:
         "SELECT date, nifty_5d_return, nifty_20d_return, india_vix "
         "FROM macro ORDER BY date ASC"), engine)
 
-    wide = (panel.pivot_table(index="date", columns="ticker", values="close",
-                              aggfunc="last").sort_index())
-    rets = np.log(wide / wide.shift(1))
-
-    market = rets.mean(axis=1)                      # equal-weighted, this universe
+    wide = close_matrix(panel)
+    rets, market = market_log_returns(panel, wide)
     level = market.cumsum()
 
     state = pd.DataFrame(index=wide.index)
@@ -135,10 +158,7 @@ def rolling_beta(panel: pd.DataFrame, window: int = DRAWDOWN_LOOKBACK) -> pd.Dat
     fit. A fold-wide beta used as a feature would be F2 in miniature — a
     quantity estimated partly from the test window.
     """
-    wide = (panel.pivot_table(index="date", columns="ticker", values="close",
-                              aggfunc="last").sort_index())
-    rets = np.log(wide / wide.shift(1))
-    market = rets.mean(axis=1)
+    rets, market = market_log_returns(panel)
 
     cov = rets.rolling(window, min_periods=VOL_LONG).cov(market)
     var = market.rolling(window, min_periods=VOL_LONG).var()

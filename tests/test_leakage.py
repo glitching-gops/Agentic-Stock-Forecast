@@ -357,3 +357,39 @@ def test_a_zero_skill_model_reports_near_zero_ic():
     m = compute_metrics(y_true, y_pred, horizon=30)
     assert abs(m["rank_ic"]) < 0.06
     assert abs(m["rank_ic_t"]) < 2.0
+
+
+# ── Stage 1: the reversal features are point-in-time ──────────────────────────
+
+def test_reversal_features_at_a_date_are_blind_to_that_date_and_after():
+    """
+    A reversal feature at t may read closes up to t-1 and nothing else — its
+    window skips session t, and its beta is the one known at t-1. So corrupting
+    every close from a date D onward must leave every feature at dates <= D
+    exactly as it was. This is stronger than the purge, which only separates
+    folds: a feature that read session t would carry t's own return into the
+    row whose 30-session label starts there.
+    """
+    from pipeline.reversal import REVERSAL_COLS, reversal_features
+
+    rng = np.random.default_rng(11)
+    dates = pd.bdate_range("2023-01-02", periods=150).strftime("%Y-%m-%d")
+    market = rng.normal(0.0, 0.01, len(dates))
+    panel = pd.concat([
+        pd.DataFrame({"date": dates, "ticker": f"L{i:02d}",
+                      "close": 100 * np.exp(np.cumsum(
+                          (0.6 + i / 20) * market + rng.normal(0, 0.02, len(dates))))})
+        for i in range(15)], ignore_index=True)
+    cut = dates[110]
+
+    before = reversal_features(panel)
+    shocked = panel.copy()
+    later = shocked["date"] >= cut
+    shocked.loc[later, "close"] *= rng.uniform(0.3, 3.0, int(later.sum()))
+    after = reversal_features(shocked)
+
+    key = ["date", "ticker"]
+    a = before[before["date"] <= cut].set_index(key)[REVERSAL_COLS]
+    b = after[after["date"] <= cut].set_index(key)[REVERSAL_COLS]
+    assert a.notna().any().all(), "not vacuous: every column is defined somewhere"
+    pd.testing.assert_frame_equal(a, b)

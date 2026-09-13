@@ -122,6 +122,30 @@ python tools/stage2b_panel_diagnostic.py
 Method and decision rule are fixed in `docs/stage2b-preregistration.md`,
 written before any pooled training run.
 
+## stage1_reversal.py
+
+Stage 1, Pilot 1 — multi-lookback residual reversal. Sandboxed and wired into
+neither job.
+
+It adds `pipeline/reversal.py`'s four residualised (`rev_resid_{1,5,10,20}`)
+and four raw (`rev_raw_{1,5,10,20}`) skip-one lookback returns to the pooled ×
+MAE, no-ticker model, and grades all three arms through the Stage 0c harness
+(`grade_panel_v3`, B = 1000). The baseline arm is REUSED from
+`stage2b_pooled_oos.npz`, and is also re-run: it must reproduce the stored
+predictions exactly before the other two arms are read. On top of that:
+- a nine-draw within-date placebo on the residual arm;
+- paired per-date cross-sectional IC tests with Driscoll-Kraay SEs at 30 lags;
+- a feature-level IC table against Da, Liu & Schaumburg (2014).
+
+```bash
+python tools/stage1_reversal.py --smoke --markdown stage1_smoke.md   # minutes
+python tools/stage1_reversal.py --markdown stage1_report.md          # ~1 h
+```
+
+Both need `panel_cache.parquet` and `stage2b_pooled_oos.npz`, whose sha256
+the run checks against `docs/stage1-preregistration.md`. Point `--panel-cache`
+and `--stage2b-npz` at them if they live outside this checkout.
+
 ## Phase 0 changes
 
 - `select_top_50.py` — **deleted.** It ranked stocks by composite score and kept
