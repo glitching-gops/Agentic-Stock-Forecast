@@ -140,7 +140,8 @@ WORSE, not better. That is the identity channel showing up as harm, not help.
   06-26 every close equals the previous session's, and NSE has no delivery file
   for those dates. So a row-stepped 30-session label that spans one measures 29
   real sessions. It is now a CLAUDE.md landmine. The fix belongs in ingestion
-  and needs a `MODEL_VERSION` decision.
+  and needs a `MODEL_VERSION` decision. **Its effect on THIS verdict was
+  measured on 2026-09-19 and is nil; see the addendum at the end.**
 - **MTO's traded-quantity denominator shifted after mid-2024.** It was 0.889 of
   `sec_bhavdata_full`'s on 2026-09-11 and 1.000 on 2024-07-08. The
   abnormal transform absorbs a slow level shift; the raw level may not be
@@ -162,3 +163,46 @@ baseline's S1, the column-permutation placebo, and R3 deciding.
 The more useful question may now be the horizon itself. P6, the 5/10/20/30-
 session sweep, is already pre-registered and unrun, and delivery % is a far
 more natural short-horizon quantity than a 30-session one.
+
+## Addendum, 2026-09-19: the phantom sessions do not touch the verdict
+
+All four phantom sessions (2026-01-15, 05-01, 05-28, 06-26) fall inside fold
+4's scored test window, so the verdict above was provisional until this was
+checked. The check is `tools/stage1b_phantom_check.py`. Its rule was written
+and hashed before it ran (sha256 `6ba71d22…9a84f`): the verdict changes iff
+R3's t reaches +2.0 once the phantom sessions are removed.
+
+**No phantom session reaches any fitted model.** Every fold's training
+labels end by 2025-01-03, eleven months before the first phantom:
+
+| fold | train last | train labels reach | test window |
+|---|---|---|---|
+| 0 | 2018-08-02 | 2018-09-18 | 2018-11-05 → 2020-06-09 |
+| 1 | 2020-03-06 | 2020-04-24 | 2020-06-10 → 2021-12-27 |
+| 2 | 2021-09-29 | 2021-11-12 | 2021-12-28 → 2023-07-20 |
+| 3 | 2023-04-25 | 2023-06-07 | 2023-07-21 → 2025-02-13 |
+| 4 | 2024-11-21 | 2025-01-03 | 2025-02-14 → 2026-09-07 |
+
+So the defect can reach only the SCORING of fold 4: 8,563 scored rows on 102
+dates have a label window that spans a phantom session, or sit on one. On
+those rows the correctly counted label moves by a median of 0.0102.
+
+| variant | scored dates | (b) abnormal − (a) | DK SE | **t** | (c) level − (a) | t |
+|---|---|---|---|---|---|---|
+| V0, as run | 1,910 | −0.00066 | 0.00355 | **−0.19** | +0.00049 | +0.08 |
+| V1, labels recounted over 30 real sessions, phantom rows dropped | 1,906 | −0.00066 | 0.00356 | **−0.19** | +0.00051 | +0.08 |
+| V2, truncated before 2025-12-03 (no label or lookback can touch one) | 1,748 | −0.00071 | 0.00388 | **−0.18** | −0.00018 | −0.03 |
+
+**The verdict stands, and is now final: R3 fails under every variant.**
+
+- **The label recount is checked against the stored labels first.** It
+  reproduces them on all 151,872 untouched rows, to within 5.0e-06, which is
+  the precision of a close stored to three decimals.
+- **The spec's 1e-9 tolerance was mis-set.** It fired the check's own stop
+  condition before any R3 figure was computed. It was widened to 1e-5, which
+  is recorded here as a deviation from the written spec.
+- **V2 is exact, not an approximation.** Because no model trained on a
+  phantom session, the stored predictions for rows before 2025-12-03 are
+  exactly what a corrected panel would produce.
+- **R2 was not re-scored.** The placebo predictions were never saved, and R3
+  decides.
