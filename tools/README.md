@@ -146,6 +146,55 @@ Both need `panel_cache.parquet` and `stage2b_pooled_oos.npz`, whose sha256
 the run checks against `docs/stage1-preregistration.md`. Point `--panel-cache`
 and `--stage2b-npz` at them if they live outside this checkout.
 
+## backfill_delivery.py, stage1b_delivery.py & stage1b_phantom_check.py
+
+Stage 1, Pilot 2 — NSE delivery %. `backfill_delivery.py` fetches NSE's
+daily `MTO_<ddmmyyyy>.DAT` for every panel session into `delivery_cache.npz`.
+It throttles to 3 requests a second, resumes where it left off, and aborts on
+a failure RATE, not a count. `--report` prints coverage; `--validate`
+re-checks MTO against `sec_bhavdata_full` and the UDiFF bhavcopy.
+
+`stage1b_delivery.py` runs the pre-registered arms: S1, R3 deciding, and the
+column-permuting placebo. `stage1b_phantom_check.py` re-scores R3 on the
+stored predictions with the four phantom 2026 sessions removed; it trains
+nothing.
+
+```bash
+python tools/backfill_delivery.py            # ~2,440 requests, ~15 min
+python tools/stage1b_delivery.py --markdown stage1b_report.md
+python tools/stage1b_phantom_check.py --markdown phantom_check.md   # seconds
+```
+
+## backfill_results.py & stage1c_sue.py
+
+Stage 1, Pilot 3 — seasonal-random-walk SUE from NSE's own results filings.
+`backfill_results.py` reads four things:
+- the legacy results list (to the December-2024 quarter);
+- the Integrated Filing list (from March 2025);
+- NSE's corporate actions (bonuses, splits, demergers);
+- every first-disclosed quarterly filing from 2013, parsed for basic EPS.
+
+It writes all of it to `results_cache.npz`, at no more than 3 requests a
+second, resumably. `--reparse` re-reads documents an older parser left
+without an EPS. Read `--report` first. It shows:
+- coverage by year;
+- how many old HTML pages reconciled with net profit ÷ shares, and at which
+  row shift;
+- XBRL EPS against its own implied EPS;
+- disclosure timing against the 15:00 cutoff;
+- NSE's splits against `corporate_actions`.
+
+`stage1c_sue.py --design-only` prints the outcome-blind design inputs. The
+full run adds R4 (net of the 0.2225% round trip) and the raw PEAD sort book
+to Pilot 2's harness.
+
+```bash
+python tools/backfill_results.py                       # ~7,700 documents, ~45 min
+python tools/backfill_results.py --report --markdown results_coverage.md
+python tools/stage1c_sue.py --design-only
+python tools/stage1c_sue.py --markdown stage1c_report.md                # ~1.5 h
+```
+
 ## Phase 0 changes
 
 - `select_top_50.py` — **deleted.** It ranked stocks by composite score and kept

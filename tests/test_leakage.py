@@ -393,3 +393,66 @@ def test_reversal_features_at_a_date_are_blind_to_that_date_and_after():
     b = after[after["date"] <= cut].set_index(key)[REVERSAL_COLS]
     assert a.notna().any().all(), "not vacuous: every column is defined somewhere"
     pd.testing.assert_frame_equal(a, b)
+
+
+def test_sue_features_at_a_date_are_blind_to_every_filing_not_yet_public():
+    """
+    A SUE feature at session t may use only results public by t's close: a
+    filing disseminated before 15:00 IST on t, or on any earlier day. So
+    corrupting every EPS disclosed at or after a cut instant (the cut day at
+    15:00) must leave every feature at sessions up to the cut day exactly as
+    it was. It must also move the very next session, so nothing is lagged more
+    than the rule says.
+
+    The fixture places the cases a random panel would rarely hit:
+    * filings at 16:00 and at exactly 15:00:00 on the cut day (public once
+      the closing window has opened);
+    * a filing at 14:00 on it (public before the close, and not corrupted);
+    * an OLD quarter disclosed after the cut, which must not enter any
+      earlier quarter's year-ago or sigma term.
+    """
+    from pipeline.earnings import (EVENT_COLS, SUE_FFILL, announcements,
+                                   event_features)
+
+    rng = np.random.default_rng(12)
+    grid = list(pd.bdate_range("2019-01-01", "2023-12-29").strftime("%Y-%m-%d"))
+    ends = pd.date_range("2016-03-31", "2023-09-30", freq="QE")
+    rows = []
+    for i in range(12):
+        eps = 10 + rng.normal(0, 1, len(ends)).cumsum()
+        hours = rng.choice([11, 14, 16, 19], len(ends))
+        for e, x, h in zip(ends, eps, hours):
+            rows.append((f"S{i:02d}", e, "standalone", x,
+                         e + pd.Timedelta(days=int(rng.integers(20, 55)), hours=int(h))))
+    table = pd.DataFrame(rows, columns=["symbol", "period_end", "basis", "eps", "disclosed"])
+    actions = pd.DataFrame(columns=["symbol", "ex_date", "kind", "factor", "subject"])
+    tickers = [f"S{i:02d}.NS" for i in range(12)]
+    cols = EVENT_COLS + [SUE_FFILL]
+
+    cut_day = grid[800]
+    cut = pd.Timestamp(cut_day + " 15:00")          # the closing window opens
+    qe = max(e for e in ends if e + pd.Timedelta(days=20) <= pd.Timestamp(cut_day))
+    at = lambda sym, e: (table["symbol"] == sym) & (table["period_end"] == e)   # noqa: E731
+    for sym in ("S00", "S01", "S02", "S03"):
+        table.loc[at(sym, qe), "disclosed"] = pd.Timestamp(cut_day + " 16:00")
+    table.loc[at("S04", qe), "disclosed"] = pd.Timestamp(cut_day + " 14:00")
+    table.loc[at("S06", qe), "disclosed"] = cut                 # exactly 15:00:00
+    table.loc[at("S05", qe - pd.offsets.QuarterEnd(5)), "disclosed"] = cut + pd.Timedelta(days=1)
+    nxt = table["period_end"] > qe
+    table.loc[nxt, "disclosed"] = table.loc[nxt, "disclosed"].clip(lower=cut + pd.Timedelta(days=2))
+
+    before = event_features(announcements(table, actions), grid, tickers)
+    shocked = table.copy()
+    later = shocked["disclosed"] >= cut
+    shocked.loc[later, "eps"] = rng.normal(0, 50, int(later.sum()))
+    after = event_features(announcements(shocked, actions), grid, tickers)
+
+    key = ["date", "ticker"]
+    a = before[before["date"] <= cut_day].set_index(key)[cols]
+    b = after[after["date"] <= cut_day].set_index(key)[cols]
+    assert (a["sue_missing"] == 0).any(), "not vacuous: SUEs are defined before the cut"
+    assert a.loc[(cut_day, "S04.NS"), "sue_age"] == 0, "the 14:00 filing is usable that day"
+    pd.testing.assert_frame_equal(a, b)
+    moved = before[before["date"] > cut_day].set_index(key)[cols]         .compare(after[after["date"] > cut_day].set_index(key)[cols])
+    assert moved.index.get_level_values("date").min() == grid[801], (
+        "a 16:00 filing on the cut day is usable at the very next session")
