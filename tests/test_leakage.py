@@ -456,3 +456,178 @@ def test_sue_features_at_a_date_are_blind_to_every_filing_not_yet_public():
     moved = before[before["date"] > cut_day].set_index(key)[cols]         .compare(after[after["date"] > cut_day].set_index(key)[cols])
     assert moved.index.get_level_values("date").min() == grid[801], (
         "a 16:00 filing on the cut day is usable at the very next session")
+
+
+# ── P6: the horizon-parameterised purge and embargo ───────────────────────────
+#
+# This is a change to the leakage-critical core, so it gets its own tests
+# rather than leaning on the 30-session ones above. Three things can go wrong
+# and only the third is visible from outside:
+#
+#   1. the derivation returns the wrong width;
+#   2. `run_arm` computes the right width and then splits on the old constant;
+#   3. the OUTER split widens and the nested search does not, so every
+#      hyperparameter is chosen across a boundary the outer fold refuses to
+#      trust — F3 one level down, and it reads as a merely optimistic number.
+
+P6_HORIZONS = (5, 10, 20, 30)
+
+
+def test_the_purge_is_never_narrower_than_the_label_it_must_span():
+    from pipeline.evaluation import (
+        POLITIS_WHITE_FLOOR_SESSIONS,
+        horizon_purge_embargo,
+    )
+
+    for h in P6_HORIZONS + (63, 90, 200):
+        assert horizon_purge_embargo(h) >= h, (
+            f"a purge of {horizon_purge_embargo(h)} cannot span an {h}-session "
+            f"label; training labels would reach into the test window")
+
+    # And never narrower than the panel's own measured serial dependence,
+    # which is the half of the rule that does not follow from arithmetic.
+    for h in P6_HORIZONS:
+        assert horizon_purge_embargo(h) >= POLITIS_WHITE_FLOOR_SESSIONS
+
+    # Above the floor the label width takes over, so the rule is a max and not
+    # a constant. A mutant returning the floor unconditionally fails here...
+    assert horizon_purge_embargo(200) == 200
+    # ...and one returning the horizon unconditionally fails here.
+    assert horizon_purge_embargo(5) == POLITIS_WHITE_FLOOR_SESSIONS
+
+    # The legacy rule every pre-P6 result was measured under stays reachable,
+    # and is what the h=30 regression pin runs.
+    for h in P6_HORIZONS:
+        assert horizon_purge_embargo(h, floor=h) == h
+
+
+def test_the_purge_derivation_refuses_a_nonsensical_width():
+    from pipeline.evaluation import horizon_purge_embargo
+
+    for bad in (0, -1, -30):
+        with pytest.raises(ValueError):
+            horizon_purge_embargo(bad)
+        with pytest.raises(ValueError):
+            horizon_purge_embargo(30, floor=bad)
+
+
+def test_run_arm_refuses_a_purge_narrower_than_its_own_label():
+    """The guard that makes the leak unconstructable rather than merely
+    unlikely: a caller cannot ask for a 30-session label purged at 5."""
+    from tools.stage2b_pooled import run_arm
+
+    panel = _synthetic_panel(n_dates=400, n_tickers=6)
+    with pytest.raises(ValueError, match="narrower than"):
+        run_arm(panel, "mae", "none", features=["a", "b"],
+                horizon=30, purge=5, fixed_params={"n_estimators": 2})
+
+
+def _record_run_arm(panel, horizon, purge, monkeypatch, min_train=200):
+    """
+    Runs `run_arm` with the nested search replaced by a recorder, and returns
+    what the training slice and the test block actually were, per fold.
+
+    The search is STUBBED rather than skipped via `fixed_params`, because
+    `fixed_params` is the one path that never calls `tune_pooled` — and the
+    horizon the SEARCH is purged at is exactly what needs observing.
+    """
+    import tools.stage2b_pooled as sp
+
+    seen = []
+
+    def fake_tune(frame, features, target="target_return", horizon=30,
+                  n_trials=10, tuning_objective="mae", enable_categorical=False):
+        seen.append({"train_dates": np.unique(frame["date"].to_numpy()),
+                     "search_horizon": horizon})
+        return {"n_estimators": 2, "max_depth": 2, "tree_method": "hist"}
+
+    monkeypatch.setattr(sp, "tune_pooled", fake_tune)
+    preds, _ = sp.run_arm(panel, "mae", "none", n_trials=1, min_train=min_train,
+                          features=["a", "b"], horizon=horizon, purge=purge,
+                          verbose=False)
+    return preds, seen
+
+
+@pytest.mark.parametrize("horizon", P6_HORIZONS)
+def test_run_arm_purges_and_embargoes_at_the_width_it_was_given(horizon, monkeypatch):
+    """
+    Measured through `run_arm` itself, on the real training slices it hands the
+    search and the real test blocks it scores.
+
+    Asserting on a splitter the test constructs for itself would pass happily
+    against a `run_arm` that had gone back to the hardcoded 30 — the mutant
+    that matters most here, because under the DECIDING rule at h=5 that mutant
+    uses a 60-date gap where 126 was asked for, and nothing in the output says
+    so.
+    """
+    from pipeline.evaluation import horizon_purge_embargo
+
+    panel = _synthetic_panel(n_dates=900, n_tickers=8)
+    grid = np.unique(panel["date"].to_numpy())
+
+    for purge in (horizon, horizon_purge_embargo(horizon)):
+        preds, seen = _record_run_arm(panel, horizon, purge, monkeypatch)
+        assert seen, "no fold ran; the test would be vacuous"
+        assert len(seen) == preds["fold"].nunique()
+
+        for rec, (fold, block) in zip(seen, preds.groupby("fold", sort=True)):
+            last_train = int(np.searchsorted(grid, rec["train_dates"].max()))
+            first_test = int(np.searchsorted(grid, block["date"].min()))
+            gap = first_test - last_train - 1
+
+            assert gap >= 2 * purge, (
+                f"h={horizon}, purge={purge}, fold {fold}: gap of {gap} grid "
+                f"dates is below the {2 * purge} the purge and embargo require")
+            assert gap >= horizon, (
+                f"h={horizon}, fold {fold}: a training label spanning {horizon} "
+                f"sessions reaches into the test window across a {gap}-date gap")
+            # The nested search is purged at the SAME width as the outer split.
+            assert rec["search_horizon"] == purge, (
+                f"the outer fold split at {purge} while the inner search was "
+                f"purged at {rec['search_horizon']}; every hyperparameter would "
+                f"be chosen across a boundary the outer fold refuses to trust")
+            # And the search was handed training rows only.
+            assert rec["train_dates"].max() < block["date"].min()
+
+
+def test_the_legacy_rule_reproduces_the_pre_p6_split_exactly():
+    """
+    The regression pin, at the altitude a unit test can reach: parameterising
+    the splitter must change nothing when the parameters are set to what they
+    used to be hardcoded at. The full pin is the run itself, against
+    `stage2b_pooled_oos.npz` at drift <= 1e-9.
+    """
+    from pipeline.evaluation import PurgedPanelWalkForward
+
+    panel = _synthetic_panel(n_dates=1200, n_tickers=8)
+    dates = panel["date"].to_numpy()
+
+    was = PurgedPanelWalkForward(n_folds=5, horizon=HORIZON, embargo=HORIZON,
+                                 min_train=500)
+    now = PurgedPanelWalkForward(n_folds=5, horizon=30, embargo=30, min_train=500)
+
+    old = list(was.split(dates))
+    new = list(now.split(dates))
+    assert old and len(old) == len(new)
+    for (a_tr, a_te), (b_tr, b_te) in zip(old, new):
+        assert np.array_equal(a_tr, b_tr)
+        assert np.array_equal(a_te, b_te)
+
+
+def test_a_shorter_horizon_does_not_shrink_the_embargo_below_the_measured_floor():
+    """
+    The empirical half of the rule, and the one a reader is most likely to
+    "simplify" away. Stage 0c measured this panel's dependence at 35.8-62.5
+    sessions against a 30-session label, so it is a property of the panel and
+    not of the label: a 5-session label does not make it five times shorter.
+    """
+    from pipeline.evaluation import (
+        POLITIS_WHITE_FLOOR_SESSIONS,
+        horizon_purge_embargo,
+    )
+
+    widths = [horizon_purge_embargo(h) for h in (5, 10, 20, 30)]
+    assert len(set(widths)) == 1, (
+        f"the purge tracked the horizon ({widths}); below the measured floor "
+        f"it must not")
+    assert widths[0] == POLITIS_WHITE_FLOOR_SESSIONS

@@ -179,6 +179,65 @@ class PurgedPanelWalkForward:
         }
 
 
+# ── The horizon-parameterised purge and embargo (P6) ──────────────────────────
+#
+# ONE copy, imported by everything that needs it. The fold guard landmine is
+# exactly this shape: Stage 0b established MIN_FOLDS_FOR_ESTIMATE on one path,
+# Stage 0c moved the statistic to another path and did not carry the constant
+# over, and the live gate would have published 19 WEAK badges. A derivation
+# that decides what a model may see is worth one definition and no copies.
+
+POLITIS_WHITE_FLOOR_SESSIONS = 63
+"""The widest automatic block length Stage 0c measured on a REAL variant.
+
+`docs/stage0-closing.md` reports Politis-White (2004, with the
+Patton-Politis-White 2009 correction) at 62.5 sessions for per-ticker x mae,
+54.3 / 50.9 / 42.4 for the pooled variants and **35.8** for pooled x mae with
+no ticker - which is the architecture P6 sweeps - against 1.9 on the placebo.
+63 is the ceiling of the widest, and it is deliberately not the 35.8 that
+matches the swept architecture: the floor is meant to bound the panel's
+dependence, and taking the narrowest measurement of it would be choosing the
+number that costs the least training data.
+
+THE UNITS ARE SESSIONS OF CALENDAR DEPENDENCE, NOT LABEL WIDTH, which is why
+it does not shrink with the horizon. The label overlap is h; this is how far
+apart two dates must be before their CROSS-SECTIONAL ICs stop moving together,
+and that is a property of the panel. A 5-session label does not make the
+market's own serial dependence five times shorter.
+"""
+
+
+def horizon_purge_embargo(horizon: int,
+                          floor: int = POLITIS_WHITE_FLOOR_SESSIONS) -> int:
+    """
+    The purge (and the equal embargo) for a walk-forward at `horizon` sessions.
+
+    ``max(horizon, floor)``, so the gap between the last training date and the
+    first test date is ``2 * max(horizon, floor)``.
+
+    Both terms are load-bearing and for different reasons:
+
+    - **horizon** is arithmetic. A training row on grid date ``i`` carries a
+      label spanning ``[i, i + horizon]``, so anything closer than ``horizon``
+      to the test window overlaps it. Below this the split leaks, full stop.
+    - **floor** is empirical. Above the label width the panel still carries
+      dependence, measured at 35.8-62.5 sessions in Stage 0c, and an embargo
+      narrower than that lets serial correlation either side of the boundary
+      do the work a label overlap would have done.
+
+    Passing ``floor=horizon`` recovers the legacy rule - purge = embargo =
+    horizon - which is what every result in this project before P6 was measured
+    under, and is how the H=30 regression pin reproduces them.
+    """
+    horizon = int(horizon)
+    if horizon <= 0:
+        raise ValueError(f"horizon must be positive, got {horizon}")
+    floor = int(floor)
+    if floor <= 0:
+        raise ValueError(f"floor must be positive, got {floor}")
+    return max(horizon, floor)
+
+
 def assert_no_leakage(
     train_dates: Sequence[str],
     test_dates: Sequence[str],

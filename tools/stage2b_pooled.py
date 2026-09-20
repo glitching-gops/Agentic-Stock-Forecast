@@ -264,13 +264,33 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
             min_train: int = EVAL_MIN_TRAIN_DATES,
             verbose: bool = True,
             fixed_params: dict | None = None,
-            features: list[str] | None = None) -> tuple[pd.DataFrame, list[dict]]:
+            features: list[str] | None = None,
+            horizon: int = HORIZON_SESSIONS,
+            purge: int | None = None) -> tuple[pd.DataFrame, list[dict]]:
     """
     A pooled purged walk-forward with the search nested inside each training
     fold. The splitter and its constants are ``panel_walk_forward``'s, so the
     fold boundaries are the ones every other comparator in this project was
     scored on.
+
+    `horizon` is the LABEL width in sessions, and the caller is responsible for
+    having retargeted ``panel[TARGET]`` to it (``panel.retarget_horizon``). It
+    is passed in rather than inferred from the target so the two cannot
+    disagree silently - the same reason ``_log_price_basis`` derives the price
+    series from the target's name instead of taking it as an argument.
+
+    `purge` is the gap carved out of the end of training, applied as BOTH the
+    purge and the embargo, so the last training date sits ``2 * purge`` dates
+    before the first test date. ``None`` means `horizon`, which is the legacy
+    rule every pre-P6 result in this project was measured under. P6 passes
+    ``horizon_purge_embargo(horizon)``, which never goes below the panel's own
+    measured serial dependence.
     """
+    purge = horizon if purge is None else int(purge)
+    if purge < horizon:
+        raise ValueError(
+            f"purge {purge} is narrower than the {horizon}-session label it "
+            f"must span; training labels would reach into the test window")
     from xgboost import XGBRegressor
 
     frame = with_ticker(panel, ticker_mode)
@@ -278,8 +298,8 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
     categorical = ticker_mode != "none"
 
     splitter = PurgedPanelWalkForward(
-        n_folds=n_folds, horizon=HORIZON_SESSIONS,
-        embargo=HORIZON_SESSIONS, min_train=min_train)
+        n_folds=n_folds, horizon=purge,
+        embargo=purge, min_train=min_train)
     dates = frame["date"].to_numpy()
     y = pd.to_numeric(frame[TARGET], errors="coerce").to_numpy(dtype=float)
 
@@ -298,8 +318,14 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
         # incomparable with the rest of this project's tables, and Stage 2a
         # showed that check is worth having (its refit matched the Stage 0
         # cache at drift 0.0e+00, which is what made the sweep readable).
+        # The INNER search is purged at the same width as the outer split.
+        # Nesting is not automatic: if this argument stayed at the module's 30
+        # while the outer fold widened, every hyperparameter would be chosen
+        # across a boundary the outer fold refuses to trust - F3 one level
+        # down, and invisible from outside, because the reported number would
+        # merely be optimistic rather than wrong-shaped.
         params = fixed_params if fixed_params is not None else tune_pooled(
-            frame.iloc[tr], features, target=TARGET, horizon=HORIZON_SESSIONS,
+            frame.iloc[tr], features, target=TARGET, horizon=purge,
             n_trials=n_trials, tuning_objective=objective,
             enable_categorical=categorical)
 
@@ -335,7 +361,8 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
 # ── scoring one cell ──────────────────────────────────────────────────────────
 
 
-def cell_metrics(preds: pd.DataFrame, folds: list[dict] | None = None) -> dict:
+def cell_metrics(preds: pd.DataFrame, folds: list[dict] | None = None,
+                 rebalance_every: int = HORIZON_SESSIONS) -> dict:
     """
     Every quantity the pre-registration named, for one cell of the 2x2.
 
@@ -381,8 +408,13 @@ def cell_metrics(preds: pd.DataFrame, folds: list[dict] | None = None) -> dict:
     # carried opposite signs, so they are reported in separate columns and the
     # t belongs only to the second. Computed by `cross_sectional_report`, the
     # same function every comparator in this project has been scored by.
+    # `rebalance_every` IS the horizon being scored, so the sampled dates are
+    # non-overlapping at that horizon. Leaving it at 30 while sweeping h would
+    # take every 30th date of a 5-session label and throw away five sixths of
+    # the independent windows the shorter horizon bought; the t column would
+    # then be measuring the sampling rule rather than the panel.
     report = cross_sectional_report(preds[["date", "ticker", "y_pred", "y_true"]],
-                                    rebalance_every=HORIZON_SESSIONS)
+                                    rebalance_every=rebalance_every)
 
     return {
         "cells": len(cells),

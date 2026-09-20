@@ -148,6 +148,15 @@ stage1_smoke.md
 stage1_run.log
 stage1_smoke.log
 
+# P6 — the horizon sweep's own run artifacts. The held-out predictions
+# (p6_sweep_oos.npz, p6_five_oos.npz) are covered by *.npz above; the findings
+# live in docs/p6-findings.md, which quotes these tables inside the reasoning
+# that makes them readable. A loose copy beside it is a second version that can
+# disagree with the first — the same call every stage here has made.
+p6_*.json
+p6_*.md
+p6_*.log
+
 # graphify — the local knowledge-graph tool's output: graph.json, graph.html,
 # GRAPH_REPORT.md and a content-addressed AST cache (12.5 MB, 175 files on
 # 2026-09-11). Regenerated from the source tree by /graphify, and it records

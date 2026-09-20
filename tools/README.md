@@ -195,6 +195,73 @@ python tools/stage1c_sue.py --design-only
 python tools/stage1c_sue.py --markdown stage1c_report.md                # ~1.5 h
 ```
 
+## p6_horizon.py
+
+P6 — the horizon sweep, and SUE / delivery % re-tested at five sessions.
+Sandboxed and wired into neither job.
+
+**Part A** retrains and relabels the pooled × MAE, no-ticker arm at h in
+{5, 10, 20, 30}, under two purge rules:
+
+- `legacy` — purge = embargo = h, what every pre-P6 result used;
+- `deciding` — purge = embargo = `max(h, 63)`, the Politis-White floor Stage 0c
+  measured (35.8–62.5 sessions on the real variants, 1.9 on the placebo). The
+  panel's dependence is a property of the panel, not of the label, so it does
+  not shrink when a shorter horizon is tested.
+
+The two rules cannot both satisfy the regression pin, and the tool does not
+pretend otherwise: `docs/p6-preregistration.md` §2.2 says why. **A0** re-runs
+h=30 on the legacy rule and the STORED label, and must reproduce
+`stage2b_pooled_oos.npz::pooled_mae_noticker` at drift ≤ 1e-9 before any
+horizon is read. The sweep itself relabels through `panel.retarget_horizon` at
+every h including 30, so the four cells share one label construction.
+
+**Part B** adds SUE and delivery %, each alone, against a properly re-derived
+FIVE-session baseline — never the 30-session one, which would confound the
+horizon change with the feature's own effect. Same four rules as Pilot 3: R3
+deciding, the column-permuting placebo, R4 net of the 0.2225% round trip at
+h=5's own rebalance count, and R5 (SUE only) for the identity fingerprint.
+`pipeline/earnings.py` and `pipeline/delivery.py` are reused untouched.
+
+```bash
+python tools/p6_horizon.py --smoke --part all --markdown p6_smoke.md   # ~6 min
+python tools/p6_horizon.py --part a --markdown p6_a.md
+python tools/p6_horizon.py --part b --markdown p6_b.md
+```
+
+`--part a` and `--part b` share `p6_results.json`, so the second run renders
+both halves. The horizon-parameterised purge lives in
+`pipeline/evaluation.horizon_purge_embargo` — one copy, imported, because a
+derivation that decides what a model may see is worth no duplicates. Its
+contract is in `tests/test_leakage.py`; everything that renders a plausible
+table while being wrong is in `tests/test_p6_horizon.py`.
+
+## p6_scale_followup.py
+
+The skeptic pass on P6's Part C, which is post hoc and pre-registers nothing.
+If Part C produces a number that looks like signal, it is not a result until it
+has survived this — four attacks, all of them standing policy:
+
+1. the `min_train` sweep, which retired the valuation result and `pooled_xgb`;
+2. the per-fold profile, which retired LoRA;
+3. a within-date **target** permutation, retrained nine times — the corrected
+   placebo pointed at the target rather than at an added column, because what
+   is under test is whether the model can rank names at all;
+4. net of the 0.2225% round trip, against that horizon's OWN break-even IC at
+   the arm's OWN measured turnover.
+
+```bash
+python tools/p6_scale_followup.py --horizons 5 --markdown p6_followup.md
+```
+
+Run on h=5 it reported: 3 of 6 min_train settings above t 2.0, a headline that
+moves from +2.41 to +1.99 on `OMP_NUM_THREADS` alone, an IC that does beat all
+nine target-permuted retrains, and a net +0.047% per rebalance at t +0.47.
+Verdict NO. A placebo draw carrying no information by construction reached
+t −2.75, which is the most useful line in its output: the t threshold is not
+calibrated for this statistic on this panel, and the IC comparison against the
+placebo is what carries the weight.
+
 ## Phase 0 changes
 
 - `select_top_50.py` — **deleted.** It ranked stocks by composite score and kept
