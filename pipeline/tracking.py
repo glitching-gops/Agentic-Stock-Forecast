@@ -18,10 +18,17 @@ TWO HASHES, DELIBERATELY SEPARATE.
   history each had, and how many rows carried a label. It changes every day by
   design.
 
+A THIRD ONE SINCE P6: environment_hash covers what was true of the MACHINE —
+the pinned XGBoost thread count, whether it was overridden, and the versions of
+xgboost, optuna, numpy, pandas and scikit-learn. It exists because P6 measured
+a result crossing its own significance threshold on `OMP_NUM_THREADS` alone,
+with zero of 162,535 predictions matching. Before it, a thread-count change
+read as a code change.
+
 Keeping them apart is the point. A metric that moves while config_hash is
-constant is a data or market effect; one that moves while data_hash is constant
-is a code effect. Hashing them together would collapse the only distinction
-worth having.
+constant is a data, market or environment effect; one that moves while
+data_hash and environment_hash are constant is a code effect. Hashing them
+together would collapse the only distinction worth having.
 
 THE BENCHMARK MAPPING IS PART OF THE CONFIG HASH. It is half the label: change
 `Financial Services -> ^NSEBANK` to `-> ^NSEI` and every historical
@@ -121,6 +128,14 @@ def config_hash() -> tuple[str, dict]:
     return _sha(config), config
 
 
+def environment_hash() -> tuple[str, dict]:
+    """What was true of the machine, and its digest. See the module docstring."""
+    from pipeline.determinism import environment_fingerprint
+
+    fingerprint = environment_fingerprint()
+    return _sha(fingerprint), fingerprint
+
+
 def data_hash(universe: list[str] | None = None, engine=None) -> tuple[str, dict]:
     """
     What the database held, and its digest.
@@ -210,6 +225,15 @@ def start_run(job: str, universe: list[str] | None = None, engine=None) -> str:
     return run_id
 
 
+def _environment_or_error() -> dict:
+    """Never raises: tracking must not be able to fail a run."""
+    try:
+        digest, fingerprint = environment_hash()
+        return {"hash": digest, **fingerprint}
+    except Exception as exc:                                    # noqa: BLE001
+        return {"error": str(exc)}
+
+
 def finish_run(run_id: str, status: str, gate=None, metrics: dict | None = None,
                notes: str | None = None, engine=None) -> None:
     """Closes the row. Never raises — tracking must not be able to fail a run."""
@@ -233,8 +257,16 @@ def finish_run(run_id: str, status: str, gate=None, metrics: dict | None = None,
                     "status": status,
                     "gate_status": gate.status if gate else None,
                     "gate_report": gate.to_json() if gate else None,
-                    "metrics": json.dumps(json_safe(metrics or {}),
-                                          default=str, allow_nan=False),
+                    # The environment travels with every run's metrics.
+                    # `experiment_runs` has no column for it and adding one is
+                    # a data/db.py migration, which means a Render redeploy —
+                    # so it rides in the JSON that is already there. A run
+                    # whose numbers cannot be reproduced can at least be
+                    # attributed.
+                    "metrics": json.dumps(
+                        json_safe({**(metrics or {}),
+                                   "environment": _environment_or_error()}),
+                        default=str, allow_nan=False),
                     "notes": notes,
                 }),
             )

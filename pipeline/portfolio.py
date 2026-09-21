@@ -68,7 +68,29 @@ logger = logging.getLogger(__name__)
 SESSIONS_PER_YEAR = 252
 
 #: Rebalances a year at the model's own horizon. ~8.4 at 30 sessions.
+#: The 30-session default, kept because it IS the production horizon and
+#: several callers legitimately want it by name. Anything that annualises a
+#: book must use `rebalances_per_year(book.rebalance_every)` instead — see
+#: below for what the constant cost.
 REBALANCES_PER_YEAR = SESSIONS_PER_YEAR / HORIZON_SESSIONS
+
+
+def rebalances_per_year(rebalance_every: int = HORIZON_SESSIONS) -> float:
+    """
+    How many NON-OVERLAPPING rebalances a year holds at this width.
+
+    P6's pre-registration flagged the module constant as a defect before the
+    sweep ran and then worked around it rather than fixing it: every
+    annualisation here read 252/30 = 8.4 regardless of the book's actual
+    horizon, so an h=5 book — which rebalances 50.4 times a year — had its
+    cost drag understated SIX-FOLD and its Sharpe scaled by sqrt(8.4) instead
+    of sqrt(50.4). Nothing in this project ever shipped that number, because
+    P6 annualised by hand to avoid it; this is the fix so the next caller does
+    not have to know.
+    """
+    if rebalance_every <= 0:
+        raise ValueError(f"rebalance_every must be positive, got {rebalance_every}")
+    return SESSIONS_PER_YEAR / rebalance_every
 
 
 @dataclass(frozen=True)
@@ -119,14 +141,25 @@ class BookResult:
     turnover: list[float] = field(default_factory=list)
     dates: list[str] = field(default_factory=list)
     n_no_ordering: int = 0
+    #: Dates that HAD an ordering but whose quantile legs would have been
+    #: majority tie-break, so nothing was traded. Counted separately from
+    #: `n_no_ordering` because they are a different failure: the model ranked,
+    #: its predictions were just too coarse to name a fifth of the universe.
+    n_books_arbitrary: int = 0
+    #: The width this book actually rebalanced at, in sessions. Carried so
+    #: `metrics()` annualises by what happened rather than by the module
+    #: default — the defect P6 flagged.
+    rebalance_every: int = HORIZON_SESSIONS
 
     def metrics(self, benchmark: list[float] | None = None) -> dict:
         return _metrics(self, benchmark)
 
 
-def _annualise(mean_per_rebalance: float) -> float:
+def _annualise(mean_per_rebalance: float,
+               rebalance_every: int = HORIZON_SESSIONS) -> float:
     """Compounds a per-rebalance log return to a yearly figure."""
-    return float(np.expm1(mean_per_rebalance * REBALANCES_PER_YEAR))
+    return float(np.expm1(mean_per_rebalance
+                          * rebalances_per_year(rebalance_every)))
 
 
 def _drawdown(returns: list[float]) -> float:
@@ -148,7 +181,10 @@ def _metrics(book: BookResult, benchmark: list[float] | None = None) -> dict:
     reason `reb_t` exists beside `daily_IC`.
     """
     out: dict = {"name": book.name, "n_rebalances": book.n_rebalances,
-                 "n_no_ordering": book.n_no_ordering}
+                 "n_no_ordering": book.n_no_ordering,
+                 "n_books_arbitrary": book.n_books_arbitrary,
+                 "rebalance_every": book.rebalance_every,
+                 "rebalances_per_year": rebalances_per_year(book.rebalance_every)}
     if book.n_rebalances < 3:
         out["note"] = "too few rebalances to compute risk statistics"
         return out
@@ -156,13 +192,14 @@ def _metrics(book: BookResult, benchmark: list[float] | None = None) -> dict:
     for label, series in (("gross", book.gross_returns), ("net", book.net_returns)):
         r = np.asarray(series, dtype=float)
         sd = float(r.std(ddof=1))
-        ann_ret = _annualise(float(r.mean()))
-        ann_vol = sd * np.sqrt(REBALANCES_PER_YEAR)
-        sharpe = (float(r.mean()) / sd * np.sqrt(REBALANCES_PER_YEAR)
+        per_year = rebalances_per_year(book.rebalance_every)
+        ann_ret = _annualise(float(r.mean()), book.rebalance_every)
+        ann_vol = sd * np.sqrt(per_year)
+        sharpe = (float(r.mean()) / sd * np.sqrt(per_year)
                   if sd > 0 else float("nan"))
         downside = r[r < 0]
         dsd = float(downside.std(ddof=1)) if len(downside) > 2 else float("nan")
-        sortino = (float(r.mean()) / dsd * np.sqrt(REBALANCES_PER_YEAR)
+        sortino = (float(r.mean()) / dsd * np.sqrt(per_year)
                    if dsd and np.isfinite(dsd) and dsd > 0 else float("nan"))
         mdd = _drawdown(list(r))
         out[label] = {
@@ -231,7 +268,8 @@ def simulate(predictions: pd.DataFrame, costs: CostModel | None = None,
     """
     costs = costs or CostModel()
     name = ("long_only" if long_only else "long_short") + f"@{quantiles}"
-    book = BookResult(name=name, n_rebalances=0)
+    book = BookResult(name=name, n_rebalances=0,
+                      rebalance_every=rebalance_every)
 
     held: set[str] = set()          # long leg
     held_short: set[str] = set()
@@ -239,6 +277,13 @@ def simulate(predictions: pd.DataFrame, costs: CostModel | None = None,
     for rb in rebalance_books(predictions, rebalance_every, quantiles):
         if rb.degenerate:
             book.n_no_ordering += 1
+            continue
+        if rb.book_arbitrary:
+            # More than half of each leg would be picked by a hash of the
+            # ticker's spelling rather than by the prediction. Trading it
+            # would be trading the hash; P6 measured such books at turnover
+            # 0.03-0.11, i.e. one arbitrary fifth of the universe, held.
+            book.n_books_arbitrary += 1
             continue
 
         longs = set(rb.top["ticker"])
@@ -266,7 +311,8 @@ def simulate(predictions: pd.DataFrame, costs: CostModel | None = None,
 
 
 def break_even_ic(costs: CostModel | None = None, spread_per_ic: float = 1.0,
-                  turnover: float = 1.0) -> dict:
+                  turnover: float = 1.0,
+                  rebalance_every: int = HORIZON_SESSIONS) -> dict:
     """
     What rank IC would be needed for the ordering to cover its own costs.
 
@@ -283,7 +329,9 @@ def break_even_ic(costs: CostModel | None = None, spread_per_ic: float = 1.0,
         "round_trip_cost": costs.round_trip,
         "assumed_turnover": turnover,
         "cost_per_rebalance": per_rebalance_cost,
-        "annual_cost_drag": float(np.expm1(per_rebalance_cost * REBALANCES_PER_YEAR)),
+        "annual_cost_drag": float(np.expm1(per_rebalance_cost
+                                           * rebalances_per_year(rebalance_every))),
+        "rebalances_per_year": rebalances_per_year(rebalance_every),
         "spread_per_unit_ic": spread_per_ic,
         "break_even_rank_ic": needed,
     }
@@ -363,13 +411,21 @@ def simulate_hedged(predictions: pd.DataFrame, beta: pd.DataFrame,
               in zip(beta["date"], beta["ticker"], beta["beta"])
               if np.isfinite(b)}
 
-    book = BookResult(name=f"beta_neutral@{quantiles}", n_rebalances=0)
+    book = BookResult(name=f"beta_neutral@{quantiles}", n_rebalances=0,
+                      rebalance_every=rebalance_every)
     held: set[str] = set()
     prev_hedge = 0.0
 
     for rb in rebalance_books(predictions, rebalance_every, quantiles):
         if rb.degenerate:
             book.n_no_ordering += 1
+            continue
+        if rb.book_arbitrary:
+            # More than half of each leg would be picked by a hash of the
+            # ticker's spelling rather than by the prediction. Trading it
+            # would be trading the hash; P6 measured such books at turnover
+            # 0.03-0.11, i.e. one arbitrary fifth of the universe, held.
+            book.n_books_arbitrary += 1
             continue
 
         longs = set(rb.top["ticker"])

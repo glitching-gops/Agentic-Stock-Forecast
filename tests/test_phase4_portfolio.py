@@ -227,8 +227,116 @@ def test_this_is_a_measurement_and_publishes_no_book():
 
     assert set(vars(book)) == {
         "name", "n_rebalances", "gross_returns", "net_returns", "turnover",
-        "dates", "n_no_ordering"}, (
+        "dates", "n_no_ordering", "n_books_arbitrary", "rebalance_every"}, (
         "BookResult grew a field; if it now carries holdings, this stopped "
         "being a measurement and became the thing P0 deleted")
+
+    # The allowlist above grew twice and both additions are counters or
+    # configuration, never holdings: `n_books_arbitrary` counts dates whose
+    # legs the tiebreak would have chosen, and `rebalance_every` records the
+    # width the book actually traded at so `metrics()` can annualise by it.
+    # Spelled out because extending an exact-set assertion is how such a guard
+    # quietly stops guarding.
+    assert not any(isinstance(v, pd.DataFrame) for v in vars(book).values())
+    assert all(not k.startswith(("holding", "position", "weight"))
+               for k in vars(book))
     assert len(book.dates) == book.n_rebalances
     assert all(isinstance(d, str) for d in book.dates)
+
+
+# ── The two defects P6 recorded and this session cleared ──────────────────────
+
+def test_annualisation_tracks_the_width_the_book_actually_traded_at():
+    """
+    `REBALANCES_PER_YEAR` was a module constant pinned at 252/30 = 8.4, and
+    every annualisation read it regardless of the book's own horizon. P6's
+    pre-registration flagged it before the sweep ran and then worked around it
+    by annualising by hand; this is the fix, so the next caller does not have
+    to know.
+
+    An h=5 book rebalances 50.4 times a year. Annualised at 8.4 its cost drag
+    is understated SIX-FOLD and its Sharpe scaled by sqrt(8.4) instead of
+    sqrt(50.4).
+    """
+    from pipeline.portfolio import rebalances_per_year
+
+    assert rebalances_per_year(30) == pytest.approx(8.4)
+    assert rebalances_per_year(5) == pytest.approx(50.4)
+    assert rebalances_per_year(5) / rebalances_per_year(30) == pytest.approx(6.0)
+    assert rebalances_per_year() == pytest.approx(REBALANCES_PER_YEAR)
+
+    with pytest.raises(ValueError):
+        rebalances_per_year(0)
+
+    # And a book carries the width it traded at, so `metrics()` uses it.
+    preds = synthetic_predictions(_panel(n_rebalances=40), 0.05, seed=3)
+    wide = simulate(preds, CostModel(), rebalance_every=30, long_only=False)
+    narrow = simulate(preds, CostModel(), rebalance_every=5, long_only=False)
+    assert wide.rebalance_every == 30 and narrow.rebalance_every == 5
+    assert wide.metrics()["rebalances_per_year"] == pytest.approx(8.4)
+    assert narrow.metrics()["rebalances_per_year"] == pytest.approx(50.4)
+
+
+def test_a_shorter_horizon_annualises_to_a_larger_sharpe_from_the_same_returns():
+    """
+    The arithmetic the constant was hiding, asserted on one series so no model
+    behaviour can obscure it: the SAME per-rebalance returns annualise
+    differently because they arrive at different frequencies.
+    """
+    from pipeline.portfolio import BookResult, rebalances_per_year
+
+    r = [0.01, -0.005, 0.02, 0.0, 0.015, -0.01, 0.005, 0.02, 0.001, -0.002]
+    made = {}
+    for h in (5, 30):
+        book = BookResult(name=f"b{h}", n_rebalances=len(r), gross_returns=list(r),
+                          net_returns=list(r), turnover=[0.5] * len(r),
+                          dates=[f"D{i}" for i in range(len(r))],
+                          rebalance_every=h)
+        made[h] = book.metrics()["net"]["sharpe"]
+
+    ratio = np.sqrt(rebalances_per_year(5) / rebalances_per_year(30))
+    assert made[5] / made[30] == pytest.approx(ratio)
+    assert made[5] > made[30]
+
+
+def test_a_book_whose_legs_the_tiebreak_would_choose_is_not_traded():
+    """
+    The tie-guard fix, at the altitude that trades. P6 measured such books at
+    turnover 0.034 (h=10) against 0.485 for a healthy model — one arbitrary
+    fifth of the universe, held, and reported with a net return.
+
+    The date still has an ordering, so it is NOT counted as `n_no_ordering`;
+    it is counted separately, because the two are different failures.
+    """
+    rows = []
+    for d in range(60):
+        for i in range(40):
+            # Two levels only: each leg would be drawn from a tied block of 20.
+            rows.append({"date": f"D{d:04d}", "ticker": f"T{i:02d}.NS",
+                         "y_pred": 1.0 if i < 20 else 0.0,
+                         "y_true": 0.01 if i < 20 else -0.01})
+    book = simulate(pd.DataFrame(rows), CostModel(), rebalance_every=1,
+                    long_only=False)
+
+    assert book.n_rebalances == 0, "a majority-tiebreak book was traded"
+    assert book.n_books_arbitrary == 60
+    assert book.n_no_ordering == 0, (
+        "an arbitrary book was miscounted as having no ordering at all; the "
+        "two are different failures and the counts must not merge")
+
+
+def test_a_genuine_ordering_is_still_traded_in_full():
+    """The guard must not suppress a real book — the other half of the
+    contract, and the half a too-strict rule would break."""
+    rng = np.random.default_rng(71)
+    rows = []
+    for d in range(60):
+        for i in range(40):
+            pred = rng.normal()
+            rows.append({"date": f"D{d:04d}", "ticker": f"T{i:02d}.NS",
+                         "y_pred": pred, "y_true": pred * 0.02 + rng.normal() * 0.001})
+    book = simulate(pd.DataFrame(rows), CostModel(), rebalance_every=1,
+                    long_only=False)
+    assert book.n_rebalances == 60
+    assert book.n_books_arbitrary == 0
+    assert np.mean(book.gross_returns) > 0

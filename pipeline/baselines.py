@@ -677,11 +677,12 @@ def _pooled_xgb_factory():
     """
     from xgboost import XGBRegressor
 
-    return XGBRegressor(
+    from pipeline.determinism import xgb_params
+
+    return XGBRegressor(**xgb_params(
         n_estimators=300, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        random_state=42, verbosity=0, tree_method="hist",
-    )
+        subsample=0.8, colsample_bytree=0.8, random_state=42,
+    ))
 
 
 def fit_factor_loadings(panel: pd.DataFrame, min_train: int = 500,

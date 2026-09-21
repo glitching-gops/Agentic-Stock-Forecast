@@ -57,6 +57,7 @@ from pipeline.evaluation import (  # noqa: E402
     cross_sectional_report,
     horizon_purge_embargo,
 )
+from pipeline.label import standardise_target as _standardise_target  # noqa: E402
 from pipeline.evidence_panel import (  # noqa: E402
     BOOTSTRAP_B,
     driscoll_kraay_se,
@@ -301,9 +302,11 @@ def part_a(raw_panel: pd.DataFrame, stored: dict, args) -> dict:
 
     # A0 — the stop condition, on the STORED label and the legacy rule.
     print("\nA0 — regression pin: h=30, legacy purge, stored label", flush=True)
+    # The ONLY opt-out in the codebase: this pin exists to reproduce
+    # predictions frozen under the raw label, so it must not standardise.
     preds, folds = run_arm(raw_panel, "mae", "none", n_trials=args.trials,
                            features=ARM_FEATURES["baseline"],
-                           horizon=30, purge=30)
+                           horizon=30, purge=30, standardise_label=False)
     repro = reproduction(stored, as_data(preds))
     out["pin"] = repro
     print(f"  A0 {'PASS' if repro['passed'] else 'FAIL'} "
@@ -532,23 +535,12 @@ def verdicts_b(b: dict) -> dict:
 # ── Part C — the scale diagnostic ─────────────────────────────────────────────
 
 
-def standardise_target(panel: pd.DataFrame) -> pd.DataFrame:
-    """
-    `TARGET` replaced by its own within-date z-score.
-
-    A monotone transform inside each date, so it changes no cross-sectional
-    rank and no per-date rank IC of any fixed ordering. What it changes is the
-    SCALE the loss is measured on, which is the whole point: `gamma` is a
-    minimum loss reduction in the loss's own units, and the tuner searches it
-    over a fixed [0, 5] at every horizon while the label's dispersion falls
-    from 0.1196 at h=30 to 0.0476 at h=5.
-    """
-    out = panel.copy()
-    y = pd.to_numeric(out[TARGET], errors="coerce")
-    g = y.groupby(out["date"])
-    z = (y - g.transform("mean")) / g.transform("std").replace(0.0, np.nan)
-    out[TARGET] = z.replace([np.inf, -np.inf], np.nan)
-    return out
+# ONE implementation of the transform, in `pipeline/label.py`, imported rather
+# than re-derived. It was defined here when it was a post-hoc diagnostic; it is
+# the pipeline's default training target now, and two copies of a label
+# definition that can disagree is the `_log_price_basis` landmine waiting to
+# happen. Re-exported so this module's own tests and callers keep working.
+standardise_target = _standardise_target
 
 
 def part_c(raw_panel: pd.DataFrame, args) -> dict:

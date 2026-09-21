@@ -506,24 +506,99 @@ def test_a_constant_prediction_earns_no_alpha():
     assert "alpha_vs_equal_weight" not in report
 
 
-def test_ranking_ties_are_not_broken_alphabetically():
+def test_a_leg_that_the_tiebreak_would_mostly_choose_earns_no_book():
     """
-    Partial ties are rare for a continuous prediction and routine for a clipped
-    or rounded one. When they happen the tiebreak must not correlate with the
-    ticker's spelling, or a spurious edge reappears in a subtler form.
+    SUPERSEDES an earlier, weaker contract, and the change is the point.
+
+    This panel has TWO prediction levels: ten names at 0.2 and ten at 0.1, and
+    the quintile is four names. So the top leg is four names drawn from a tied
+    block of ten, and which four is decided entirely by the tiebreak. The old
+    guard allowed that — it refused only a cross-section that was tied END TO
+    END — and merely required the tiebreak not to be alphabetical, which is
+    the weaker claim that a spurious edge be RANDOM rather than absent.
+
+    P6 measured what that permitted: the pooled model's median date carried
+    nine distinct values across 84 names, one sampled date had 52 names tied
+    at the top value, and the resulting "books" turned over 0.03-0.11 — one
+    arbitrary fifth of the universe, held, and reported with a net return.
+
+    Now such a date earns no book at all. It still RANKS, because `rank_ic`
+    averages ranks over ties and that is correct, so its IC stays in the
+    sample; only the quantile columns are withheld.
     """
     panel = _constant_prediction_panel(n_dates=400)
-    # Two prediction levels, so there IS an ordering; ties fill each level and
-    # straddle the quintile boundary.
     half = panel["ticker"] < "T10.NS"
     panel.loc[half, "y_pred"] = 0.2
     panel.loc[~half, "y_pred"] = 0.1
 
     report = cross_sectional_report(panel, rebalance_every=1)
+
+    # The ordering is real, so the dates are still scored...
     assert report["n_rebalances"] > 0
-    # The top quintile is drawn from the tied 0.2 block. If the tiebreak were
-    # alphabetical it would be exactly T00-T03, which carry the planted edge.
-    assert report["alpha_vs_equal_weight"] < 0.04, report
+    assert report["n_dates_no_ordering"] == 0
+    assert np.isfinite(report["mean_rank_ic"])
+
+    # ...and not one of them yields a tradeable leg.
+    assert report["n_books_arbitrary"] == report["n_rebalances"]
+    assert report["n_books_traded"] == 0
+    assert report["mean_arbitrary_fraction"] == pytest.approx(1.0)
+
+    # So no quantile number is reported at all — in particular not the
+    # planted alphabetical edge of +0.05 the old guard let through at 0.04.
+    assert np.isnan(report["alpha_vs_equal_weight"])
+    assert np.isnan(report["long_short_spread"])
+
+
+def test_an_arbitrary_SHORT_leg_is_caught_even_when_the_long_leg_is_clean():
+    """
+    Both legs are checked, not just the top one.
+
+    A long-short book is only as good as its worse leg, and a model can easily
+    be sharp about its favourites while lumping everything it dislikes into one
+    value — which is exactly the shape a tree produces when the bottom of the
+    cross-section falls into a single leaf. Mutation testing put this test
+    here: taking the top leg's fraction alone survived the whole suite.
+    """
+    rows = []
+    for d in range(40):
+        for i in range(40):
+            # Top 20 strictly ordered; bottom 20 all identical, so the short
+            # leg of 8 is drawn from a tied block of 20.
+            pred = float(40 - i) if i < 20 else -100.0
+            rows.append({"date": f"D{d:04d}", "ticker": f"T{i:02d}.NS",
+                         "y_pred": pred, "y_true": float(40 - i)})
+    report = cross_sectional_report(pd.DataFrame(rows), rebalance_every=1)
+
+    assert report["n_rebalances"] == 40
+    assert report["n_dates_no_ordering"] == 0
+    assert report["n_books_traded"] == 0, (
+        "a book whose SHORT leg was majority tiebreak was traded")
+    assert report["n_books_arbitrary"] == 40
+    assert np.isnan(report["long_short_spread"])
+
+
+def test_a_tied_block_that_exactly_fills_a_leg_is_not_arbitrary():
+    """
+    The other side of the rule, and the case that caught a wrong first cut.
+
+    Five blocks of four names, quintile of four: every leg is exactly one
+    block, so the tiebreak has nothing to choose — membership is decided by
+    the prediction alone. A guard that asked only "is there a tie at the cut"
+    would refuse this, which would throw away a perfectly determined book and
+    change every historical number for no reason.
+    """
+    rows = []
+    for d in range(50):
+        for i in range(20):
+            rows.append({"date": f"D{d:04d}", "ticker": f"T{i:02d}.NS",
+                         "y_pred": float(4 - i // 4), "y_true": float(4 - i // 4)})
+    report = cross_sectional_report(pd.DataFrame(rows), rebalance_every=1)
+
+    assert report["n_rebalances"] == 50
+    assert report["n_books_arbitrary"] == 0
+    assert report["n_books_traded"] == 50
+    assert report["mean_arbitrary_fraction"] == pytest.approx(0.0)
+    assert report["long_short_spread"] == pytest.approx(4.0)
 
 
 def test_a_real_ordering_is_still_scored():

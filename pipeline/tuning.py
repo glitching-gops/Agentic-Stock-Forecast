@@ -30,6 +30,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
+from pipeline.determinism import xgb_params
 from pipeline.evaluation import (
     PurgedPanelWalkForward,
     PurgedWalkForward,
@@ -122,7 +123,7 @@ def purged_cv_score(
         if mask_tr.sum() < 50 or mask_te.sum() < 10:
             continue
 
-        model = XGBRegressor(**params, random_state=SEED, verbosity=0)
+        model = XGBRegressor(**xgb_params(**params, random_state=SEED))
         model.fit(X_tr[mask_tr], y_tr[mask_tr])
         preds = model.predict(X_te[mask_te])
         scores.append(float(mean_absolute_error(y_te[mask_te], preds)))
@@ -169,7 +170,7 @@ def purged_cv_rank_ic_score(
         if mask_tr.sum() < 50 or mask_te.sum() < 10:
             continue
 
-        model = XGBRegressor(**params, random_state=SEED, verbosity=0)
+        model = XGBRegressor(**xgb_params(**params, random_state=SEED))
         model.fit(X_tr[mask_tr], y_tr[mask_tr])
         preds = np.asarray(model.predict(X_te[mask_te]), dtype=float)
         truth = y_te[mask_te].to_numpy(dtype=float)
@@ -350,8 +351,8 @@ def purged_panel_cv_score(
         if len(tr) < 100 or len(te) < 10:
             continue
 
-        model = XGBRegressor(**params, random_state=SEED, verbosity=0,
-                             enable_categorical=enable_categorical)
+        model = XGBRegressor(**xgb_params(**params, random_state=SEED,
+                                          enable_categorical=enable_categorical))
         model.fit(panel.iloc[tr][features], y_all[tr])
         preds = np.asarray(model.predict(panel.iloc[te][features]), dtype=float)
 

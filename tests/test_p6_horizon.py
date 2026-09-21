@@ -410,16 +410,48 @@ def test_standardising_the_target_preserves_every_within_date_ranking():
 
 
 def test_standardising_a_degenerate_date_does_not_invent_an_ordering():
-    """A date whose label is constant has no ordering, and dividing by a zero
-    standard deviation must produce NaN rather than a fabricated one."""
+    """
+    A date whose label is constant has no ordering, and dividing by a zero
+    standard deviation must produce NaN rather than a fabricated one.
+
+    The cross-sections here are 12 names wide on purpose: the transform
+    refuses a date thinner than `MIN_NAMES_PER_DATE`, which the fixture must
+    clear or the test would pass for the wrong reason.
+    """
+    from pipeline.panel import MIN_NAMES_PER_DATE
     from tools.p6_horizon import standardise_target
 
+    n = MIN_NAMES_PER_DATE + 2
+    rng = np.random.default_rng(4)
     panel = pd.DataFrame({
-        "date": ["d0"] * 4 + ["d1"] * 4,
-        "ticker": [f"T{j}" for j in range(4)] * 2,
-        TARGET: [0.1, 0.1, 0.1, 0.1, -0.02, 0.01, 0.03, 0.05],
+        "date": ["d0"] * n + ["d1"] * n,
+        "ticker": [f"T{j:02d}" for j in range(n)] * 2,
+        TARGET: [0.1] * n + list(rng.normal(0, 0.05, n)),
     })
     out = standardise_target(panel)
-    flat = out[out["date"] == "d0"][TARGET]
-    assert flat.isna().all(), "a constant date was given a fabricated ordering"
+    assert out[out["date"] == "d0"][TARGET].isna().all(), (
+        "a constant date was given a fabricated ordering")
+    assert out[out["date"] == "d1"][TARGET].notna().all()
+
+
+def test_a_cross_section_too_thin_to_standardise_is_refused():
+    """
+    Dividing by the standard deviation of six numbers manufactures outliers
+    instead of removing them. `cross_sectional_zscore` has always refused a
+    thin date for the features; the target transform makes the same refusal,
+    and this pins that the two agree.
+    """
+    from pipeline.panel import MIN_NAMES_PER_DATE
+    from tools.p6_horizon import standardise_target
+
+    rng = np.random.default_rng(5)
+    thin, wide = MIN_NAMES_PER_DATE - 1, MIN_NAMES_PER_DATE + 5
+    panel = pd.DataFrame({
+        "date": ["d0"] * thin + ["d1"] * wide,
+        "ticker": ([f"T{j:02d}" for j in range(thin)]
+                   + [f"T{j:02d}" for j in range(wide)]),
+        TARGET: list(rng.normal(0, 0.05, thin)) + list(rng.normal(0, 0.05, wide)),
+    })
+    out = standardise_target(panel)
+    assert out[out["date"] == "d0"][TARGET].isna().all()
     assert out[out["date"] == "d1"][TARGET].notna().all()

@@ -1,5 +1,38 @@
 # Stage 1 — closing the new-data track
 
+> **CORRECTION NOTICE — 2026-09-21. The numbers below are not reproducible as
+> written, and two of the reasons are defects rather than noise.** Nothing here
+> is rewritten; see `docs/hygiene-findings.md` for what changed and by how
+> much.
+>
+> 1. **They were produced at an unpinned thread count.** Nothing in the
+>    repository pinned XGBoost's `n_jobs`, so every fit ran at whatever this
+>    workstation defaulted to (20). Measured: the same code with the same seeds
+>    gives different hyperparameters and a different model at a different
+>    thread count — zero of 162,535 predictions matching, a maximum difference
+>    of 6.2 prediction standard deviations. Re-pinned at `XGB_THREADS = 2`, the
+>    30-session baseline moves from cs IC −0.00101 to −0.00423 and from
+>    1 STRONG / 1 WEAK / 82 to 2 STRONG / 3 WEAK / 79. **Every verdict here
+>    survives — a null that wobbles into another null is still a null — but the
+>    digits do not.**
+> 2. **They were produced on the RAW label**, which is no longer the pipeline's
+>    default training target. `gamma` is denominated in the loss, so the fixed
+>    `[0, 5]` search range meant something different at every label scale;
+>    the within-date standardised label (`pipeline/label.py`) is the default
+>    now, and under it the same architecture emits 0 of 420 constant cells
+>    instead of 7, and 84 distinct predictions per date instead of 8.
+>
+> 3. **Any QUANTILE or BOOK figure here — long-short spread, top-quintile
+>    return, alpha, net-of-cost — was computed with a tie guard that refused
+>    only a wholly tied cross-section.** The pooled model's predictions are
+>    discrete, and 48 of the 64 h=30 books had legs that were MAJORITY chosen
+>    by the ticker tie-break rather than by the model. Those columns are
+>    withdrawn rather than corrected. **The rank-IC figures are unaffected and
+>    reproduce to the digit**, because `rank_ic` averages ranks over ties.
+>
+> The session that measured all of this changed no conclusion in this
+> document.
+
 **The single document to hand a reader for Stage 1.** It carries the three
 pilots, what each one failed on, and the one reading that ties them together.
 The per-pilot detail stays where it was written: `docs/stage1-findings.md`,

@@ -1,5 +1,30 @@
 # The evidence-grading track, closed
 
+> **CORRECTION NOTICE — 2026-09-21. The numbers below are not reproducible as
+> written, and two of the reasons are defects rather than noise.** Nothing here
+> is rewritten; see `docs/hygiene-findings.md` for what changed and by how
+> much.
+>
+> 1. **They were produced at an unpinned thread count.** Nothing in the
+>    repository pinned XGBoost's `n_jobs`, so every fit ran at whatever this
+>    workstation defaulted to (20). Measured: the same code with the same seeds
+>    gives different hyperparameters and a different model at a different
+>    thread count — zero of 162,535 predictions matching, a maximum difference
+>    of 6.2 prediction standard deviations. Re-pinned at `XGB_THREADS = 2`, the
+>    30-session baseline moves from cs IC −0.00101 to −0.00423 and from
+>    1 STRONG / 1 WEAK / 82 to 2 STRONG / 3 WEAK / 79. **Every verdict here
+>    survives — a null that wobbles into another null is still a null — but the
+>    digits do not.**
+> 2. **They were produced on the RAW label**, which is no longer the pipeline's
+>    default training target. `gamma` is denominated in the loss, so the fixed
+>    `[0, 5]` search range meant something different at every label scale;
+>    the within-date standardised label (`pipeline/label.py`) is the default
+>    now, and under it the same architecture emits 0 of 420 constant cells
+>    instead of 7, and 84 distinct predictions per date instead of 8.
+>
+> The session that measured all of this changed no conclusion in this
+> document.
+
 > **This is the single document to read for this whole track.** It supersedes
 > the numbers in `stage0-evidence-grading.md`, `stage0-addendum-degeneracy-sweep.md`,
 > `stage0b-findings.md` and section 8 of `stage2b-findings.md`, each of which

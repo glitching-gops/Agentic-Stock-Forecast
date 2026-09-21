@@ -254,13 +254,48 @@ has survived this — four attacks, all of them standing policy:
 python tools/p6_scale_followup.py --horizons 5 --markdown p6_followup.md
 ```
 
-Run on h=5 it reported: 3 of 6 min_train settings above t 2.0, a headline that
-moves from +2.41 to +1.99 on `OMP_NUM_THREADS` alone, an IC that does beat all
-nine target-permuted retrains, and a net +0.047% per rebalance at t +0.47.
-Verdict NO. A placebo draw carrying no information by construction reached
-t −2.75, which is the most useful line in its output: the t threshold is not
-calibrated for this statistic on this panel, and the IC comparison against the
-placebo is what carries the weight.
+It has been run on h=5 twice, and the two runs disagree, which is itself the
+finding:
+
+- **2026-09-20, unpinned threads:** 3 of 6 min_train settings above t 2.0, a
+  headline that moved from +2.41 to +1.99 on `OMP_NUM_THREADS` alone, and a
+  net +0.047% per rebalance at t +0.47. Verdict NO.
+- **2026-09-21, pinned at `XGB_THREADS = 2`, standardised label as the
+  default:** 5 of 6 settings above t 2.0, IC beating all nine target-permuted
+  retrains, net **+0.027% per rebalance at t +0.28**. Verdict YES.
+
+The second is the one to believe, because it is reproducible; neither is a
+result. A placebo carrying no information reached **t −2.75** in the first run
+and **−2.64** in the second, so the t threshold is not calibrated for this
+statistic on this panel, and it deflates to nothing at ~150 trials.
+`docs/hygiene-findings.md` §4 has the full reading.
+
+## hygiene_repin.py
+
+Re-pins the stored 30-session baseline under the two changes the 2026-09-21
+hygiene session made, and measures what the conformal interval costs.
+
+Three arms on identical folds and rows, split so each change is attributable:
+
+- **committed** — the numbers in the repo: raw label, this machine's default
+  20 threads;
+- **old_pinned** — raw label, `XGB_THREADS = 2`. Isolates what the thread pin
+  ALONE moved;
+- **new_pinned** — within-date standardised label, pinned. The new baseline.
+
+It also re-runs `new_pinned` a second time and requires drift 0.0, and measures
+split-conformal coverage through BOTH inverses of the standardised label — the
+realised moments (exact, never available live) and the causal ones (the only
+thing a forecast can use) — calibrated on the early folds and checked on each
+later fold in turn.
+
+```bash
+python tools/hygiene_repin.py --smoke --markdown hygiene_smoke.md   # ~1 min
+python tools/hygiene_repin.py --markdown hygiene.md                 # ~10 min
+```
+
+Written against `docs/hygiene-preregistration.md`; findings in
+`docs/hygiene-findings.md`.
 
 ## Phase 0 changes
 

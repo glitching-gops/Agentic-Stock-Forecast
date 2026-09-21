@@ -40,6 +40,8 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from pipeline.baselines import FACTORS  # noqa: E402
+from pipeline.determinism import xgb_params  # noqa: E402
+from pipeline.label import standardise_target  # noqa: E402
 from pipeline.evaluation import (  # noqa: E402
     PurgedPanelWalkForward,
     cross_sectional_report,
@@ -266,7 +268,8 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
             fixed_params: dict | None = None,
             features: list[str] | None = None,
             horizon: int = HORIZON_SESSIONS,
-            purge: int | None = None) -> tuple[pd.DataFrame, list[dict]]:
+            purge: int | None = None,
+            standardise_label: bool = True) -> tuple[pd.DataFrame, list[dict]]:
     """
     A pooled purged walk-forward with the search nested inside each training
     fold. The splitter and its constants are ``panel_walk_forward``'s, so the
@@ -286,6 +289,39 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
     ``horizon_purge_embargo(horizon)``, which never goes below the panel's own
     measured serial dependence.
     """
+    # THE WITHIN-DATE STANDARDISED LABEL IS THE DEFAULT TRAINING TARGET.
+    #
+    # `gamma` is a minimum loss reduction in the loss's own units, and the raw
+    # label's dispersion falls from 0.1196 at h=30 to 0.0476 at h=5 while the
+    # search range stays [0, 5] — so at a short horizon every split looks
+    # unprofitable and the model emits one constant per fold. P6 measured five
+    # distinct predicted values across 162,535 rows at h=5; standardising
+    # gives 0 of 420 constant cells at every horizon.
+    #
+    # `pipeline.label.standardise_target` is idempotent when the moments are
+    # already attached, so a caller that standardised upstream is not
+    # double-transformed. The opt-out exists for ONE purpose: reproducing
+    # predictions frozen under the old label, which the A0 regression pin
+    # must do.
+    if standardise_label:
+        before = int(pd.to_numeric(panel[TARGET], errors="coerce").notna().sum())
+        panel = standardise_target(panel)
+        after = int(pd.to_numeric(panel[TARGET], errors="coerce").notna().sum())
+        # REFUSE LOUDLY RATHER THAN RETURN NOTHING. The transform is a
+        # within-date operation and declines a cross-section thinner than
+        # `MIN_NAMES_PER_DATE`, so on a narrow panel it empties the label
+        # and every fold then fails the row guard below — which looks
+        # exactly like a splitter that produced no folds. Found by making
+        # this the default: four leakage tests on an 8-ticker synthetic
+        # panel went from passing to 'no fold ran', with nothing saying
+        # why.
+        if before and after < before // 2:
+            raise ValueError(
+                f"standardising the label left {after:,} of {before:,} rows "
+                f"labelled; the cross-section is probably thinner than "
+                f"MIN_NAMES_PER_DATE. Pass standardise_label=False if the "
+                f"raw label is what you meant.")
+
     purge = horizon if purge is None else int(purge)
     if purge < horizon:
         raise ValueError(
@@ -329,8 +365,8 @@ def run_arm(panel: pd.DataFrame, objective: str, ticker_mode: str,
             n_trials=n_trials, tuning_objective=objective,
             enable_categorical=categorical)
 
-        model = XGBRegressor(**params, random_state=42, verbosity=0,
-                             enable_categorical=categorical)
+        model = XGBRegressor(**xgb_params(**params, random_state=42,
+                                          enable_categorical=categorical))
         model.fit(frame.iloc[tr][features], y[tr])
         pred = np.asarray(model.predict(frame.iloc[te][features]), dtype=float)
         in_sample = np.asarray(model.predict(frame.iloc[tr][features]), dtype=float)

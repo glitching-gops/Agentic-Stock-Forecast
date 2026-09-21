@@ -157,6 +157,12 @@ p6_*.json
 p6_*.md
 p6_*.log
 
+# Hygiene session (2026-09-21) — the re-pin's run artifacts. Predictions are
+# covered by *.npz above; the findings live in docs/hygiene-findings.md.
+hygiene_*.json
+hygiene_*.md
+hygiene_*.log
+
 # graphify — the local knowledge-graph tool's output: graph.json, graph.html,
 # GRAPH_REPORT.md and a content-addressed AST cache (12.5 MB, 175 files on
 # 2026-09-11). Regenerated from the source tree by /graphify, and it records

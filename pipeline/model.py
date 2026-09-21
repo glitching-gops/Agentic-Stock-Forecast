@@ -41,6 +41,7 @@ from xgboost import XGBRegressor
 
 from data.db import get_engine, to_native, to_native_params
 from pipeline.conformal import ConformalCalibration, fit_conformal, to_price_view
+from pipeline.determinism import xgb_params
 from pipeline.evaluation import (
     PurgedWalkForward,
     WalkForwardResult,
@@ -191,7 +192,7 @@ def load_features_for_ticker(ticker: str, engine=None) -> pd.DataFrame:
 def _model_factory(params: dict | None = None):
     """Returns a factory producing fresh, identically configured estimators."""
     def factory():
-        model = XGBRegressor(random_state=42, verbosity=0, tree_method="hist")
+        model = XGBRegressor(**xgb_params(random_state=42))
         if params:
             model.set_params(**params)
         return model
@@ -541,7 +542,7 @@ def fit_production_model(ticker: str, df: pd.DataFrame, force_tune: bool = False
     X, y = labelled[FEATURES], labelled[TARGET]
     params = tune_and_cache(ticker, X, y, horizon=HORIZON_SESSIONS, force=force_tune)
 
-    model = XGBRegressor(**params, random_state=42, verbosity=0)
+    model = XGBRegressor(**xgb_params(**params, random_state=42))
     model.fit(X, y)
 
     os.makedirs(MODELS_DIR, exist_ok=True)

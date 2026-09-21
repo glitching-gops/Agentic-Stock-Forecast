@@ -309,6 +309,7 @@ def test_the_pooled_harness_reproduces_panel_walk_forward_exactly():
     nothing. Given the same fixed hyperparameters the two must agree to the
     last bit, or Stage 2b's cells cannot be read beside the baselines table.
     """
+    from pipeline.determinism import xgb_params
     from pipeline.evaluation import panel_walk_forward
     from tools.stage2b_pooled import EVAL_MIN_TRAIN_DATES, run_arm
     from xgboost import XGBRegressor
@@ -317,13 +318,24 @@ def test_the_pooled_harness_reproduces_panel_walk_forward_exactly():
     params = {"n_estimators": 30, "max_depth": 3, "learning_rate": 0.1,
               "tree_method": "hist"}
 
+    # THE RAW LABEL ON BOTH SIDES. `run_arm` standardises by default now;
+    # `panel_walk_forward` does not, because `compare_baselines` reads it and
+    # that table's floors (`market`, `train_mean`) are defined in return units.
+    # What this test measures is the FOLD BOUNDARY, so the label must be the
+    # one thing that does not differ between the two.
     mine, folds = run_arm(panel, "mae", "none", min_train=400, verbose=False,
-                          fixed_params=params, features=["a", "b"])
+                          fixed_params=params, features=["a", "b"],
+                          standardise_label=False)
 
+    # And the comparator is built through the same pin. Constructing it bare
+    # would leave `n_jobs` at the machine default while `run_arm` uses two,
+    # and P6 measured that a thread-count difference alone changes every
+    # prediction — so this equality check would be asserting something about
+    # the machine rather than about the harness.
     theirs = panel_walk_forward(
         panel, ["a", "b"],
-        model_factory=lambda: XGBRegressor(**params, random_state=42,
-                                           verbosity=0),
+        model_factory=lambda: XGBRegressor(**xgb_params(**params,
+                                                        random_state=42)),
         splitter=PurgedPanelWalkForward(n_folds=5, horizon=HORIZON,
                                         embargo=HORIZON, min_train=400),
         target="target_return",

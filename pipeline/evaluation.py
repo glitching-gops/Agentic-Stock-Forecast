@@ -791,7 +791,62 @@ class RebalanceBook:
     day: pd.DataFrame          # the full cross-section, sorted best-first
     top: pd.DataFrame          # the long book
     bottom: pd.DataFrame       # the short book
-    degenerate: bool = False   # no ordering to trade: skipped by both callers
+    degenerate: bool = False   # no ordering AT ALL: leaves the sample entirely
+    #: An ordering exists, but the quantile legs would be majority tie-break,
+    #: so `top` and `bottom` are withheld while `day` — and therefore the
+    #: date's rank IC — is kept. See `rebalance_books` for why the two are
+    #: separate.
+    book_arbitrary: bool = False
+    #: Share of the larger leg whose membership the TIE-BREAK chose rather than
+    #: the prediction. 0.0 when every prediction at the cut is included by
+    #: right; 1.0 when the whole cross-section is tied. Carried so a refusal is
+    #: auditable rather than a bare boolean.
+    arbitrary_fraction: float = 0.0
+
+    @property
+    def tradeable(self) -> bool:
+        """Whether this date yields a book anything may trade or score legs on."""
+        return not (self.degenerate or self.book_arbitrary)
+
+
+#: How much of a quantile leg may be chosen by the tie-break before the book
+#: stops being the model's. Half: past this, most of what is held was picked by
+#: a hash of the ticker's spelling, and the book measures the hash.
+#:
+#: NOT tuned to preserve any existing number. It refuses a large share of dates
+#: on this panel precisely because the pooled model's predictions are coarse —
+#: which is the finding, not a reason to move the threshold.
+MAX_ARBITRARY_LEG_FRACTION = 0.5
+
+
+def _arbitrary_leg_fraction(ordered: np.ndarray, k: int) -> float:
+    """
+    The larger of the two legs' tie-decided fractions.
+
+    `ordered` is the date's predictions sorted best-first; `k` is the leg size.
+    Everything strictly beyond a leg's cut value is the model's choice, so what
+    the tie-break had to pick is ``k - (names strictly beyond the cut)``.
+    """
+    n = len(ordered)
+    if n <= k:
+        return 1.0
+
+    def _leg(cut: float, beyond: int, at_cut: int) -> int:
+        # Seats the tie-break has to fill from the tied block at the cut.
+        slots = k - beyond
+        # A tied block that EXACTLY fills the remaining seats leaves no choice:
+        # every name at the cut is in the leg. Only a block larger than the
+        # seats makes membership arbitrary. Getting this wrong is not academic
+        # — it scored a clean five-block cross-section as 100% arbitrary.
+        return slots if at_cut > slots else 0
+
+    top_cut = ordered[k - 1]
+    bottom_cut = ordered[n - k]
+    top = _leg(top_cut, int(np.sum(ordered > top_cut)),
+               int(np.sum(ordered == top_cut)))
+    bottom = _leg(bottom_cut, int(np.sum(ordered < bottom_cut)),
+                  int(np.sum(ordered == bottom_cut)))
+    return float(max(top, bottom) / k)
 
 
 def rebalance_books(
@@ -825,16 +880,33 @@ def rebalance_books(
         pred = day["y_pred"].to_numpy(dtype=float)
         finite = np.isfinite(pred)
         if finite.sum() < floor or np.ptp(pred[finite]) == 0:
-            # A PREDICTION WITH NO ORDERING EARNS NO PORTFOLIO. Reported as
-            # degenerate so the caller can count it, never scored.
+            # NO ORDERING AT ALL. Nothing to rank and nothing to trade, so the
+            # date leaves the sample entirely — this is the original guard and
+            # it is unchanged.
             yield RebalanceBook(date=str(dt), day=day, top=day.iloc[:0],
-                                bottom=day.iloc[:0], degenerate=True)
+                                bottom=day.iloc[:0], degenerate=True,
+                                arbitrary_fraction=1.0)
             continue
 
         day = day.sort_values(["y_pred", "_tiebreak"], ascending=[False, True])
         k = max(2, len(day) // quantiles)
+        arbitrary = _arbitrary_leg_fraction(day["y_pred"].to_numpy(dtype=float), k)
+
+        if arbitrary > MAX_ARBITRARY_LEG_FRACTION:
+            # AN ORDERING, BUT NOT A BOOK. The date still ranks — `rank_ic`
+            # averages ranks over ties, which is correct and unaffected — but
+            # the quantile legs would be majority tie-break, so they are
+            # withheld. The two are separated deliberately: refusing the whole
+            # date would change WHICH DATES the rank IC averages over, and a
+            # sweep that changes the row count measures two things at once.
+            yield RebalanceBook(date=str(dt), day=day, top=day.iloc[:0],
+                                bottom=day.iloc[:0], book_arbitrary=True,
+                                arbitrary_fraction=arbitrary)
+            continue
+
         yield RebalanceBook(date=str(dt), day=day,
-                            top=day.head(k), bottom=day.tail(k))
+                            top=day.head(k), bottom=day.tail(k),
+                            arbitrary_fraction=arbitrary)
 
 
 def cross_sectional_report(
@@ -888,19 +960,29 @@ def cross_sectional_report(
 
     records = []
     degenerate = 0
+    arbitrary_books = 0
 
     for book in rebalance_books(panel, rebalance_every, quantiles):
         if book.degenerate:
             degenerate += 1
             continue
         day = book.day
+        # A date whose legs are majority tie-break still RANKS — `rank_ic`
+        # averages ranks over ties — so its IC is kept and only the quantile
+        # columns are withheld as NaN. Dropping the whole date instead would
+        # change which dates `mean_rank_ic` averages over, which is the
+        # sweep-that-changes-the-row-count error one level down.
+        legs = book.tradeable
+        if not legs:
+            arbitrary_books += 1
         records.append({
             "date": book.date,
             "n": len(day),
-            "top": float(book.top["y_true"].mean()),
-            "bottom": float(book.bottom["y_true"].mean()),
+            "top": float(book.top["y_true"].mean()) if legs else float("nan"),
+            "bottom": float(book.bottom["y_true"].mean()) if legs else float("nan"),
             "all": float(day["y_true"].mean()),
             "ic": rank_ic(day["y_true"].to_numpy(), day["y_pred"].to_numpy()),
+            "arbitrary_fraction": book.arbitrary_fraction,
         })
 
     if not records:
@@ -927,6 +1009,12 @@ def cross_sectional_report(
     return {
         "n_rebalances": len(R),
         "n_dates_no_ordering": degenerate,
+        # Dates that ranked but whose quantile legs were withheld as majority
+        # tie-break. `mean_rank_ic` includes them; every quantile column below
+        # does not.
+        "n_books_arbitrary": arbitrary_books,
+        "n_books_traded": int(R["top"].notna().sum()),
+        "mean_arbitrary_fraction": float(R["arbitrary_fraction"].mean()),
         "mean_rank_ic": float(R["ic"].mean()),
         "rank_ic_t": ic_t,
         "rank_ic_p": ic_p,

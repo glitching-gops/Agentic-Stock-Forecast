@@ -519,7 +519,8 @@ def test_run_arm_refuses_a_purge_narrower_than_its_own_label():
     panel = _synthetic_panel(n_dates=400, n_tickers=6)
     with pytest.raises(ValueError, match="narrower than"):
         run_arm(panel, "mae", "none", features=["a", "b"],
-                horizon=30, purge=5, fixed_params={"n_estimators": 2})
+                horizon=30, purge=5, fixed_params={"n_estimators": 2},
+                standardise_label=False)
 
 
 def _record_run_arm(panel, horizon, purge, monkeypatch, min_train=200):
@@ -542,9 +543,12 @@ def _record_run_arm(panel, horizon, purge, monkeypatch, min_train=200):
         return {"n_estimators": 2, "max_depth": 2, "tree_method": "hist"}
 
     monkeypatch.setattr(sp, "tune_pooled", fake_tune)
+    # The RAW label. What this measures is the fold boundary, and the
+    # standardised default would make the target depend on the fixture's
+    # cross-sectional width — a second moving part in a leakage test.
     preds, _ = sp.run_arm(panel, "mae", "none", n_trials=1, min_train=min_train,
                           features=["a", "b"], horizon=horizon, purge=purge,
-                          verbose=False)
+                          verbose=False, standardise_label=False)
     return preds, seen
 
 
@@ -590,6 +594,35 @@ def test_run_arm_purges_and_embargoes_at_the_width_it_was_given(horizon, monkeyp
             assert rec["train_dates"].max() < block["date"].min()
 
 
+def test_the_default_label_transform_refuses_a_panel_it_would_empty():
+    """
+    The standardised label is the DEFAULT training target now, and it is a
+    within-date transform that declines a cross-section thinner than
+    `MIN_NAMES_PER_DATE`. On a narrow panel it therefore empties the label,
+    every fold fails the row guard, and `run_arm` returns nothing — which is
+    indistinguishable from a splitter that produced no folds.
+
+    Found by making it the default: four of the tests above went from passing
+    to "no fold ran", with nothing saying why. It must refuse instead.
+    """
+    from pipeline.panel import MIN_NAMES_PER_DATE
+    from tools.stage2b_pooled import run_arm
+
+    thin = _synthetic_panel(n_dates=900, n_tickers=MIN_NAMES_PER_DATE - 2)
+    with pytest.raises(ValueError, match="MIN_NAMES_PER_DATE"):
+        run_arm(thin, "mae", "none", n_trials=1, min_train=200,
+                features=["a", "b"], fixed_params={"n_estimators": 2},
+                verbose=False)
+
+    # Wide enough, and it runs — so the refusal is about width, not about the
+    # transform being broken.
+    wide = _synthetic_panel(n_dates=900, n_tickers=MIN_NAMES_PER_DATE + 4)
+    preds, _ = run_arm(wide, "mae", "none", n_trials=1, min_train=200,
+                       features=["a", "b"], fixed_params={"n_estimators": 2},
+                       verbose=False)
+    assert len(preds) > 0
+
+
 def test_the_legacy_rule_reproduces_the_pre_p6_split_exactly():
     """
     The regression pin, at the altitude a unit test can reach: parameterising
@@ -631,3 +664,68 @@ def test_a_shorter_horizon_does_not_shrink_the_embargo_below_the_measured_floor(
         f"the purge tracked the horizon ({widths}); below the measured floor "
         f"it must not")
     assert widths[0] == POLITIS_WHITE_FLOOR_SESSIONS
+
+
+# ── The standardised label: the leakage contract ──────────────────────────────
+#
+# The label is standardised WITHIN each date across the whole panel, BEFORE the
+# split. That is safe only if a date's z-score depends on nothing but that
+# date's own cross-section — so a label from a future window can never reach a
+# training row through the moments. The hygiene session's pre-registration
+# named this as the first thing to suspect if the standardised label produced
+# anything positive, and it did. These two tests are that suspicion, checked.
+
+
+def test_a_standardised_label_depends_on_its_own_date_alone():
+    """Corrupting every label from a cut date onward must leave every z-score
+    before the cut bit-identical."""
+    from pipeline.label import standardise_target
+
+    panel = _synthetic_panel(n_dates=300, n_tickers=14)
+    grid = sorted(panel["date"].unique())
+    cut = grid[150]
+
+    clean = standardise_target(panel)
+    poisoned = panel.copy()
+    poisoned.loc[poisoned["date"] >= cut, "target_return"] = 1e6
+    dirty = standardise_target(poisoned)
+
+    before = (clean["date"] < cut).to_numpy()
+    assert before.sum() > 1000
+    assert np.array_equal(clean.loc[before, "target_return"].to_numpy(),
+                          dirty.loc[before, "target_return"].to_numpy())
+    # And the corruption did reach the dates after the cut, or the test proves
+    # nothing: a constant 1e6 cross-section standardises to NaN.
+    assert dirty.loc[~before, "target_return"].isna().all()
+
+
+def test_run_arm_on_the_standardised_label_is_blind_to_its_own_test_window():
+    """
+    The end-to-end version. Corrupt every label from fold k's first TEST date
+    onward, re-run, and fold k's predictions must not move: the model for fold
+    k was trained on rows at least 2 x purge dates earlier, and the
+    standardisation is within-date, so nothing from the test window can reach
+    it through either channel.
+    """
+    from tools.stage2b_pooled import run_arm
+
+    panel = _synthetic_panel(n_dates=900, n_tickers=14)
+    params = {"n_estimators": 20, "max_depth": 3, "learning_rate": 0.1}
+
+    clean, _ = run_arm(panel, "mae", "none", min_train=300, verbose=False,
+                       fixed_params=params, features=["a", "b"])
+    last = int(clean["fold"].max())
+    first_test = clean.loc[clean["fold"] == last, "date"].min()
+
+    poisoned = panel.copy()
+    poisoned.loc[poisoned["date"] >= first_test, "target_return"] = (
+        np.random.default_rng(1).normal(size=int((poisoned["date"] >= first_test).sum())) * 50)
+    dirty, _ = run_arm(poisoned, "mae", "none", min_train=300, verbose=False,
+                       fixed_params=params, features=["a", "b"])
+
+    a = clean[clean["fold"] == last].sort_values(["date", "ticker"])
+    b = dirty[dirty["fold"] == last].sort_values(["date", "ticker"])
+    assert len(a) == len(b) > 0
+    assert np.array_equal(a["y_pred"].to_numpy(), b["y_pred"].to_numpy()), (
+        "fold predictions moved when only that fold's own test-window labels "
+        "changed; the standardised label is leaking across the boundary")
