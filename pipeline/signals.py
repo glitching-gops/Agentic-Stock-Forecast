@@ -257,6 +257,45 @@ def compute_sector_momentum(df: pd.DataFrame, benchmark: pd.DataFrame) -> pd.Dat
 
 
 # ── Earnings ──────────────────────────────────────────────────────────────────
+
+#: `yf.Ticker().earnings_dates` parses HTML through `pandas.read_html`, which
+#: needs one of these. yfinance 1.3.0 declares NEITHER, so a perfectly valid
+#: install can lack it.
+HTML_PARSERS = ("lxml", "html5lib")
+
+
+class EarningsParserMissing(RuntimeError):
+    """No HTML parser, so no earnings dates, so `earnings_surprise` would be a
+    constant zero for every ticker — silently, because the fetch is caught."""
+
+
+def require_earnings_parser() -> None:
+    """
+    Refuse to compute signals with no HTML parser installed.
+
+    MEASURED, 2026-09-22, on the first CI run after the dependency lock landed.
+    Production had been resolving yfinance 1.7.0, which depends on lxml; the
+    lock pins the researched 1.3.0, which does not, so the runner had none and
+    every ticker logged "earnings surprise failed ... Import lxml failed". The
+    except branch below then wrote 0.0 — and `earnings_surprise` is one of the
+    15 pooled FACTORS. Nothing failed, nothing was empty, and a whole feature
+    column quietly became a constant on every row the job rewrote.
+
+    That is the FinBERT gauge and the FII-flow zeros for the third time: a
+    FAILED MEASUREMENT STORED AS A VALID NEUTRAL VALUE. The package is pinned
+    in requirements.in now; this makes its absence loud rather than invisible,
+    because a pin is only as good as the environment that honours it.
+    """
+    from importlib.util import find_spec
+
+    if not any(find_spec(name) is not None for name in HTML_PARSERS):
+        raise EarningsParserMissing(
+            f"none of {list(HTML_PARSERS)} is installed, so "
+            f"yfinance.earnings_dates cannot parse and earnings_surprise would "
+            f"be written as a constant 0.0 for every ticker. Install the locked "
+            f"environment: pip install -r requirements.txt")
+
+
 def compute_earnings_surprise(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Earnings surprise, (actual - estimate) / |estimate|, clipped to [-2, 2] and
@@ -604,6 +643,10 @@ def compute_and_store(single_ticker: str | None = None,
     continuing and previously could not see either.
     """
     engine = get_engine()
+    # BEFORE the loop, not inside it: a missing HTML parser is a configuration
+    # error that would otherwise be absorbed per ticker as earnings_surprise =
+    # 0.0, one factor column at a time.
+    require_earnings_parser()
 
     if single_ticker:
         to_process = [single_ticker]
@@ -668,15 +711,23 @@ def count_labelled_rows(ticker: str | None = None) -> int:
     ever refuses a DECREASE, but it means a count recorded before the switch is
     not comparable with one recorded after. That is what MODEL_VERSION and
     experiment_runs.data_hash exist to make visible.
+
+    SESSIONS ONLY, SINCE 2026-09-22, for the reason `_labelled_rows_from`
+    gives, and measured the hard way: the daily job ABORTED TWICE on the first
+    run after the phantom-session fix, because each ticker's first clean
+    rewrite drops the four or five rows Yahoo invented on NSE holidays and this
+    total then fell, 222,514 -> 222,378. The write-boundary guard excused those
+    rows; this one did not, and BOTH jobs read it. Left alone it is a trap
+    rather than a one-off: 49 tickers are still refused by the benchmark
+    outage, so the day their index returns their phantom rows go with it and
+    both jobs would abort again — the weekly one before persisting any
+    evaluation. A row on a day NSE did not trade is not a label to protect.
     """
     engine = get_engine()
-    if ticker:
-        q = text("SELECT COUNT(*) AS n FROM signals "
-                 "WHERE ticker = :t AND target_return IS NOT NULL")
-        df = pd.read_sql(q, engine, params={"t": ticker})
-    else:
-        df = pd.read_sql(
-            text("SELECT COUNT(*) AS n FROM signals WHERE target_return IS NOT NULL"),
-            engine,
-        )
-    return int(df["n"].iloc[0]) if not df.empty else 0
+    where = "target_return IS NOT NULL" + (" AND ticker = :t" if ticker else "")
+    params = {"t": ticker} if ticker else {}
+    dates = pd.read_sql(text(f"SELECT date FROM signals WHERE {where}"),
+                        engine, params=params)
+    if dates.empty:
+        return 0
+    return int(session_calendar().session_mask(dates["date"]).sum())

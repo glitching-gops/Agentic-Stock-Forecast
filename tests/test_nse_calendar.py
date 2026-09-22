@@ -236,6 +236,59 @@ def test_the_label_guard_still_refuses_a_row_lost_on_a_session():
             _upsert_signals(conn, "T.NS", _frame(["2026-01-13", "2026-01-16"]))
 
 
+def test_the_job_level_label_count_ignores_phantom_rows(monkeypatch):
+    """
+    The guard BOTH jobs read, not the write-boundary one.
+
+    Measured 2026-09-22: the daily job aborted twice on the first run after the
+    phantom fix, because removing Yahoo's holiday rows lowered this total
+    (222,514 -> 222,378) and it counted them as labels. 49 tickers are still
+    refused by the benchmark outage, so without this the same abort returns the
+    day their index does.
+    """
+    import sqlalchemy as sa
+
+    import pipeline.signals as signals
+
+    engine = sa.create_engine("sqlite://")
+    with engine.connect() as conn:
+        conn.execute(sa.text(
+            "CREATE TABLE signals (ticker TEXT, date TEXT, target_return REAL)"))
+        for d in ("2026-01-13", "2026-01-14", "2026-01-15", "2026-01-16"):
+            conn.execute(sa.text("INSERT INTO signals VALUES ('T.NS', :d, 0.01)"),
+                         {"d": d})
+        conn.commit()
+    monkeypatch.setattr(signals, "get_engine", lambda: engine)
+
+    # Four labelled rows on file, one of them on a day NSE did not trade.
+    assert signals.count_labelled_rows() == 3
+    assert signals.count_labelled_rows("T.NS") == 3
+    assert signals.count_labelled_rows("OTHER.NS") == 0
+
+
+def test_signals_refuse_to_run_without_an_html_parser(monkeypatch):
+    """
+    No HTML parser means `earnings_surprise` — a pooled FACTOR — is written as
+    a constant 0.0 for every ticker, silently, because the fetch is caught.
+    Measured on the first locked CI run (2026-09-22).
+    """
+    import importlib.util
+
+    import pipeline.signals as signals
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda n, *a, **k: None if n in signals.HTML_PARSERS
+                        else real(n, *a, **k))
+    with pytest.raises(signals.EarningsParserMissing, match="requirements.txt"):
+        signals.require_earnings_parser()
+    with pytest.raises(signals.EarningsParserMissing):
+        signals.compute_and_store(tickers=["T.NS"])
+
+    monkeypatch.undo()
+    signals.require_earnings_parser()          # the real environment has one
+
+
 def test_a_phantom_row_cannot_stand_in_for_a_lost_session_label():
     """Both sides of the comparison count sessions only. If the INCOMING side
     counted every row, a frame that loses a real session's label but carries a

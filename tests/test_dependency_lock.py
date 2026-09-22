@@ -95,6 +95,20 @@ def test_the_serving_lock_carries_nothing_render_does_not_import():
         f"locks (see the torch landmine in CLAUDE.md).")
 
 
+def test_the_serving_lock_carries_an_html_parser():
+    """
+    yfinance 1.3.0 declares no HTML parser, but `earnings_dates` needs one, and
+    without it `earnings_surprise` — a pooled FACTOR — is silently written as a
+    constant 0.0. Measured on the first locked CI run (2026-09-22): production
+    had been resolving yfinance 1.7.0, which pulls lxml in by itself.
+    """
+    from pipeline.signals import HTML_PARSERS
+
+    pins = parse_lock(REPO / "requirements.txt")
+    assert any(p in pins for p in HTML_PARSERS), (
+        f"requirements.txt pins none of {list(HTML_PARSERS)}")
+
+
 def test_the_evidence_lock_carries_the_grading_packages():
     pins = parse_lock(REPO / "requirements-evidence.txt")
     assert {"arch", "linearmodels"} <= set(pins)

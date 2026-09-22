@@ -283,3 +283,70 @@ asterisk.
 - `requirements-scoring.txt` and `requirements-series.txt` are not locked
   (torch, transformers, chronos). The workflows install them before the lock so
   they cannot move a locked package, but their own versions float.
+
+---
+
+## 6. What the first locked production run found (2026-09-22)
+
+The daily job ran on `203b111` and **succeeded** — the phantom fix worked as
+designed (`[Fetch] dropped Yahoo bars on 5 date(s) NSE did not trade:
+2026-01-15, 2026-05-01, 2026-05-28, 2026-06-26, 2026-09-14`), the lock check
+passed at 88 pins, and the new gate check reported no market-wide flat bar. It
+also exposed two regressions from this session's own work, both now fixed.
+
+### 6.1 The lock dropped an undeclared dependency, and a FACTOR went constant
+
+**Measured, by diffing the two runs' install logs.** Production had never been
+pinned, so it resolved **yfinance 1.7.0**, which depends on `lxml`. The lock
+pins the researched **yfinance 1.3.0**, which declares neither `lxml` nor
+`html5lib` — so the locked runner had no HTML parser, and
+`yf.Ticker().earnings_dates` (pandas `read_html` underneath) raised for all 84
+tickers. `compute_earnings_surprise` catches that and writes **0.0**.
+
+`earnings_surprise` is one of the 15 pooled FACTORS. Nothing failed, nothing
+was empty: **the 35 tickers the run could write now hold a constant-zero
+column across their whole history** (~85,600 rows, 0 non-zero values), while
+the 49 the benchmark outage refused still carry ~1,450 real values each. That
+is the FinBERT gauge and the FII-flow zeros for the third time — a failed
+measurement stored as a valid neutral value.
+
+Fixed twice over: `lxml` is pinned in `requirements.in`, and
+`signals.require_earnings_parser()` refuses to compute signals at all when no
+parser is importable, before the ticker loop, so a pin the environment fails to
+honour is loud rather than invisible. It self-heals: the next daily run on the
+fix rewrites those 35 tickers' full history with real values.
+
+**The wider lesson about the lock itself:** freezing to the researched versions
+*downgraded* production, which had drifted well ahead — yfinance 1.7.0 → 1.3.0,
+xgboost 3.4.1 → 3.2.0, pandas 3.0.6 → 3.0.2, numpy 2.5.3 → 2.4.4. That is the
+intended trade (the stored numbers are only reproducible against the versions
+that produced them), but it means **production's behaviour moves backwards at
+the moment a lock lands**, and anything the newer versions were quietly
+providing goes with it.
+
+### 6.2 The job-level F6 guard counted phantom rows as labels
+
+The write-boundary guard excused rows on days NSE did not trade; the guard BOTH
+JOBS read — `count_labelled_rows()` — did not. Each ticker's first clean
+rewrite therefore lowered the total (222,514 → 222,378) and the daily job
+**aborted twice** (17:13, 17:28) before a third attempt passed with the drop
+already applied. It was a trap, not a one-off: 49 tickers are still refused by
+the sector-index outage, so the day their index returns, the same abort would
+hit the daily job and the weekly one — the latter before persisting any
+evaluation. `count_labelled_rows` now counts sessions only, in one place.
+
+### 6.3 What was NOT caused by this session, checked rather than assumed
+
+**The 49 refused tickers are the standing vendor outage.** The identical
+49-name list appears in `experiment_runs.metrics` for every daily run since
+**2026-09-16**, six days before the merge, and every one of them is mapped to a
+dead Yahoo sector index (`^CNXAUTO`, `^CNXCONSUM`, `^CNXENERGY`, `^CNXFMCG`,
+`^CNXINFRA`, `^CNXMETAL`, `^CNXREALTY`). Their signals have been stale since
+2026-09-15 and their labels are intact, which is the F6 guard working.
+
+**One gate WARN disappeared, and that is not evidence of health.**
+`sessions_are_contiguous` warned on 48 tickers before the merge and passes
+after. The check compares stored signal rows against `ohlcv` sessions in range;
+`ohlcv` has lost the phantom dates while the 49 refused tickers' signals still
+carry them, so the difference it measures has inverted rather than closed. It
+will read correctly once those tickers write again.
