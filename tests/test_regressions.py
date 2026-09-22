@@ -2931,7 +2931,11 @@ def _gate_fixture(rows=600, duplicate=False, future=False, infinite=False):
             f"CREATE TABLE signals (ticker TEXT, date TEXT, close REAL, "
             f"target_return REAL, target_excess_return REAL, "
             f"benchmark_return REAL, {cols})"))
-        conn.execute(text("CREATE TABLE ohlcv (ticker TEXT, date TEXT, close REAL)"))
+        # The real ohlcv columns (pipeline.fetch.OHLCV_COLUMNS): a check that
+        # reads open/high/low/volume raised on the old three-column copy.
+        conn.execute(text(
+            "CREATE TABLE ohlcv (ticker TEXT, date TEXT, open REAL, high REAL, "
+            "low REAL, close REAL, adj_close REAL, volume REAL)"))
         conn.execute(text(
             "CREATE TABLE corporate_actions (ticker TEXT, date TEXT, "
             "action_type TEXT, ratio REAL, amount REAL, implausible INTEGER)"))
@@ -2949,7 +2953,9 @@ def _gate_fixture(rows=600, duplicate=False, future=False, infinite=False):
                 {"t": "TEST.NS", "d": day, "c": 100.0 + i * 0.01, "tr": 0.01,
                  "te": 0.01 if i < rows - 30 else None, "br": 0.0, **values},
             )
-            conn.execute(text("INSERT INTO ohlcv VALUES ('TEST.NS', :d, 100.0)"),
+            conn.execute(text("INSERT INTO ohlcv (ticker, date, open, high, low, "
+                              "close, adj_close, volume) VALUES ('TEST.NS', :d, "
+                              "99.5, 100.5, 99.0, 100.0, 100.0, 1000.0)"),
                          {"d": day})
 
         if duplicate:

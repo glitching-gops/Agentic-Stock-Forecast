@@ -351,6 +351,72 @@ def check_sessions_are_contiguous(engine, universe) -> Check:
                  f"{', '.join(gapped[:8])}")
 
 
+#: How far back the market-wide flat-bar check looks. Recent only: its job is
+#: to catch a NEW holiday the calendar missed, and the one known historical
+#: instance (2025-03-18, a real session Yahoo serves as a flat bar) would
+#: otherwise turn the gate WARN on every run forever, which is decoration.
+FLAT_BAR_LOOKBACK_DAYS = 90
+#: A date is suspect when at least this share of at least this many tickers
+#: carry a flat, zero-volume bar. A real session never does: across ten years
+#: the share on a traded day is ~0 (measured 2026-09-21), and on a Yahoo
+#: holiday bar it is 1.0.
+FLAT_BAR_SHARE = 0.9
+FLAT_BAR_MIN_TICKERS = 10
+
+
+def check_no_market_wide_flat_bars(engine, universe) -> Check:
+    """
+    No recent date may carry a flat, zero-volume bar for the whole market.
+
+    That is the exact signature of the Yahoo holiday bar the NSE calendar in
+    `pipeline/fetch.py` exists to remove — open = high = low = close = the
+    previous close, volume 0, for every ticker. Seeing it here means one of two
+    things, and the detail says which: the calendar did not know the date was a
+    holiday (an ad hoc closure announced after `data/nse_calendar.json` was
+    committed), or NSE DID trade and Yahoo has no prices for the day (as it
+    does for 2025-03-18). Either way the day's returns are fiction.
+
+    Warns rather than fails: the bar changes a feature by one session's return
+    and a published forecast survives it, so it must be visible, not fatal.
+    """
+    since = (pd.Timestamp.today().normalize()
+             - pd.Timedelta(days=FLAT_BAR_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    by_date = pd.read_sql(
+        text("""
+            SELECT date,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN volume = 0 AND open = high AND high = low
+                                 AND low = close THEN 1 ELSE 0 END) AS flat
+              FROM ohlcv
+             WHERE date >= :since
+             GROUP BY date
+        """),
+        engine, params={"since": since},
+    )
+    if by_date.empty:
+        return Check("no_market_wide_flat_bars", WARN, "no recent ohlcv rows")
+    bad = by_date[(by_date["n"] >= FLAT_BAR_MIN_TICKERS)
+                  & (by_date["flat"] >= FLAT_BAR_SHARE * by_date["n"])]
+    if bad.empty:
+        return Check("no_market_wide_flat_bars", PASS,
+                     f"no market-wide flat bar since {since}")
+
+    from data import nse_calendar
+
+    calendar = nse_calendar.current()[0]
+    notes = []
+    for d in sorted(bad["date"].astype(str)):
+        try:
+            kind = ("NSE traded - Yahoo has no prices" if calendar.is_session(d)
+                    else "NSE did NOT trade - a phantom session got in")
+        except nse_calendar.CalendarNotCurrent:
+            kind = "outside the NSE calendar"
+        notes.append(f"{d} ({kind})")
+    return Check("no_market_wide_flat_bars", WARN,
+                 f"{len(notes)} date(s) with a flat zero-volume bar across the "
+                 f"market: {'; '.join(notes)}")
+
+
 CHECKS = [
     check_no_duplicate_signal_rows,
     check_no_future_dates,
@@ -361,6 +427,7 @@ CHECKS = [
     check_price_breaks_are_explained,
     check_target_distribution,
     check_sessions_are_contiguous,
+    check_no_market_wide_flat_bars,
 ]
 
 

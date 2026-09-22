@@ -23,6 +23,13 @@ Pytest configuration.
    * GUARD. `get_engine` refuses any non-SQLite engine for the rest of the
      session. This catches the other route: something later reassigning
      `data.db.DATABASE_URL` or reloading the module after the override.
+
+3. THE SUITE NEVER ASKS NSE FOR ITS HOLIDAY LIST (2026-09-21). The fetch step
+   and the signals write guard both read `data.nse_calendar.current()`, which
+   merges NSE's live list into the committed file. Here the live fetch always
+   fails, so every test sees exactly `data/nse_calendar.json` — the fall-back
+   path production takes when NSE does not answer — and no test depends on the
+   network or on what NSE published today.
 """
 import os
 import sys
@@ -59,3 +66,19 @@ def _suite_get_engine():
 
 
 _db.get_engine = _suite_get_engine
+
+import pytest  # noqa: E402
+
+import data.nse_calendar as _nse_calendar  # noqa: E402
+
+
+def _no_network_holiday_list(year, session=None):
+    raise RuntimeError("the test suite never fetches NSE's holiday list")
+
+
+@pytest.fixture(autouse=True)
+def _offline_nse_calendar(monkeypatch):
+    monkeypatch.setattr(_nse_calendar, "fetch_holiday_master", _no_network_holiday_list)
+    _nse_calendar._current.clear()
+    yield
+    _nse_calendar._current.clear()

@@ -44,12 +44,23 @@ second is what it must never be relaxed into. tests pin this.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
+from data import nse_calendar
 from data.db import get_engine
 from pipeline.signals import FEATURE_COLS
+
+logger = logging.getLogger(__name__)
+
+
+def drop_non_sessions(panel: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """`panel` without rows on dates NSE did not trade, by the COMMITTED
+    calendar - no network on the panel path - and the dates removed."""
+    return nse_calendar.drop_non_sessions(panel, nse_calendar.load())
 
 # Macro columns joined onto every row by date. Kept here rather than imported
 # from pipeline.model so that the panel does not pull in XGBoost; a test pins
@@ -183,6 +194,16 @@ def load_panel(
     panel = pd.read_sql(text(sql), engine, params=params)
     if panel.empty:
         return panel
+
+    # NO DAY NSE DID NOT TRADE REACHES A PANEL (2026-09-21). `pipeline/fetch.py`
+    # now refuses Yahoo's holiday bars at ingestion, but a ticker whose signals
+    # write was refused by the label guard keeps the rows it had, phantoms
+    # included, until a clean run lands. Filtering here as well means no panel
+    # depends on every ticker having been rewritten since the fix.
+    panel, phantom = drop_non_sessions(panel)
+    if phantom:
+        logger.warning("load_panel: dropped rows on %d date(s) NSE did not trade: %s",
+                       len(phantom), ", ".join(phantom))
 
     for col in ("benchmark_close", "benchmark_ticker"):
         if col not in panel.columns:

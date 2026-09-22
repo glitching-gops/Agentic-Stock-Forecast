@@ -504,15 +504,32 @@ def _labelled_rows_from(conn, ticker: str, start: str) -> dict[str, int]:
     DELETE over the range, it would erase every historical excess label the
     ticker had from before its index went dark. That is F6 exactly, reappearing
     through the door the target switch opened.
+
+    ONLY LABELS ON DAYS NSE TRADED ARE PROTECTED (2026-09-21). A row stored on
+    a holiday Yahoo invented a bar for is a defect, not training data, and
+    `pipeline/fetch.py` now removes those days. Counting them here would make
+    the first clean recompute a "decrease" for every ticker and refuse the lot.
+    Nothing else is excused: a label lost to a vendor gap on a real session,
+    or to a feature turning NaN, still refuses the write.
     """
+    calendar = session_calendar()
     counts = {}
     for col in LABEL_COLS:
-        counts[col] = int(conn.execute(
-            text(f"SELECT COUNT(*) FROM signals WHERE ticker = :t "
+        dates = [r[0] for r in conn.execute(
+            text(f"SELECT date FROM signals WHERE ticker = :t "
                  f"AND date >= :start AND {col} IS NOT NULL"),
             {"t": ticker, "start": start},
-        ).scalar() or 0)
+        )]
+        counts[col] = int(calendar.session_mask(dates).sum()) if dates else 0
     return counts
+
+
+def session_calendar():
+    """The NSE calendar the fetch step used this run. Indirected so a test can
+    hand the write guard a calendar without a network."""
+    from data import nse_calendar
+
+    return nse_calendar.current()[0]
 
 
 def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
@@ -547,9 +564,13 @@ def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
 
     start = df["date"].min()
     existing = _labelled_rows_from(conn, ticker, start)
+    # Both sides are counted over NSE sessions only, so the comparison is like
+    # with like whether or not the incoming frame still carries a phantom row.
+    on_session = session_calendar().session_mask(df["date"])
 
     for col in LABEL_COLS:
-        incoming = (int(df[col].notna().sum()) if col in df.columns else 0)
+        incoming = (int((df[col].notna().to_numpy() & on_session).sum())
+                    if col in df.columns else 0)
         if incoming < existing[col]:
             raise LabelLossRefused(
                 f"{ticker}: this frame would drop {col} from {existing[col]} to "

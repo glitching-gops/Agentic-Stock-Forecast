@@ -168,3 +168,10 @@ hygiene_*.log
 # 2026-09-11). Regenerated from the source tree by /graphify, and it records
 # absolute local paths, so it is machine-local rather than project truth.
 graphify-out/
+
+# Pre-universe hygiene (2026-09-21): the calendar-controlled panel rebuild
+# (tools/phantom_rebuild.py) and the Stage 1 re-run's per-job artifacts. The
+# findings live in docs/; the *.npz predictions are covered by *.npz above.
+panel_cache_control.parquet
+panel_cache_clean.parquet
+stage1_rerun/

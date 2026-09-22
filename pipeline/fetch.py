@@ -21,6 +21,15 @@ Two changes fix it:
 ``detect_adjustment_breaks()`` reports where the ratio between raw and adjusted
 close changes, which the validation gate uses to catch corporate actions that
 arrived mid-window.
+
+A THIRD CHANGE, 2026-09-21: ONLY NSE SESSIONS ARE STORED. Yahoo answers an NSE
+holiday with a bar for every ticker — open = high = low = close = the previous
+close, volume 0 — and this module stored it, so the panel carried 2026-01-15,
+05-01, 05-28, 06-26 and 09-14 as trading days. Every fetched frame now passes
+through `data.nse_calendar`, built from NSE's own holiday list and delivery
+archive, and a date NSE did not trade never reaches the table. Because each
+run replaces the whole 10-year window, the first run after this change also
+removes every phantom row already stored.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import pandas as pd
 import yfinance as yf
 from sqlalchemy import text
 
+from data import nse_calendar
 from data.db import get_engine
 
 PERIOD   = "10y"          # was "2y" — the 30-day target with ~250 usable rows
@@ -62,6 +72,22 @@ def _normalise(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     out = df[OHLCV_COLUMNS].dropna(subset=["close", "adj_close"])
     return out[out["close"] > 0].reset_index(drop=True)
+
+
+def sessions_only(frames: dict[str, pd.DataFrame], calendar: nse_calendar.NSECalendar
+                  ) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """
+    Every frame with the dates NSE did not trade removed, and those dates.
+
+    Raises `CalendarNotCurrent` for a date in a year the calendar does not
+    cover. That is deliberate: storing the window unfiltered would put every
+    holiday bar of the new year back in, and nothing downstream could tell.
+    """
+    kept, dropped = {}, set()
+    for ticker, df in frames.items():
+        kept[ticker], gone = nse_calendar.drop_non_sessions(df, calendar)
+        dropped.update(gone)
+    return kept, sorted(dropped)
 
 
 def _download_batch(tickers: list[str]) -> dict[str, pd.DataFrame]:
@@ -128,11 +154,16 @@ def fetch_and_store(single_ticker: str | None = None, tickers: list[str] | None 
             print("[Fetch] Universe is empty — run data.universe.sync_current_membership() first.")
             return 0
 
+    calendar, note = nse_calendar.current()
+    print(f"[Fetch] NSE calendar: {note}")
+
     total = 0
+    removed: set[str] = set()
     for i in range(0, len(to_fetch), BATCH):
         batch = to_fetch[i:i + BATCH]
         print(f"[Fetch] Downloading {i + 1}-{i + len(batch)} of {len(to_fetch)}...")
-        frames = _download_batch(batch)
+        frames, dropped = sessions_only(_download_batch(batch), calendar)
+        removed.update(dropped)
 
         with engine.connect() as conn:
             for ticker, df in frames.items():
@@ -146,6 +177,9 @@ def fetch_and_store(single_ticker: str | None = None, tickers: list[str] | None 
         if missing:
             print(f"[Fetch] no data returned for: {', '.join(sorted(missing))}")
 
+    if removed:
+        print(f"[Fetch] dropped Yahoo bars on {len(removed)} date(s) NSE did not "
+              f"trade: {', '.join(sorted(removed))}")
     print(f"[Fetch] Complete. {total} rows written across {len(to_fetch)} tickers.")
     return total
 
