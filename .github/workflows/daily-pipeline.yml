@@ -28,8 +28,14 @@ jobs:
           python-version: "3.12.0"
           cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      # requirements.txt is a LOCK (generated from requirements.in by uv, every
+      # package pinned with hashes), so pip installs in hash-checking mode and
+      # refuses anything it does not name. The check after it fails the job if
+      # the environment is not exactly the lock.
+      - name: Install dependencies (locked)
+        run: |
+          pip install -r requirements.txt
+          python tools/check_locked_env.py requirements.txt
 
       # Restores whatever the most recent run (daily OR weekly) saved.
       # Cache keys must be unique to be saved, so restore uses a prefix match

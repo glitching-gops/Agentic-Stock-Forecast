@@ -1,0 +1,73 @@
+# THE INPUT FILE. Edit THIS, never requirements.txt.
+#
+# requirements.txt is GENERATED from this file and pins the ENTIRE dependency
+# tree, transitive packages included, for Linux AND Windows on Python >= 3.12.
+# A floating transitive version moves results exactly as a direct one does, and
+# every number in docs/ is only reproducible against the versions it was
+# measured on. To add or upgrade a dependency, see "Dependencies" in CLAUDE.md
+# section 8: edit this file, re-run tools/lock_requirements.ps1, commit both.
+#
+# Render installs requirements.txt and ONLY that. Nothing that the API does not
+# import belongs here (torch's Phase 0 removal, and the arch/linearmodels split
+# into requirements-evidence.in, are the two standing examples).
+# Data
+yfinance>=0.2.40
+pandas>=2.2.2
+numpy>=1.26.4
+scipy>=1.13.0
+sqlalchemy>=2.0.30
+ta>=0.11.0
+feedparser
+# requests, httpx and psycopg2-binary were exact-pinned at 2.32.3 / 0.27.0 /
+# 2.9.9 in May 2026 with no recorded reason, while every local run since used
+# 2.33.1 / 0.28.1 / 2.9.12. The lock (2026-09-21) takes the local versions:
+# psycopg2-binary 2.9.9 ships no wheel for Python 3.13, so the old pin could
+# not install on the development interpreter at all. None of the three touches
+# a number; all three are I/O. Bounds only here - the exact version is the lock's.
+requests>=2.32.3
+httpx>=0.27.0
+
+# Modelling
+xgboost>=2.0.3
+scikit-learn>=1.4.2
+optuna>=3.6.1
+joblib
+
+# Agents / LLM
+langgraph
+langchain
+langchain-groq
+groq
+
+# Backend
+fastapi>=0.111.0
+uvicorn>=0.30.1
+pydantic>=2.7.1
+psycopg2-binary>=2.9.9
+
+# Ops
+apscheduler
+python-dotenv>=1.0.1
+pytz>=2024.1
+
+# Tests
+pytest>=8.0.0
+
+# transformers went with it. Its only use was FinBERT sentiment scoring, which
+# needs torch and therefore failed to load on every production run since Phase 0
+# ("Error loading FinBERT: name 'torch' is not defined"), scoring nothing while
+# the dashboard displayed a permanently-neutral gauge. Headlines are now stored
+# unscored — see pipeline/sentiment.py. Restoring a scorer is a Phase 2 item and
+# needs a dated news archive before it can be backtested at all.
+#
+# torch was removed in Phase 0. It was needed only by the LSTM, which never
+# wrote a checkpoint and so never produced a forecast; that module now lives in
+# pipeline/archived/ and is not imported anywhere on the live path. Dropping it
+# also removes the largest contributor to memory pressure on the free tier.
+# Reinstall it if experiment E3 brings the ensemble back.
+
+# streamlit and plotly went with the app/ directory. The Streamlit dashboard was
+# retired once the Next.js frontend took over; it was the ONLY consumer of
+# either package, and both were being installed on Render — which serves the
+# API and has never rendered a chart. plotly alone is ~15MB on an instance that
+# has already been OOM-killed once.

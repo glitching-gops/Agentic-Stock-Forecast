@@ -1,0 +1,18 @@
+# THE INPUT FILE for research-only dependencies. Edit THIS, never
+# requirements-research.txt, which is GENERATED and constrained by the serving
+# lock exactly as requirements-evidence.txt is.
+#
+# Installed on a research machine only: NOT by Render, NOT by the daily or
+# weekly jobs. Install with
+#
+#     pip install -r requirements.txt -r requirements-evidence.txt -r requirements-research.txt
+#
+# Found 2026-09-21 by building an environment from the locks alone: every
+# research tool reads panel_cache.parquet through pandas.read_parquet, which
+# needs a parquet engine, and none was declared anywhere - the numbers in docs/
+# were produced with the pyarrow that happened to be installed. pandas 3 also
+# backs its default string dtype with pyarrow WHEN IT IS PRESENT, so this is
+# not only an I/O dependency.
+-c requirements.txt
+
+pyarrow

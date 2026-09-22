@@ -160,7 +160,19 @@ def environment_fingerprint() -> dict:
     exist: when a metric moves while one of them is constant, it says which of
     code, data or environment caused it. Before P6 there was no third one, and
     a thread-count change would have read as a code change.
+
+    THE OPERATING SYSTEM IS PART OF IT (2026-09-21). With every library version
+    and the thread count identical, the h=30 baseline is bit-identical run to
+    run on Windows and run to run on Linux, and DIFFERENT between them - max
+    drift 0.64, fold 4 choosing gamma 0.172 on Linux against 3.188 on Windows.
+    The cause is XGBoost's row and column subsampling: the same seed draws a
+    different sample under MSVC's C++ standard library than under GCC's,
+    because the standard fixes the generator but not the distributions. A fit
+    with `subsample` and `colsample_bytree` at 1.0 is identical on both.
     """
+    import platform
+    import sys
+
     import numpy
     import pandas
 
@@ -172,6 +184,9 @@ def environment_fingerprint() -> dict:
             return "absent"
 
     return {
+        "platform": sys.platform,
+        "machine": platform.machine(),
+        "python": platform.python_version(),
         "xgb_threads": xgb_threads(),
         "xgb_threads_pinned_default": XGB_THREADS,
         "xgb_threads_overridden": xgb_threads() != XGB_THREADS,

@@ -58,10 +58,14 @@ jobs:
           python-version: "3.12.0"
           cache: "pip"
 
+      # The unlocked foundation-model extras FIRST, then the lock, which puts
+      # back any locked package they moved; the check proves it. Same order and
+      # reason as weekly-evaluation.yml.
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
           pip install -r requirements-series.txt
+          pip install -r requirements.txt
+          python tools/check_locked_env.py requirements.txt
 
       - name: Cache the model weights
         uses: actions/cache@v4

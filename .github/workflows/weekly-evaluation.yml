@@ -30,18 +30,25 @@ jobs:
           python-version: "3.12.0"
           cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
       # The news scorer only. CPU wheels, ~200MB, and NOT in requirements.txt —
       # that file is installed by Render and by the daily job, neither of which
       # scores anything, and torch was removed in Phase 0 as the largest
       # contributor to memory pressure on an instance already OOM-killed once.
       # `continue-on-error` because a scorer that will not install must cost a
       # recorded skip, not an hour of persisted per-ticker evaluation.
+      #
+      # FIRST, since the 2026-09-21 lock. torch and transformers are not locked,
+      # and their install may move a package the lock pins. Installing the lock
+      # AFTER them puts every locked package back at its pinned version, and the
+      # check below proves it. (The lock cannot be passed to this step as a `-c`
+      # constraint: a hashed constraints file switches pip into hash-checking
+      # mode, which then refuses the unpinned torch.)
       - name: Install news-scoring extras
         continue-on-error: true
         run: pip install -r requirements-scoring.txt
+
+      - name: Install dependencies (locked)
+        run: pip install -r requirements.txt
 
       # The evidence layer's grading-time extras (Stage 0c): `arch` and
       # `linearmodels`. NOT in requirements.txt for torch's reason — Render
@@ -55,9 +62,20 @@ jobs:
       # notes, so a missing install costs both cross-checks SILENTLY.
       # `continue-on-error` for the scorer's reason: an install failure must
       # cost a recorded skip, never the persisted per-ticker evaluation.
-      - name: Install evidence-grading extras
+      - name: Install evidence-grading extras (locked)
         continue-on-error: true
         run: pip install -r requirements-evidence.txt
+
+      # Fails the job if any locked package is not at its pin. The evidence lock
+      # is checked only when it installed, so a failed optional step stays a
+      # recorded skip rather than becoming a failed run.
+      - name: Verify the environment is the lock
+        run: |
+          if python -c "import arch, linearmodels" 2>/dev/null; then
+            python tools/check_locked_env.py requirements.txt requirements-evidence.txt
+          else
+            python tools/check_locked_env.py requirements.txt
+          fi
 
       - name: Restore tuned hyperparameters cache
         uses: actions/cache/restore@v4
