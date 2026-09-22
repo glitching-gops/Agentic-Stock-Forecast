@@ -292,3 +292,74 @@ and the same floors as everything else in this project.
 
 **Next: P6, the horizon sweep.** Pre-registered at
 `docs/p6-preregistration.md`.
+
+---
+
+## Addendum — 2026-09-21: re-run under the new conditions. The asterisk is removed.
+
+**Pre-registered** in `docs/stage1-rerun-preregistration.md` (sha256
+`2469804d41f9c4918212d99c1c889eef4cca1682892dd06ae6d7013011369a72`, LF, fixed
+before any arm ran), **run by** `tools/stage1_rerun.py`. The correction notice at
+the top of this document said the verdicts were measured on a model that emitted
+~8 distinct predictions per date across 84 names, and so could partly be a fact
+about resolution rather than about the features. That is now tested, not argued.
+
+**The conditions changed; the pilots did not.** Same features, same ingestion,
+same construction (imported unchanged from the three pilot tools), same h=30,
+pooled × MAE, no ticker feature. What changed: the within-date standardised
+label, `XGB_THREADS` = 2, the locked libraries, and the calendar-clean panel
+(`panel_cache_clean.parquet`, the four 2026 phantom sessions removed). Windows,
+the platform the stored baseline was produced on.
+
+**S1 held three times.** The baseline re-run on each pilot's panel reproduces
+the stored post-fix baseline (`baseline_clean_oos.npz`) at drift **exactly
+0.0**, 160,104 of 160,104 rows.
+
+**The resolution confound is gone in every arm, measured.**
+
+| | old label (as run) | new label |
+|---|---|---|
+| median distinct predictions per date, 84 names | **8 - 12** (min 2-4) | **84** (min 83-84) |
+| constant (ticker, fold) cells of 420 | 3 - 9 | **0** |
+
+**All three stay null on R3.** Hypothesis arms, paired per-date cross-sectional
+IC gain over the baseline, Driscoll-Kraay SE at 30 lags:
+
+| pilot | hypothesis arm | old R3 | **new R3** | new R2 (placebos beaten) | verdict |
+|---|---|---|---|---|---|
+| 1 reversal | residual reversal, k = 1/5/10/20 | +0.0002, t +0.07 | **−0.00186, t −0.84** | 9 of 9 | NOT SIGNAL |
+| 2 delivery % | abnormal delivery | −0.00066, t −0.19 | **−0.00343, t −2.06** | 4 of 9 | NOT SIGNAL |
+| 3 SUE | SRW surprise, event window | −0.0055, t −0.56 | **−0.00061, t −0.16** | 9 of 9 | NOT SIGNAL |
+
+The other arms: raw reversal −0.00252 (t −1.66); delivery level +0.00544
+(t +1.61); SUE timing-only −0.00189 (t −0.51). **R5, the surprise over timing
+alone: +0.00128, t +0.36** — positive, which was pre-registered as a FAILED
+prediction (P4 expected it to fail) and does not matter, because R3 fails
+first. R4, descriptive: the SUE book trails the baseline book by 0.30% per
+rebalance net of the round trip (t −1.33).
+
+**Grades moved, and nothing else did.** Baselines and the reversal arms grade
+0 / 0 / 84. Delivery arms each lift one name to WEAK (WIPRO, CIPLA); the SUE arm
+three (CIPLA, MOTHERSON, WIPRO) — and **the timing-only arm, which carries no
+surprise at all, lifts six, one of them STRONG.** That is Pilot 3's
+identity-fingerprint finding again, on the new label: the grade movement comes
+from `sue_age` and `sue_missing`, not from the surprise.
+
+**Read against the placebo, with one thing the old runs could not show.**
+Every one of the 27 placebo retrains LOST cross-sectional IC against the
+baseline (−0.0016 to −0.0043). On the new label, adding two to four columns of
+within-date noise to the pooled model costs it ~0.003 of IC. So R2 now separates
+"less harmful than noise" from "worse than noise": reversal and SUE beat all nine
+of their placebos and are STILL below the baseline. Delivery's abnormal arm is
+inside its placebo band (4 of 9). **Its t −2.06 is a NEGATIVE deviation inside
+the placebo range, and at ~150 trials on this panel a best |t| near 3.2 is
+expected from noise.** Not a finding in either direction.
+
+**The pre-registered predictions:** P1 (S1 exact) held; P2 (every hypothesis
+arm fails R3) held; P3 held; **P4 (SUE fails R5) FAILED** — R5 is +0.00128;
+P5 (84 distinct per date, 0 constant cells in every arm) held.
+
+**Conclusion: the three Stage 1 nulls were the features.** Remove the
+resolution asterisk from this document. The track stays closed on the terms of
+§5; nothing in this addendum reopens it. Detail in
+`docs/pre-universe-hygiene-findings.md` §3.
