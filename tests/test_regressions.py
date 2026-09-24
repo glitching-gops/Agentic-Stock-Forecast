@@ -137,7 +137,10 @@ def test_the_model_version_moved_with_the_target():
                                  # v4 (2026-09-24): the sector benchmark is
                                  # panel-internal, so the features and the
                                  # excess label changed definition again.
-                                 "rebuild-absolute-return-v3"), (
+                                 "rebuild-absolute-return-v3",
+                                 # v5 (2026-09-24): thin-sector names get
+                                 # market-relative momentum instead of NULL.
+                                 "absolute-return-sector-loo-v4"), (
         "the target changed; a run before and after must be distinguishable "
         "in experiment_runs and _load_persisted_evaluation must discard the "
         "older evidence")

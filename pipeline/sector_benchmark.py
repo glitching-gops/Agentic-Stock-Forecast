@@ -26,10 +26,10 @@ LEAVE-ONE-OUT, ALWAYS. A stock inside its own benchmark is partly subtracted
 from itself — the `^CNX100` landmine, arrived at from the other side — and in a
 five-name sector that is a fifth of the benchmark.
 
-THIN SECTORS ARE MISSING, NOT FILLED. A leave-one-out mean over ONE peer is a
-pairwise spread, not a benchmark. Measured 2026-09-24 on the frozen 84 (20-
-session log returns, non-overlapping, nine sectors of >= 5 names): the mean of
-m random peers shares a median of
+THIN SECTORS FALL BACK TO THE MARKET, FEATURE AND LABEL ALIKE. A leave-one-
+out mean over ONE peer is a pairwise spread, not a benchmark. Measured
+2026-09-24 on the frozen 84 (20-session log returns, non-overlapping, nine
+sectors of >= 5 names): the mean of m random peers shares a median of
 
     m = 1: 0.58    m = 2: 0.74    m = 3: 0.85    m = 4: 0.92
 
@@ -38,24 +38,32 @@ m = 2: 0.65, FMCG). One peer leaves ~42% of the "benchmark" as a single other
 company's idiosyncratic move; two is the smallest mean whose variance is
 majority-shared with its sector in every sector measured. So
 `MIN_SECTOR_PEERS = 2`: a sector needs three names. Today 7 sectors hold one
-or two names — 11 of the 84 tickers — and for those the three `sector_rel_*`
-features are NULL, with `sector_rel_missing = 1`. Never 0.0: a zero is a
-position on the scale, indistinguishable downstream from "exactly in line with
-the sector", which is the silent-neutral defect this project has shipped three
-times. (3 peers would lose the same 11 today; 4 would lose 15.)
+or two names — 11 of the 84 tickers. (3 peers would lose the same 11; 4 would
+lose 15.)
 
-THE LABEL FALLS BACK, AND SAYS SO. `target_excess_return` still needs a
-benchmark for a thin-sector name, or the write guard refuses it forever and
-the name stays stale. It falls back to the leave-one-out equal-weighted
-UNIVERSE mean — the market as `regime.market_log_returns` defines it, minus
-the stock — and records `benchmark_sector_specific = 0`, exactly as the old
-mapping fell back to NIFTY 50 for sectors without a usable index. The
-FEATURE does not fall back: a column called `sector_rel` that silently means
-market-relative for a subset of names is a mislabelled column.
+Those names are benchmarked against the leave-one-out equal-weighted UNIVERSE
+mean — the market as `regime.market_log_returns` defines it, minus the stock —
+recorded as `benchmark_ticker = 'EW-LOO:MARKET'`, `benchmark_sector_specific
+= 0`. ONE `Benchmark` object serves both the `sector_rel_*` features and the
+excess label, so the two cannot disagree about the reference.
+
+WHY NOT NULL (v4 -> v5, 2026-09-24). v4 stored NULL `sector_rel_*` for the 11,
+with a `sector_rel_missing` flag. Honest, and an identity channel: NULL in
+three features on every date, always on the same 11 names, is a persistent
+group marker, and the pooled tree's missing-value branch learned which group
+paid in the early folds — +0.011 of cross-sectional IC (t +2.06) that NULLs on
+11 RANDOM names did not reproduce (docs/dashboard-switch-findings.md §1). A
+market-relative value is a real measurement against a different, recorded
+reference, not a neutral sentinel: it sits on the same scale as every other
+name's and marks nobody. The flag is RETIRED: "the reference is the market" is
+exactly `benchmark_sector_specific = 0`, already stored from the same object,
+and a second column for one fact is one that can drift. Neither is a model
+input.
 
 "UNKNOWN" IS MISSING, NEVER A SECTOR. An empty or absent industry label would
 otherwise pool every unlabelled name into one pseudo-sector and average
-unrelated companies — the silent-neutral fingerprint in a new place.
+unrelated companies — the silent-neutral fingerprint in a new place. An
+unlabelled name is benchmarked against the market, exactly like a thin one.
 
 WHAT THIS DOES NOT REMOVE. The sector LABEL still comes from outside: NSE's
 own constituent CSV (`data.universe.fetch_nse_constituents`, stored with
@@ -132,7 +140,6 @@ class Benchmark:
     ticker: str
     name: str                 # stored as signals.benchmark_ticker
     sector_specific: bool     # stored as signals.benchmark_sector_specific
-    relative_features: bool   # whether sector_rel_* may be computed against it
     peers: int                # names in the leave-one-out set
     frame: pd.DataFrame
 
@@ -204,7 +211,7 @@ def build_benchmarks(prices: pd.DataFrame, sectors: dict[str, str | None],
                               "benchmark_close": level.to_numpy(),
                               "bench_void_cum": void.cumsum().to_numpy()})
         out[t] = Benchmark(ticker=t, name=name, sector_specific=specific,
-                           relative_features=specific, peers=n_peers, frame=frame)
+                           peers=n_peers, frame=frame)
     return out
 
 
@@ -221,7 +228,7 @@ def index_benchmark(ticker: str, name: str, series: pd.DataFrame,
     frame["date"] = frame["date"].astype(str)
     frame["bench_void_cum"] = 0
     return Benchmark(ticker=ticker, name=name, sector_specific=sector_specific,
-                     relative_features=True, peers=0, frame=frame)
+                     peers=0, frame=frame)
 
 
 def load_universe_prices(tickers: list[str], engine=None) -> pd.DataFrame:

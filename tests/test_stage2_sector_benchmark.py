@@ -5,9 +5,9 @@ Pins the properties that make it a benchmark rather than a number:
 
   * leave-one-out: a stock's own price never reaches its own benchmark;
   * it IS the mean of the peers' daily log returns, cumulated;
-  * a thin sector (fewer than MIN_SECTOR_PEERS peers) gets NO sector features
-    — NULL with sector_rel_missing = 1, never 0.0 — and its excess label falls
-    back to the market, flagged sector_specific = 0;
+  * a thin sector (fewer than MIN_SECTOR_PEERS peers) falls back to the
+    leave-one-out MARKET for its features AND its excess label (v5), flagged
+    sector_specific = 0 — never NULL on those names, never 0.0;
   * "Unknown" / an empty label is missing, never a pseudo-sector;
   * a window spanning a date the peers could not form a mean is void;
   * NSE's constituent CSV without an industry column is refused, loudly.
@@ -66,11 +66,11 @@ def test_the_benchmark_is_the_mean_of_the_peers_log_returns():
     assert b.name == "EW-LOO:Big" and b.sector_specific and b.peers == 4
 
 
-def test_a_thin_sector_gets_no_sector_features_and_a_flagged_market_label():
+def test_a_thin_sector_falls_back_to_the_market_flagged():
     b = sb.build_benchmarks(_prices(), SECTORS)["T0.NS"]
     assert sb.MIN_SECTOR_PEERS == 2
     assert b.name == sb.MARKET_BENCHMARK
-    assert not b.sector_specific and not b.relative_features
+    assert not b.sector_specific
     # market fallback: every other name in the universe
     assert b.peers == 6
 
@@ -84,7 +84,7 @@ def test_unknown_is_missing_never_a_pseudo_sector():
     out = sb.build_benchmarks(_prices(), sectors)
     for t in ("S2.NS", "S3.NS", "S4.NS", "T0.NS", "T1.NS"):
         assert out[t].name == sb.MARKET_BENCHMARK, t
-        assert not out[t].relative_features
+        assert not out[t].sector_specific
     assert all(not b.name.endswith("Unknown") for b in out.values())
     # The two remaining "Big" names are a sector of 2: one peer each, thin.
     assert out["S0.NS"].name == sb.MARKET_BENCHMARK
@@ -140,22 +140,24 @@ def frozen_earnings(monkeypatch):
     monkeypatch.setattr(signals, "compute_earnings_surprise", fake)
 
 
-def test_thin_sector_features_are_null_with_an_indicator_never_zero(frozen_earnings):
+def test_thin_sector_features_are_market_relative_never_null(frozen_earnings):
+    """v5: a thin-sector name carries sector_rel_* against the leave-one-out
+    market — the same benchmark as its excess label — so its missingness is
+    exactly a sector name's. NULL on the same names every date was the v4
+    fingerprint."""
     prices = _prices()
     bm = sb.build_benchmarks(prices, SECTORS)
     thin = compute_signals_frame("T0.NS", _ohlcv(prices, "T0.NS"), bm["T0.NS"])
-    assert thin[list(SECTOR_REL_COLS)].isna().all().all()
-    assert (thin["sector_rel_missing"] == 1).all()
-    assert (thin[list(SECTOR_REL_COLS)] != 0.0).all().all()
-    # the excess label still exists, against the market, and says so
-    assert thin["target_excess_return"].notna().sum() > 0
+    big = compute_signals_frame("S0.NS", _ohlcv(prices, "S0.NS"), bm["S0.NS"])
+    assert thin[list(SECTOR_REL_COLS)].notna().all().all()
     assert (thin["benchmark_sector_specific"] == 0).all()
     assert (thin["benchmark_ticker"] == sb.MARKET_BENCHMARK).all()
-    # no row was DROPPED for the NULL features
-    big = compute_signals_frame("S0.NS", _ohlcv(prices, "S0.NS"), bm["S0.NS"])
+    assert thin["target_excess_return"].notna().sum() > 0
     assert len(thin) == len(big)
-    assert big[list(SECTOR_REL_COLS)].notna().all().all()
-    assert (big["sector_rel_missing"] == 0).all()
+    np.testing.assert_array_equal(thin[list(SECTOR_REL_COLS)].isna().to_numpy(),
+                                  big[list(SECTOR_REL_COLS)].isna().to_numpy())
+    # the flag is retired: benchmark_sector_specific carries its meaning
+    assert "sector_rel_missing" not in thin.columns
 
 
 def test_the_excess_label_is_stock_minus_benchmark_over_the_same_window(frozen_earnings):
@@ -215,3 +217,16 @@ def test_benchmark_names_are_human_readable():
     assert get_benchmark_name("EW-LOO:Healthcare") == "Healthcare peers (equal-weighted)"
     assert "rest of the universe" in get_benchmark_name(sb.MARKET_BENCHMARK)
     assert get_benchmark_name("^CNXIT") == "NIFTY IT"
+
+
+def test_a_three_name_sector_is_exactly_at_the_peer_boundary():
+    """MIN_SECTOR_PEERS = 2 means a sector of THREE names keeps its own
+    benchmark (two peers each) and a sector of two falls back to the market."""
+    tickers = ["A.NS", "B.NS", "C.NS", "D.NS", "E.NS", "M.NS"]
+    sectors = {"A.NS": "Three", "B.NS": "Three", "C.NS": "Three",
+               "D.NS": "Two", "E.NS": "Two", "M.NS": "Other"}
+    out = sb.build_benchmarks(_prices(tickers=tickers), sectors)
+    for t in ("A.NS", "B.NS", "C.NS"):
+        assert out[t].sector_specific and out[t].name == "EW-LOO:Three" and out[t].peers == 2
+    for t in ("D.NS", "E.NS"):
+        assert not out[t].sector_specific and out[t].name == sb.MARKET_BENCHMARK

@@ -261,10 +261,12 @@ def init_db():
                 pass  # Column already exists, skip
 
         # Non-numeric signal columns recording which benchmark was used.
-        # `sector_rel_missing` (2026-09-24, MODEL_VERSION v4): 1 where the
-        # sector_rel_* features are NULL — a thin or unlabelled sector has no
-        # panel-internal sector benchmark. An explicit indicator beside the
-        # NULLs, never a 0.0 standing in for them (pipeline/sector_benchmark.py).
+        # `sector_rel_missing` (2026-09-24, MODEL_VERSION v4) is RETIRED and no
+        # longer written (v5, the same day): thin sectors now take market-
+        # relative momentum, and "the reference is the market" is exactly
+        # `benchmark_sector_specific = 0` (pipeline/sector_benchmark.py). The
+        # column is kept so a fresh database matches the live one; rows written
+        # from v5 on hold NULL there. It was never a model input.
         for col, coltype in [("benchmark_ticker", "TEXT"),
                              ("benchmark_sector_specific", "INTEGER"),
                              ("sector_rel_missing", "INTEGER")]:

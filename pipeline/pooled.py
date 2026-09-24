@@ -30,8 +30,9 @@ THE MODEL, AND WHERE EACH CHOICE WAS MEASURED
   * The within-date STANDARDISED label (pipeline/label.py) — P6/Hygiene: it
     ends the tuner's gamma degeneracy and makes predictions fine-grained.
   * Nested Optuna search inside each purged fold, XGB_THREADS pinned.
-  * MISSING STAYS MISSING. The NULLABLE features (sector_rel_* for thin
-    sectors, earnings_surprise before vendor coverage, hurst warm-up) reach
+  * MISSING STAYS MISSING. The NULLABLE features (sector_rel_* in warm-up
+    and void windows, earnings_surprise before vendor coverage, hurst warm-up)
+    reach
     XGBoost as NaN, which it treats as missing with a learned default branch —
     `cross_sectional_zscore(keep_missing=True)`. Never 0.0.
 
@@ -59,7 +60,8 @@ from pipeline.baselines import FACTORS
 from pipeline.determinism import xgb_params
 from pipeline.evaluation import PurgedPanelWalkForward
 from pipeline.label import (CS_MEAN, CS_SD, MOMENT_COLS, attach_causal_moments,
-                            inverse_standardise, standardise_target)
+                            causal_moments, inverse_standardise,
+                            standardise_target)
 from pipeline.model import EVAL_N_FOLDS, EVAL_TUNE_TRIALS
 from pipeline.panel import SCALE_FREE, TARGET, cross_sectional_zscore
 from pipeline.signals import HORIZON_SESSIONS
@@ -67,7 +69,11 @@ from pipeline.signals import HORIZON_SESSIONS
 #: The shadow model's own identifier, recorded on every shadow row beside the
 #: config, data and environment hashes. Bump it whenever anything below
 #: changes what the model is — the per-ticker MODEL_VERSION does not cover it.
-POOLED_MODEL_VERSION = "pooled-std-mae-noticker-v1"
+# v2 (2026-09-24): thin-sector names carry market-relative sector_rel_*
+# instead of NULL (MODEL_VERSION v5), and the interval is spread-normalised
+# (`spread_frame`, conformal.ScaledConformalCalibration). Pre-registered in
+# docs/stage2-fallback-conformal-preregistration.md.
+POOLED_MODEL_VERSION = "pooled-std-mae-noticker-v2"
 
 FEATURES: list[str] = list(FACTORS)
 OBJECTIVE = "mae"
@@ -78,6 +84,13 @@ N_FOLDS = EVAL_N_FOLDS
 N_TRIALS = EVAL_TUNE_TRIALS
 HORIZON = HORIZON_SESSIONS
 RANDOM_STATE = 42
+#: Trailing window, in grid dates, of the PAST-ONLY cross-sectional spread the
+#: conformal interval is scaled by (`spread_frame`). One trading month: short
+#: enough to be the current spread, long enough not to be one date's noise.
+#: Fixed in the pre-registration and not swept. Deliberately NOT the inverse's
+#: 252-date `MOMENT_LOOKBACK`, which trails the fold-level dispersion drift that
+#: failed the constant-width gate by about half a year.
+SPREAD_LOOKBACK = 21
 
 #: Raw-label copy kept beside the standardised target, so the inverse can be
 #: scored against the quantity the dashboard publishes.
@@ -252,6 +265,24 @@ def causal_frame(panel: pd.DataFrame, horizon: int = HORIZON) -> pd.DataFrame:
     est = attach_causal_moments(panel[["date", "ticker", TARGET]], horizon=horizon)
     return (est[["date", CS_MEAN, CS_SD]].drop_duplicates("date")
             .rename(columns={CS_MEAN: "causal_mean", CS_SD: "causal_sd"}))
+
+
+def spread_frame(panel: pd.DataFrame, horizon: int = HORIZON,
+                 lookback: int = SPREAD_LOOKBACK) -> pd.DataFrame:
+    """
+    Per-date PAST-ONLY cross-sectional spread of the raw label, for scaling the
+    conformal interval: the mean realised cross-sectional sd of the
+    `horizon`-session label over the `lookback` grid dates ending `horizon`
+    dates before each date. The label dated t - horizon spans [t - horizon, t]
+    and is realised at t's close, so nothing later is read — the same two lags
+    as `label.causal_moments`, which computes it. Using the date's OWN realised
+    sd would be reading the 30 sessions after the forecast.
+    """
+    if all(c in panel.columns for c in MOMENT_COLS):
+        raise ValueError("spread_frame needs the RAW panel, not a standardised one")
+    est = causal_moments(panel[["date", "ticker", TARGET]], horizon=horizon,
+                         lookback=lookback, min_dates=lookback)
+    return est[["date", CS_SD]].rename(columns={CS_SD: "interval_spread"})
 
 
 def invert(preds: pd.DataFrame, causal: pd.DataFrame,

@@ -16,6 +16,15 @@ landmine. These panels separate that mechanism from information:
                   73 — the fingerprint without the names that carry it
 
     python tools/stage2_diagnose.py --panel stage2/panel_new.parquet --out-dir stage2/diag
+
+FROM v5 ON (2026-09-24, docs/stage2-fallback-conformal-preregistration.md §2)
+the production panel IS the fallback arm, so the comparison is re-run from it
+the other way round (`--from-v5`):
+
+    real11        the NULLs put back on the REAL 11 thin names — v4 rebuilt
+    placebo_<k>   the NULLs on 11 RANDOM names of the 73, as before
+
+    python tools/stage2_diagnose.py --from-v5 --panel stage2/v5/panel_v5.parquet --out-dir stage2/v5
 """
 
 from __future__ import annotations
@@ -48,13 +57,53 @@ def market_relative(panel: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     return out
 
 
+def thin_names(panel: pd.DataFrame) -> list[str]:
+    """The names benchmarked against the market (v5: flagged by
+    benchmark_sector_specific = 0; there is no NULL pattern to find them by)."""
+    spec = panel.groupby("ticker")["benchmark_sector_specific"].max()
+    return sorted(spec[spec == 0].index)
+
+
+def with_nulls(panel: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    """`panel` with sector_rel_* NULL on every row of `tickers` — the v4
+    representation, placed on whichever names are given."""
+    p = panel.copy()
+    p.loc[p["ticker"].isin(tickers), list(SECTOR_REL_COLS)] = np.nan
+    return p
+
+
+def placebo_draws(thin: list[str], all_tickers: list[str], draws: int) -> list[list[str]]:
+    """The same seeded draws of 11 random non-thin names the last session used."""
+    others = sorted(set(all_tickers) - set(thin))
+    rng = np.random.default_rng(20260924)
+    return [sorted(rng.choice(others, size=len(thin), replace=False)) for _ in range(draws)]
+
+
+def main_from_v5(args) -> None:
+    panel = pd.read_parquet(args.panel)
+    thin = thin_names(panel)
+    with_nulls(panel, thin).to_parquet(args.out_dir / "panel_real11.parquet", index=False)
+    meta = {"thin": thin, "placebos": {}}
+    for k, fake in enumerate(placebo_draws(thin, list(panel["ticker"].unique()), args.draws)):
+        with_nulls(panel, fake).to_parquet(args.out_dir / f"panel_placebo_{k}.parquet",
+                                           index=False)
+        meta["placebos"][k] = fake
+    (args.out_dir / "diagnose.json").write_text(json.dumps(meta, indent=1))
+    print(json.dumps(meta, indent=1))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--panel", type=Path, required=True)
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--draws", type=int, default=3)
+    ap.add_argument("--from-v5", action="store_true",
+                    help="build the real-11 and random-11 NULL arms from a v5 panel")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.from_v5:
+        main_from_v5(args)
+        return
     panel = pd.read_parquet(args.panel)
     thin = sorted(panel.loc[panel["sector_rel_missing"] == 1, "ticker"].groupby(
         panel["ticker"]).size().loc[lambda s: s > 0.5 * panel.groupby("ticker").size()

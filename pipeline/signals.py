@@ -61,9 +61,11 @@ TARGET_COLS = ["target_return", "target_excess_return", "benchmark_return"]
 #: of them used to be filled with a value that sits ON the scale:
 #:
 #:   sector_rel_*       0.0 when the benchmark was unavailable ("exactly in line
-#:                      with the sector"); now NULL for a thin sector, with
-#:                      `sector_rel_missing = 1` beside it. See
-#:                      pipeline/sector_benchmark.py.
+#:                      with the sector"). Since v5 every name has a benchmark
+#:                      (a thin sector falls back to the leave-one-out market,
+#:                      pipeline/sector_benchmark.py), so these are NULL only
+#:                      in warm-up and across a void window — rows every
+#:                      ticker shares, never a per-name marker.
 #:   earnings_surprise  0.0 before the vendor's first recorded announcement —
 #:                      88-94% of rows in 2016-2020, measured — i.e. "never
 #:                      observed" stored as "no surprise"; and, the other way
@@ -225,28 +227,28 @@ def compute_sector_momentum(df: pd.DataFrame, benchmark: Benchmark | None) -> pd
     Relative momentum over 5/10/20 sessions: the stock's return minus its
     benchmark's over the same rows.
 
-    NULL, NEVER 0.0, WHEN THERE IS NO SECTOR BENCHMARK. This used to write 0.0
-    for every row when the index failed to download — "exactly in line with
-    the sector", on a scale where that is a real and common value. And before
-    that it FORWARD-FILLED a dead index, so for the two months after Yahoo
-    stopped publishing it, `sector_rel_*` for 49 tickers was their own raw
-    momentum. Now: a thin or unlabelled sector has no sector benchmark, these
-    columns are NULL, and `sector_rel_missing` says so. A window that spans a
-    date the peers could not form a mean is NULL too, never stretched.
+    AGAINST THE SAME BENCHMARK AS THE EXCESS LABEL, ALWAYS. A thin or
+    unlabelled sector's benchmark is the leave-one-out market
+    (`benchmark_sector_specific = 0` records it); the feature reads that same
+    object rather than going NULL, because NULL on the same 11 names every
+    date was a group fingerprint the pooled tree exploited (v4 -> v5; see
+    pipeline/sector_benchmark.py). NULL, never 0.0, when there is no benchmark
+    at all — 0.0 is "exactly in line", a real and common value — and NULL
+    across a window that spans a date the peers could not form a mean, never
+    stretched. (Before v4 this wrote 0.0 on a failed download and forward-
+    filled a dead index into raw momentum.)
     """
     df = attach_benchmark(df, benchmark)
-    usable = benchmark is not None and benchmark.relative_features
 
     for window in (5, 10, 20):
         col = f"sector_rel_{window}d"
-        if not usable:
+        if benchmark is None:
             df[col] = np.nan
             continue
         stock_ret = df["close"].pct_change(window)
         bench_ret = df["benchmark_close"].pct_change(window)
         rel = (stock_ret - bench_ret).replace([np.inf, -np.inf], np.nan)
         df[col] = rel.where(~_window_void(df["bench_void_cum"], window))
-    df["sector_rel_missing"] = df[list(SECTOR_REL_COLS)].isna().any(axis=1).astype(int)
     return df
 
 
@@ -537,7 +539,7 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame,
     # read as an input - see the note in data/db.py.
     keep = (["date", "ticker", "close"] + FEATURE_COLS + TARGET_COLS
             + ["benchmark_close", "benchmark_ticker",
-               "benchmark_sector_specific", "sector_rel_missing"])
+               "benchmark_sector_specific"])
     return df[keep].reset_index(drop=True)
 
 

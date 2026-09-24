@@ -127,7 +127,10 @@ def config_hash() -> tuple[str, dict]:
         # so the rule is what is hashed (pipeline/sector_benchmark.py).
         "benchmark": {"method": "equal-weighted leave-one-out sector peers",
                       "min_sector_peers": MIN_SECTOR_PEERS,
-                      "fallback": MARKET_BENCHMARK},
+                      "fallback": MARKET_BENCHMARK,
+                      # v5: the relative-momentum FEATURES fall back too,
+                      # to the same benchmark as the label, never NULL.
+                      "features_follow_fallback": True},
     }
     return _sha(config), config
 

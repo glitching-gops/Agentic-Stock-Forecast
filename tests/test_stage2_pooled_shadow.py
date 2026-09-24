@@ -222,6 +222,15 @@ def test_weekly_then_daily_shadow_end_to_end(shadow_db, monkeypatch):
     assert fc["pred_return"].notna().all() and fc["interval_low"].notna().all()
     assert (fc["interval_low"] < fc["implied_price"]).all()
     assert (fc["implied_price"] < fc["interval_high"]).all()
+    # pooled v2: the band is q x THIS date's past-only spread, stored beside it
+    cal = json.loads(models["calibration_json"].iloc[0])
+    assert cal["method"] == "spread-normalised"
+    # ...and the gate that judged it scored the same interval, not the constant one
+    assert json.loads(models["coverage_json"].iloc[0])["method"] == "spread-normalised"
+    assert weekly["coverage_method"] == "spread-normalised"
+    assert fc["interval_spread"].notna().all() and (fc["interval_spread"] > 0).all()
+    half = np.log(fc["interval_high"] / fc["current_price"]) - fc["pred_return"]
+    np.testing.assert_allclose(half, cal["quantile"] * fc["interval_spread"], rtol=1e-9)
     # a re-run is a record, not a running total
     pooled_shadow.run_daily_shadow(universe, eng)
     assert len(pd.read_sql("SELECT * FROM shadow_forecasts", eng)) == len(fc)

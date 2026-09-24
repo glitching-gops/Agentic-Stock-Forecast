@@ -12,7 +12,8 @@ code that built it.
     build     read every input once, read-only, and write it with a manifest
     verify    re-hash the files against the manifest
     panel     build a panel from the snapshot through the PRODUCTION signals
-              code: --arm new (panel-internal sector benchmark, v4) or
+              code: --arm new (panel-internal sector benchmark; since v5 the
+              thin-sector names are market-relative, not NULL) or
               --arm old (the Yahoo indices, as stored, forward-filled as the
               pre-v4 code did)
     guard     simulate the signals write guard for every ticker against the
@@ -286,12 +287,10 @@ def build_panel(frames: dict, arm: str) -> tuple[pd.DataFrame, dict]:
         signals.compute_earnings_surprise = original
 
     cols = ["date", "ticker", "close", *FEATURE_COLS, TARGET, EXCESS_TARGET,
-            "benchmark_close", "benchmark_ticker", "benchmark_sector_specific",
-            "sector_rel_missing"]
+            "benchmark_close", "benchmark_ticker", "benchmark_sector_specific"]
     p = pd.concat(out, ignore_index=True)[cols].copy()
     for c in cols:
-        if c not in ("date", "ticker", "benchmark_ticker", "benchmark_sector_specific",
-                     "sector_rel_missing"):
+        if c not in ("date", "ticker", "benchmark_ticker", "benchmark_sector_specific"):
             p[c] = _db_real(p[c])
 
     macro = frames["macro"].drop_duplicates("date").set_index("date").sort_index()
@@ -312,10 +311,10 @@ def build_panel(frames: dict, arm: str) -> tuple[pd.DataFrame, dict]:
     report["tickers"] = int(p["ticker"].nunique())
     report["labelled"] = {c: int(p[c].notna().sum()) for c in TARGETS}
     report["benchmarks"] = {t: {"name": b.name, "sector_specific": b.sector_specific,
-                                "relative_features": b.relative_features,
                                 "peers": b.peers} for t, b in benchmarks.items()}
-    report["sector_rel_missing_tickers"] = sorted(
-        p.groupby("ticker")["sector_rel_missing"].min().loc[lambda s: s == 1].index)
+    # v5: a thin-sector name's features are market-relative, not NULL.
+    report["market_benchmark_tickers"] = sorted(
+        p.groupby("ticker")["benchmark_sector_specific"].max().loc[lambda s: s == 0].index)
     report["null_share"] = {c: float(p[c].isna().mean()) for c in NULLABLE_FEATURES}
     return p, report
 
@@ -390,8 +389,8 @@ def main() -> None:
     print(f"panel {args.arm}: {report['rows']:,} rows, {report['tickers']} tickers, "
           f"labelled {report['labelled']}, skipped {report['skipped']}, "
           f"sha256 {report['panel_sha256'][:16]}, {report['seconds']}s")
-    print(f"  sector_rel missing for {len(report['sector_rel_missing_tickers'])} "
-          f"tickers: {report['sector_rel_missing_tickers']}")
+    print(f"  market benchmark for {len(report['market_benchmark_tickers'])} "
+          f"tickers: {report['market_benchmark_tickers']}")
     print(f"  null shares: " + ", ".join(f"{k} {v:.3f}" for k, v in report['null_share'].items()))
 
 

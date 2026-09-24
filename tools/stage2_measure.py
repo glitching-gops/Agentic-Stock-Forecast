@@ -37,7 +37,10 @@ import pandas as pd
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 ROOT = Path(__file__).resolve().parents[1]
-PREREG = ROOT / "docs" / "dashboard-switch-preregistration.md"
+#: The pre-registration this run is measured against. Default: the Stage 2
+#: dashboard switch; STAGE2_PREREG names a later one (e.g. the 2026-09-24
+#: fallback + conformal step). The tool refuses without the file either way.
+PREREG = ROOT / os.environ.get("STAGE2_PREREG", "docs/dashboard-switch-preregistration.md")
 SNAPSHOT_MANIFEST = ROOT / "stage2" / "snapshot" / "manifest.json"
 COLS = ("date", "ticker", "y_true", "y_pred", "fold")
 DK_LAGS = 30
@@ -56,7 +59,7 @@ def provenance(panel_path: Path | None = None) -> dict:
 
     if not PREREG.exists():
         raise SystemExit(f"no pre-registration at {PREREG}; refusing to measure")
-    out = {"prereg_sha256": sha256_file(PREREG),
+    out = {"prereg": PREREG.name, "prereg_sha256": sha256_file(PREREG),
            "environment": environment_fingerprint(),
            "python": sys.version.split()[0], "platform": sys.platform}
     if SNAPSHOT_MANIFEST.exists():

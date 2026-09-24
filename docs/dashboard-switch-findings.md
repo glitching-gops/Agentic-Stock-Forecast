@@ -1,5 +1,14 @@
 # Stage 2 — the dashboard switch — findings
 
+> **FOLLOW-UP, 2026-09-24 (the same day): both blockers below are resolved,
+> pre-registered, in `docs/stage2-fallback-conformal-findings.md`.** The 11
+> thin-sector names now take market-relative momentum instead of NULL
+> (MODEL_VERSION v5). The fingerprint is gone: Δ vs the Yahoo arm is +0.0009
+> (t +0.31) and the pooled cs IC is +0.0116 (t +0.79). The spread-normalised
+> interval passes the UNCHANGED conformal gate: 0.825 overall, folds 0.848 /
+> 0.820 / 0.775 / 0.859. The CI runner reproduced the WSL digest. Nothing
+> below is rewritten.
+
 2026-09-24. Measured against `docs/dashboard-switch-preregistration.md`
 (sha256 `07bb38a254a649c0231895d61d6693a3c10fb436b7885276568c4b116cbc016b`,
 written and hashed before the first reference run), on the frozen snapshot

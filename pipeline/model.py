@@ -82,7 +82,15 @@ from pipeline.tuning import tune, tune_and_cache
 # warm-up) — see signals.NULLABLE_FEATURES. Features the per-ticker model was
 # evaluated on changed definition, so its v3 evaluations are discarded until
 # the weekly job re-measures them.
-MODEL_VERSION = "absolute-return-sector-loo-v4"
+#
+# Bumped again 2026-09-24 (v4 -> v5): THE THIN-SECTOR NAMES GET MARKET-RELATIVE
+# MOMENTUM, NOT NULL. The 11 names whose sector is too thin for a peer mean now
+# compute sector_rel_* against the leave-one-out market — the benchmark their
+# excess label already used — because NULL on the same 11 names every date was
+# a group fingerprint the pooled model exploited (docs/stage2-fallback-
+# conformal-preregistration.md). Three features changed definition for those
+# names, so v4 evaluations are discarded too.
+MODEL_VERSION = "absolute-return-sector-loo-market-v5"
 
 FEATURES = FEATURE_COLS + [
     # Macro.

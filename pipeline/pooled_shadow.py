@@ -67,6 +67,13 @@ from data.db import get_engine
 #: covering the realised price and covering the realised log return are the
 #: same event), measured by expanding calibration (`conformal.
 #: expanding_fold_coverage`).
+#:
+#: THE BANDS ARE UNCHANGED FROM THE GATE THE CONSTANT-WIDTH INTERVAL FAILED
+#: (0.868 overall, 0.903 in fold 4). Since pooled v2 the interval is SPREAD-
+#: NORMALISED (docs/stage2-fallback-conformal-preregistration.md §3): the
+#: residual is scored in units of a past-only cross-sectional spread
+#: (`pooled.spread_frame`) and the band is `pred ± q × spread`. The same bands
+#: judge it; widening them after a failure would be tuning the gate.
 COVERAGE_NOMINAL = 0.80
 #: Overall: the ±5pp rule `conformal.check_coverage` already names
 #: `well_calibrated`, and the band inside which "80%" is an honest description.
@@ -80,11 +87,13 @@ COVERAGE_BAND_FOLD = (0.70, 0.90)
 GATE_PASS, GATE_FAIL, GATE_UNMEASURED = "PASS", "FAIL", "UNMEASURED"
 
 
-def coverage_gate(y_true, y_pred, folds) -> dict:
-    """The pre-registered conformal gate. Never tuned after measuring."""
+def coverage_gate(y_true, y_pred, folds, spread=None, price=None) -> dict:
+    """The pre-registered conformal gate. Never tuned after measuring.
+    `spread`: score the spread-normalised interval instead of the constant one."""
     from pipeline.conformal import expanding_fold_coverage
 
-    cov = expanding_fold_coverage(y_true, y_pred, folds, coverage=COVERAGE_NOMINAL)
+    cov = expanding_fold_coverage(y_true, y_pred, folds, coverage=COVERAGE_NOMINAL,
+                                  spread=spread, price=price)
     lo, hi = COVERAGE_BAND_OVERALL
     flo, fhi = COVERAGE_BAND_FOLD
     reasons = []
@@ -190,6 +199,7 @@ def init_shadow_tables(engine=None) -> None:
             interval_low     REAL,
             interval_high    REAL,
             interval_coverage REAL,
+            interval_spread  REAL,
             prob_up          REAL,
             grade            TEXT,
             panel_statement  INTEGER,
@@ -203,6 +213,15 @@ def init_shadow_tables(engine=None) -> None:
     with engine.begin() as conn:
         for stmt in ddl:
             conn.execute(text(stmt))
+    # Columns added after a table first shipped. CREATE IF NOT EXISTS leaves an
+    # existing table as it was, so each is added here when absent.
+    from sqlalchemy import inspect
+
+    have = {c["name"] for c in inspect(engine).get_columns("shadow_forecasts")}
+    with engine.begin() as conn:
+        for col, typ in (("interval_spread", "REAL"),):     # pooled v2
+            if col not in have:
+                conn.execute(text(f"ALTER TABLE shadow_forecasts ADD COLUMN {col} {typ}"))
 
 
 # ── provenance ────────────────────────────────────────────────────────────────
@@ -227,6 +246,8 @@ def pooled_config_hash() -> tuple[str, dict]:
         "n_trials": pooled.N_TRIALS,
         "min_train_dates": pooled.MIN_TRAIN_DATES,
         "causal_moment_lookback": MOMENT_LOOKBACK,
+        "interval": {"method": "spread-normalised split conformal",
+                     "spread_lookback": pooled.SPREAD_LOOKBACK},
         "bootstrap_b": BOOTSTRAP_B,
         "block": BLOCK_LENGTH_SESSIONS,
         "coverage": [COVERAGE_NOMINAL, list(COVERAGE_BAND_OVERALL),
@@ -323,7 +344,7 @@ def run_weekly_shadow(universe: list[str] | None = None, engine=None,
     for `experiment_runs`.
     """
     from pipeline import pooled
-    from pipeline.conformal import fit_conformal
+    from pipeline.conformal import fit_scaled_conformal
     from pipeline.evidence_panel import BOOTSTRAP_B, grade_panel_v3
     from pipeline.panel import load_panel
     from pipeline.tracking import git_sha
@@ -342,13 +363,16 @@ def run_weekly_shadow(universe: list[str] | None = None, engine=None,
     preds, folds = pooled.walk_forward(prepared, n_trials=n_trials, verbose=verbose)
     t_wf = time.time() - started
 
-    inv = pooled.invert(preds, pooled.causal_frame(raw))
-    ok = np.isfinite(inv["pred_return"]) & np.isfinite(inv["y_raw"])
+    inv = pooled.invert(preds, pooled.causal_frame(raw)).merge(
+        pooled.spread_frame(raw), on="date", how="left")
+    ok = (np.isfinite(inv["pred_return"]) & np.isfinite(inv["y_raw"])
+          & np.isfinite(inv["interval_spread"]))
     gate = coverage_gate(inv.loc[ok, "y_raw"], inv.loc[ok, "pred_return"],
-                         inv.loc[ok, "fold"])
-    calibration = fit_conformal(inv.loc[ok, "y_raw"].to_numpy(),
-                                inv.loc[ok, "pred_return"].to_numpy(),
-                                coverage=COVERAGE_NOMINAL)
+                         inv.loc[ok, "fold"], spread=inv.loc[ok, "interval_spread"])
+    calibration = fit_scaled_conformal(inv.loc[ok, "y_raw"].to_numpy(),
+                                       inv.loc[ok, "pred_return"].to_numpy(),
+                                       inv.loc[ok, "interval_spread"].to_numpy(),
+                                       coverage=COVERAGE_NOMINAL)
 
     grading = grade_panel_v3(preds["date"].astype(str).to_numpy(),
                              preds["ticker"].astype(str).to_numpy(),
@@ -372,9 +396,11 @@ def run_weekly_shadow(universe: list[str] | None = None, engine=None,
         "features_json": json.dumps(fitted.features),
         "params_json": json.dumps(fitted.params), "booster": fitted.booster,
         "calibration_json": json.dumps(None if calibration is None else {
+            "method": "spread-normalised",
+            "spread_lookback": pooled.SPREAD_LOOKBACK,
             "quantile": calibration.quantile, "coverage": calibration.coverage,
             "n": calibration.n,
-            "residuals": [round(float(r), 6) for r in calibration.residuals]}),
+            "scores": [round(float(r), 6) for r in calibration.scores]}),
         "coverage_json": json.dumps({k: v for k, v in gate.items()}, default=float),
         "coverage_status": gate["status"],
         "walk_forward_json": json.dumps(
@@ -399,6 +425,7 @@ def run_weekly_shadow(universe: list[str] | None = None, engine=None,
         "grades": counts, "panel_statement": statement["degenerate"] == 1,
         "tau2": statement["tau2_reml"], "statement": statement["statement"][:300],
         "coverage_status": gate["status"], "coverage_overall": gate["overall"],
+        "coverage_method": gate.get("method"),
         "coverage_by_fold": [round(f["coverage"], 4) for f in gate["per_fold"]],
         "env_hash": hashes["env_hash"],
         "seconds_walk_forward": round(t_wf, 1), "seconds_grading": round(t_grade, 1),
@@ -422,7 +449,8 @@ def run_daily_shadow(universe: list[str] | None = None, engine=None) -> dict:
     Cheap: one panel load, one predict, no search.
     """
     from pipeline import pooled
-    from pipeline.conformal import ConformalCalibration, to_price_view
+    from pipeline.conformal import (ConformalCalibration,
+                                    ScaledConformalCalibration, to_price_view)
     from pipeline.panel import load_panel
 
     engine = engine or get_engine()
@@ -441,15 +469,22 @@ def run_daily_shadow(universe: list[str] | None = None, engine=None) -> dict:
         train_last_date=str(model["train_last_date"]),
         features=json.loads(model["features_json"]))
     cal = json.loads(model["calibration_json"] or "null")
-    calibration = None if not cal else ConformalCalibration(
-        quantile=float(cal["quantile"]), coverage=float(cal["coverage"]),
-        residuals=np.asarray(cal["residuals"], dtype=float), n=int(cal["n"]))
+    scaled = constant = None
+    if cal and cal.get("method") == "spread-normalised":
+        scaled = ScaledConformalCalibration(
+            quantile=float(cal["quantile"]), coverage=float(cal["coverage"]),
+            scores=np.asarray(cal["scores"], dtype=float), n=int(cal["n"]))
+    elif cal:                                    # a pooled v1 calibration
+        constant = ConformalCalibration(
+            quantile=float(cal["quantile"]), coverage=float(cal["coverage"]),
+            residuals=np.asarray(cal["residuals"], dtype=float), n=int(cal["n"]))
 
     raw = load_panel(universe, engine=engine)
     prepared = pooled.prepare(raw)
     as_of = str(prepared["date"].max())
     preds = pooled.predict_on(fitted, prepared, as_of)
-    inv = pooled.invert(preds, pooled.causal_frame(raw), z_col="pred_z")
+    inv = pooled.invert(preds, pooled.causal_frame(raw), z_col="pred_z").merge(
+        pooled.spread_frame(raw), on="date", how="left")
 
     grades = pd.read_sql(text("SELECT ticker, grade FROM shadow_evaluations "
                               "WHERE model_id = :m"), engine,
@@ -464,6 +499,10 @@ def run_daily_shadow(universe: list[str] | None = None, engine=None) -> dict:
     rows, unpriced = [], []
     for r in inv.itertuples(index=False):
         ret, price = float(r.pred_return), float(r.close)
+        spread = float(r.interval_spread)
+        # The interval is priced at THIS date's past-only spread; with no
+        # spread there is no interval, never one at a made-up width.
+        calibration = scaled.at(spread) if scaled is not None else constant
         if not (np.isfinite(ret) and np.isfinite(price) and price > 0):
             unpriced.append(r.ticker)
             view = {}
@@ -482,6 +521,8 @@ def run_daily_shadow(universe: list[str] | None = None, engine=None) -> dict:
             "interval_low": view.get("interval_low"),
             "interval_high": view.get("interval_high"),
             "interval_coverage": view.get("interval_coverage"),
+            "interval_spread": (spread if scaled is not None and np.isfinite(spread)
+                                else None),
             "prob_up": view.get("prob_up"),
             "grade": None if (one_statement or g is None or pd.isna(g)) else str(g),
             "panel_statement": int(one_statement),
