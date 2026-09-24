@@ -133,7 +133,11 @@ def test_the_model_version_moved_with_the_target():
     from pipeline.model import MODEL_VERSION
 
     assert MODEL_VERSION not in ("phase0-excess-return-v1",
-                                 "phase1-benchmark-audited-v2"), (
+                                 "phase1-benchmark-audited-v2",
+                                 # v4 (2026-09-24): the sector benchmark is
+                                 # panel-internal, so the features and the
+                                 # excess label changed definition again.
+                                 "rebuild-absolute-return-v3"), (
         "the target changed; a run before and after must be distinguishable "
         "in experiment_runs and _load_persisted_evaluation must discard the "
         "older evidence")
@@ -327,13 +331,20 @@ def test_no_backward_fill_anywhere_on_the_live_path():
 # ── F13: earnings surprise must lag the announcement ──────────────────────────
 
 def test_earnings_surprise_lands_after_the_announcement_date():
-    from pipeline.signals import compute_earnings_surprise
+    """F13, asserted through behaviour rather than a grep of the source (the
+    grep broke the moment the mapping moved into `earnings_surprise_from`)."""
+    from pipeline.signals import earnings_surprise_from
 
-    source = inspect.getsource(compute_earnings_surprise)
-    assert "s > row[\"announced\"]" in source or "s > row['announced']" in source, (
+    sessions = pd.DataFrame({"date": ["2024-05-09", "2024-05-10", "2024-05-13",
+                                      "2024-05-14"]})
+    vendor = pd.DataFrame({"EPS Estimate": [10.0], "Reported EPS": [12.0]},
+                          index=pd.Index(pd.to_datetime(["2024-05-10"]).tz_localize("UTC"),
+                                         name="Earnings Date"))
+    out = earnings_surprise_from(vendor, sessions).set_index("date")["earnings_surprise"]
+    assert pd.isna(out["2024-05-10"]), (
         "earnings surprise must attach to the first session strictly AFTER the "
-        "announcement; Indian results are commonly declared post-close (F13)"
-    )
+        "announcement; Indian results are commonly declared post-close (F13)")
+    assert out["2024-05-13"] == pytest.approx(0.2)
 
 
 # ── F4: universe must not be selected on model output ─────────────────────────
@@ -1764,13 +1775,19 @@ def test_a_missing_benchmark_still_produces_the_absolute_label():
         "volume": np.full(400, 1_000_000.0),
     })
 
-    empty = pd.DataFrame(columns=["date", "benchmark_close"])
-    original = sig.get_benchmark_series
-    sig.get_benchmark_series = lambda *a, **k: empty
+    from pipeline.sector_benchmark import index_benchmark
+
+    # A benchmark that resolved to NOTHING (no level on any date) — the shape
+    # a dead index took, and the shape a peer mean takes with no peers.
+    empty = index_benchmark("MARUTI.NS", "EW-LOO:Automobile and Auto Components",
+                            pd.DataFrame(columns=["date", "benchmark_close"]),
+                            sector_specific=True)
+    original = sig.compute_earnings_surprise
+    sig.compute_earnings_surprise = lambda t, df: df.assign(earnings_surprise=0.1)
     try:
-        frame = sig.compute_signals_frame("MARUTI.NS", ohlcv)
+        frame = sig.compute_signals_frame("MARUTI.NS", ohlcv, empty)
     finally:
-        sig.get_benchmark_series = original
+        sig.compute_earnings_surprise = original
 
     assert frame is not None, (
         "a dead benchmark must no longer cost the ticker its absolute label")
@@ -1785,39 +1802,19 @@ def test_a_missing_benchmark_still_produces_the_absolute_label():
         "make a vendor outage look like an unmapped ticker")
 
 
-def test_benchmark_fetch_retries_and_reports_an_unusable_response():
+def test_signals_no_longer_download_a_sector_index():
     """
-    The old code raised only on an outright empty response, so a frame that
-    arrived non-empty but cleaned down to nothing fell through the SUCCESS path
-    and cached an empty result with no message at all — which is why the
-    2026-08-16 log contains no benchmark error despite three indices failing.
+    RETIRED 2026-09-24 (MODEL_VERSION v4): `get_benchmark_series`, its retry
+    loop and its cache. The benchmark is built from the universe's own prices
+    (pipeline/sector_benchmark.py), so there is no vendor index left to retry —
+    eight of ten had stopped publishing and left 49 tickers refused. This pins
+    that the Yahoo index path does not come back unnoticed.
     """
     import pipeline.signals as sig
 
-    source = inspect.getsource(sig.get_benchmark_series)
-    assert "BENCHMARK_FETCH_ATTEMPTS" in source, "a transient miss must be retried"
-    assert "cleaned.empty" in source, (
-        "a response that cleans down to nothing is a failure, not a result"
-    )
-
-    calls = {"n": 0}
-
-    def _always_fails(*args, **kwargs):
-        calls["n"] += 1
-        raise RuntimeError("network")
-
-    original_dl, original_sleep = sig.yf.download, sig.time.sleep
-    sig.yf.download = _always_fails
-    sig.time.sleep = lambda *a, **k: None
-    sig._benchmark_cache.pop("^CNXAUTO", None)
-    try:
-        out = sig.get_benchmark_series("^CNXAUTO")
-    finally:
-        sig.yf.download, sig.time.sleep = original_dl, original_sleep
-        sig._benchmark_cache.pop("^CNXAUTO", None)
-
-    assert out.empty
-    assert calls["n"] == sig.BENCHMARK_FETCH_ATTEMPTS
+    assert not hasattr(sig, "get_benchmark_series")
+    assert not hasattr(sig, "_benchmark_cache")
+    assert "yf.download" not in inspect.getsource(sig)
 
 
 def test_weekly_job_aborts_if_recomputing_signals_destroys_labels():
@@ -2299,17 +2296,14 @@ def test_a_benchmark_that_does_not_align_degrades_like_a_missing_one():
         "benchmark_close": np.linspace(20000.0, 24000.0, 300),
     })
 
-    original_bench = signals.get_benchmark_series
-    original_map = signals.get_benchmark
+    from pipeline.sector_benchmark import index_benchmark
+
+    bench = index_benchmark("TEST.NS", "^CNXENERGY", misaligned, sector_specific=True)
     original_earnings = signals.compute_earnings_surprise
-    signals.get_benchmark_series = lambda *a, **k: misaligned
-    signals.get_benchmark = lambda t: ("^CNXENERGY", True)
     signals.compute_earnings_surprise = lambda t, df: df.assign(earnings_surprise=0.0)
     try:
-        frame = signals.compute_signals_frame("TEST.NS", ohlcv)
+        frame = signals.compute_signals_frame("TEST.NS", ohlcv, bench)
     finally:
-        signals.get_benchmark_series = original_bench
-        signals.get_benchmark = original_map
         signals.compute_earnings_surprise = original_earnings
 
     assert frame is not None, (
@@ -3062,17 +3056,18 @@ def test_config_hash_changes_when_the_benchmark_mapping_changes():
     historical target for its members, so it has to move the config hash or two
     incomparable runs will look identical in the run log.
     """
-    import data.tickers
+    import pipeline.sector_benchmark as sb
     from pipeline.tracking import config_hash
 
+    # Since v4 the benchmark is a RULE (leave-one-out sector peers with a
+    # minimum count), so changing the rule is the remap that must move it.
     before, _ = config_hash()
-    original = dict(data.tickers.SECTOR_INDICES)
+    original = sb.MIN_SECTOR_PEERS
     try:
-        data.tickers.SECTOR_INDICES["Information Technology"] = "^NSEI"
+        sb.MIN_SECTOR_PEERS = original + 1
         after, _ = config_hash()
     finally:
-        data.tickers.SECTOR_INDICES.clear()
-        data.tickers.SECTOR_INDICES.update(original)
+        sb.MIN_SECTOR_PEERS = original
 
     assert before != after, (
         "a benchmark remap must change config_hash, or a run before and after "

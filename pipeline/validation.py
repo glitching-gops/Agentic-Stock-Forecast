@@ -328,7 +328,14 @@ def check_sessions_are_contiguous(engine, universe) -> Check:
     if counts.empty:
         return Check("sessions_are_contiguous", WARN, "no signal rows")
 
+    # BOTH DIRECTIONS (2026-09-24). This used to flag only signals rows FEWER
+    # than ohlcv sessions. After the phantom-session fix ohlcv lost the NSE
+    # holidays while every refused ticker's signals KEPT them, so stored rows
+    # EXCEEDED sessions, the difference went negative, and the check PASSED -
+    # for the wrong reason: the grids disagreed in the other direction. A
+    # surplus row is a session the label counts that never traded.
     gapped: list[str] = []
+    surplus: list[str] = []
     for row in counts.itertuples(index=False):
         if row.ticker not in universe:
             continue
@@ -341,14 +348,23 @@ def check_sessions_are_contiguous(engine, universe) -> Check:
         missing = int(sessions or 0) - int(row.stored)
         if missing > 0:
             gapped.append(f"{row.ticker}(-{missing})")
+        elif missing < 0:
+            surplus.append(f"{row.ticker}(+{-missing})")
 
-    if not gapped:
+    if not gapped and not surplus:
         return Check("sessions_are_contiguous", PASS,
-                     f"all {len(universe)} tickers cover every session in range")
-    return Check("sessions_are_contiguous", WARN,
-                 f"{len(gapped)} tickers have interior session gaps, so a "
-                 f"row-stepped horizon disagrees with the label: "
-                 f"{', '.join(gapped[:8])}")
+                     f"all {len(universe)} tickers: stored signal rows match "
+                     f"ohlcv sessions exactly in range")
+    parts = []
+    if gapped:
+        parts.append(f"{len(gapped)} tickers have interior session gaps, so a "
+                     f"row-stepped horizon disagrees with the label: "
+                     f"{', '.join(gapped[:8])}")
+    if surplus:
+        parts.append(f"{len(surplus)} tickers carry signal rows on dates ohlcv "
+                     f"does not hold (stale rows, usually a refused write "
+                     f"keeping phantom sessions): {', '.join(surplus[:8])}")
+    return Check("sessions_are_contiguous", WARN, "; ".join(parts))
 
 
 #: How far back the market-wide flat-bar check looks. Recent only: its job is
@@ -417,6 +433,48 @@ def check_no_market_wide_flat_bars(engine, universe) -> Check:
                  f"market: {'; '.join(notes)}")
 
 
+def check_no_silent_neutral_signals(engine, universe) -> Check:
+    """
+    No feature may sit, for a whole ticker, on a neutral value across the
+    recent window, and none may be identical across every ticker on a date.
+
+    The standing form of the Part 1 audit (pipeline/silent_neutral.py). The
+    three silent failures this project shipped - FinBERT's neutral gauge, the
+    FII/DII zeros, `earnings_surprise = 0.0` after the lock dropped lxml - all
+    show one of those two shapes in the data, and none raised or produced a
+    NULL. The fourth should be caught here, on the run that writes it, rather
+    than by an investigation weeks later.
+
+    Scope: the pooled FACTORS plus the market-invariant check skipped for the
+    macro columns, which ARE identical across tickers on a date by
+    construction. Warns rather than fails: a genuine signal can be flat for a
+    while, and a gate that fails on that gets switched off.
+    """
+    from pipeline.silent_neutral import STANDING_WINDOW_SESSIONS, standing_findings
+    from pipeline.signals import FEATURE_COLS
+    from pipeline.panel import PRICE_SCALED
+
+    cols = [c for c in FEATURE_COLS if c not in PRICE_SCALED]
+    dates = pd.read_sql(
+        text("SELECT DISTINCT date FROM signals ORDER BY date DESC LIMIT :n"),
+        engine, params={"n": STANDING_WINDOW_SESSIONS})
+    if dates.empty:
+        return Check("no_silent_neutral_signals", WARN, "no signal rows")
+    since = str(dates["date"].min())
+    df = pd.read_sql(
+        text(f"SELECT date, ticker, {', '.join(cols)} FROM signals "
+             f"WHERE date >= :since"),
+        engine, params={"since": since})
+    df = df[df["ticker"].isin(universe)] if universe else df
+    findings = standing_findings(df, cols)
+    if not findings:
+        return Check("no_silent_neutral_signals", PASS,
+                     f"{len(cols)} features over {len(dates)} sessions: no ticker "
+                     f"constant at a neutral value, no date constant across "
+                     f"tickers")
+    return Check("no_silent_neutral_signals", WARN, "; ".join(findings))
+
+
 CHECKS = [
     check_no_duplicate_signal_rows,
     check_no_future_dates,
@@ -428,6 +486,7 @@ CHECKS = [
     check_target_distribution,
     check_sessions_are_contiguous,
     check_no_market_wide_flat_bars,
+    check_no_silent_neutral_signals,
 ]
 
 

@@ -261,8 +261,13 @@ def init_db():
                 pass  # Column already exists, skip
 
         # Non-numeric signal columns recording which benchmark was used.
+        # `sector_rel_missing` (2026-09-24, MODEL_VERSION v4): 1 where the
+        # sector_rel_* features are NULL — a thin or unlabelled sector has no
+        # panel-internal sector benchmark. An explicit indicator beside the
+        # NULLs, never a 0.0 standing in for them (pipeline/sector_benchmark.py).
         for col, coltype in [("benchmark_ticker", "TEXT"),
-                             ("benchmark_sector_specific", "INTEGER")]:
+                             ("benchmark_sector_specific", "INTEGER"),
+                             ("sector_rel_missing", "INTEGER")]:
             try:
                 with conn.begin_nested():
                     conn.execute(text(f"ALTER TABLE signals ADD COLUMN {col} {coltype}"))

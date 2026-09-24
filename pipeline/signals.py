@@ -26,7 +26,6 @@ Three Phase 0 changes:
 
 from __future__ import annotations
 
-import time
 from typing import NamedTuple
 
 import numpy as np
@@ -39,7 +38,7 @@ from ta.volatility import BollingerBands, AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator
 
 from data.db import get_engine
-from data.tickers import get_benchmark
+from pipeline.sector_benchmark import Benchmark
 
 # Forecast horizon in TRADING SESSIONS, not calendar days. 30 sessions is
 # roughly 42 calendar days on the NSE calendar. The previous code used
@@ -57,7 +56,36 @@ FEATURE_COLS = [
 
 TARGET_COLS = ["target_return", "target_excess_return", "benchmark_return"]
 
-_benchmark_cache: dict[str, pd.DataFrame] = {}
+#: Features that may legitimately be NULL on a row, and are stored as NULL
+#: rather than as a neutral number (2026-09-24, MODEL_VERSION v4). Every one
+#: of them used to be filled with a value that sits ON the scale:
+#:
+#:   sector_rel_*       0.0 when the benchmark was unavailable ("exactly in line
+#:                      with the sector"); now NULL for a thin sector, with
+#:                      `sector_rel_missing = 1` beside it. See
+#:                      pipeline/sector_benchmark.py.
+#:   earnings_surprise  0.0 before the vendor's first recorded announcement —
+#:                      88-94% of rows in 2016-2020, measured — i.e. "never
+#:                      observed" stored as "no surprise"; and, the other way
+#:                      round, one old surprise carried for YEARS when the
+#:                      vendor stopped recording a ticker (EARNINGS_STALE_
+#:                      SESSIONS).
+#:   hurst              0.0 for EVERY ticker on 13 dates in late 2016: a
+#:                      partial-window artifact (the fit ran over whichever
+#:                      lags existed yet), plus 0.5 when not computable.
+#:
+#: A zero is indistinguishable downstream from a real measurement of zero,
+#: which is the silent-neutral defect this project has shipped three times.
+#: XGBoost reads NaN natively as MISSING, with a learned default branch, so
+#: the tree models take these as NaN; `panel.cross_sectional_zscore` keeps
+#: them NaN on request. A row is never DROPPED for one of these being NULL -
+#: dropping would lose a labelled row and the write guard would (rightly)
+#: refuse the whole ticker.
+NULLABLE_FEATURES: tuple[str, ...] = (
+    "sector_rel_5d", "sector_rel_10d", "sector_rel_20d",
+    "earnings_surprise", "hurst",
+)
+SECTOR_REL_COLS = ("sector_rel_5d", "sector_rel_10d", "sector_rel_20d")
 
 
 class LabelLossRefused(RuntimeError):
@@ -130,6 +158,13 @@ def _rolling_hurst(close: pd.Series, window: int = 60) -> pd.Series:
 
     Vectorised over lags rather than calling a Python lambda per window, which
     was measurably slow across a 100-ticker universe.
+
+    NaN UNTIL EVERY LAG HAS A FULL WINDOW (2026-09-24). The slope used to be
+    fitted over whichever lags happened to exist yet, against deviations
+    computed over ALL of them, which is a different and biased estimator: it
+    wrote exactly 0.0 for every ticker on 13 dates in late 2016. And an
+    incomputable row used to be filled with 0.5, "a random walk", which is a
+    claim, not an absence. Both are NaN now; see NULLABLE_FEATURES.
     """
     log_close = np.log(close.astype(float))
     lags = np.arange(2, 20)
@@ -142,7 +177,8 @@ def _rolling_hurst(close: pd.Series, window: int = 60) -> pd.Series:
 
     tau = pd.concat(tau_frames, axis=1)
     tau = tau.where(tau > 0)
-    log_tau = np.log(tau)
+    complete = tau.notna().all(axis=1)
+    log_tau = np.log(tau).where(complete, axis=0)
 
     # Slope of log(tau) on log(lag), computed in closed form per row.
     x_mean = log_lags.mean()
@@ -152,107 +188,65 @@ def _rolling_hurst(close: pd.Series, window: int = 60) -> pd.Series:
     y_mean = log_tau.mean(axis=1)
     cov = (log_tau.sub(y_mean, axis=0) * x_dev).sum(axis=1)
 
-    slope = cov / denom
-    return slope.clip(0.0, 1.0).fillna(0.5).round(4)
+    slope = (cov / denom).where(complete)
+    return slope.clip(0.0, 1.0).round(4)
 
 
-# ── Benchmark series ──────────────────────────────────────────────────────────
-BENCHMARK_FETCH_ATTEMPTS = 3
+# ── Benchmark and relative momentum ──────────────────────────────────────────
 
 
-def get_benchmark_series(index_ticker: str, period: str = "10y") -> pd.DataFrame:
-    """
-    Downloads a benchmark index close series, cached per process.
-
-    The previous code downloaded the sector index once per stock, so a
-    100-ticker run made 100 redundant requests for the same handful of indices.
-
-    RETRIES, AND NEVER FAILS QUIETLY. A transient miss here is not a cosmetic
-    problem: the excess-return target is `stock return - benchmark return`, so
-    an index that resolves to nothing NULLs the target for every row of every
-    stock benchmarked to it, and compute_and_store then writes those NULLs over
-    good labels. On 2026-08-16 exactly that happened — ^CNXAUTO, ^CNXINFRA and
-    ^CNXREALTY came back unusable in one run and 22 tickers went from ~2,390
-    labelled rows to 0, with no error anywhere in the log. All three indices
-    served full history again minutes later, so the failure was transient.
-
-    It produced no log line because the old code only raised on an outright
-    empty response. A frame that arrived non-empty but cleaned down to nothing
-    (all-NaN closes) fell straight through `.dropna()` into an empty result via
-    the success path, so even the "unavailable" message never printed. Both
-    outcomes are now the same failure and both are reported.
-
-    The empty frame is still cached on failure so a dead index is not retried
-    once per stock, but see compute_signals_frame: callers must now SKIP a
-    ticker whose benchmark is missing rather than compute a null target for it.
-    """
-    if index_ticker in _benchmark_cache:
-        return _benchmark_cache[index_ticker]
-
-    out = pd.DataFrame(columns=["date", "benchmark_close"])
-
-    for attempt in range(1, BENCHMARK_FETCH_ATTEMPTS + 1):
-        try:
-            data = yf.download(index_ticker, period=period, interval="1d",
-                               auto_adjust=True, progress=False)
-            if data is None or data.empty:
-                raise ValueError("empty response")
-
-            data = data.reset_index()
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = [str(c[0]).lower() for c in data.columns]
-            else:
-                data.columns = [str(c).lower() for c in data.columns]
-
-            cleaned = pd.DataFrame({
-                "date": data["date"].astype(str).str[:10],
-                "benchmark_close": data["close"].astype(float),
-            }).dropna()
-
-            # Non-empty on arrival but empty once cleaned is a FAILURE, not a
-            # result. Treating it as success is what made this silent.
-            if cleaned.empty:
-                raise ValueError(
-                    f"{len(data)} rows returned, none with a usable close")
-
-            out = cleaned
-            break
-        except Exception as exc:                              # noqa: BLE001
-            print(f"[Signals] benchmark {index_ticker} attempt "
-                  f"{attempt}/{BENCHMARK_FETCH_ATTEMPTS} failed: {exc}")
-            if attempt < BENCHMARK_FETCH_ATTEMPTS:
-                time.sleep(2 * attempt)
-
-    if out.empty:
-        print(f"[Signals] benchmark {index_ticker} UNAVAILABLE after "
-              f"{BENCHMARK_FETCH_ATTEMPTS} attempts — every ticker benchmarked "
-              f"to it will be skipped rather than written with a null target.")
-
-    _benchmark_cache[index_ticker] = out
-    return out
+def _window_void(void_cum: pd.Series, steps: int) -> pd.Series:
+    """True where the `steps`-row window ending (steps > 0) or starting
+    (steps < 0) at this row spans a date the benchmark could not be formed."""
+    if steps > 0:
+        return (void_cum - void_cum.shift(steps)) > 0
+    return (void_cum.shift(steps) - void_cum) > 0
 
 
-def compute_sector_momentum(df: pd.DataFrame, benchmark: pd.DataFrame) -> pd.DataFrame:
-    """
-    Relative momentum over 5/10/20 sessions: stock return minus benchmark
-    return. Falls back to 0.0 when the benchmark is unavailable.
-    """
-    cols = ["sector_rel_5d", "sector_rel_10d", "sector_rel_20d"]
+def attach_benchmark(df: pd.DataFrame, benchmark: Benchmark | None) -> pd.DataFrame:
+    """The benchmark level and its void counter, on this ticker's own rows.
 
-    if benchmark.empty:
-        for col in cols:
-            df[col] = 0.0
+    Forward-filled onto a date the benchmark's grid lacks, never backward: a
+    panel-internal benchmark is built on the universe's own grid so this is a
+    no-op for a universe member; it matters only for an external series."""
+    if benchmark is None or benchmark.frame.empty:
+        df["benchmark_close"] = np.nan
+        df["bench_void_cum"] = np.nan
         return df
+    frame = benchmark.frame[["date", "benchmark_close", "bench_void_cum"]]
+    df = df.merge(frame, on="date", how="left")
+    df["benchmark_close"] = df["benchmark_close"].ffill()      # never bfill
+    df["bench_void_cum"] = df["bench_void_cum"].ffill()
+    return df
 
-    df = df.merge(benchmark, on="date", how="left")
-    df["benchmark_close"] = df["benchmark_close"].ffill()   # forward only, never bfill
 
-    for window in [5, 10, 20]:
+def compute_sector_momentum(df: pd.DataFrame, benchmark: Benchmark | None) -> pd.DataFrame:
+    """
+    Relative momentum over 5/10/20 sessions: the stock's return minus its
+    benchmark's over the same rows.
+
+    NULL, NEVER 0.0, WHEN THERE IS NO SECTOR BENCHMARK. This used to write 0.0
+    for every row when the index failed to download — "exactly in line with
+    the sector", on a scale where that is a real and common value. And before
+    that it FORWARD-FILLED a dead index, so for the two months after Yahoo
+    stopped publishing it, `sector_rel_*` for 49 tickers was their own raw
+    momentum. Now: a thin or unlabelled sector has no sector benchmark, these
+    columns are NULL, and `sector_rel_missing` says so. A window that spans a
+    date the peers could not form a mean is NULL too, never stretched.
+    """
+    df = attach_benchmark(df, benchmark)
+    usable = benchmark is not None and benchmark.relative_features
+
+    for window in (5, 10, 20):
+        col = f"sector_rel_{window}d"
+        if not usable:
+            df[col] = np.nan
+            continue
         stock_ret = df["close"].pct_change(window)
         bench_ret = df["benchmark_close"].pct_change(window)
-        df[f"sector_rel_{window}d"] = (
-            (stock_ret - bench_ret).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        )
+        rel = (stock_ret - bench_ret).replace([np.inf, -np.inf], np.nan)
+        df[col] = rel.where(~_window_void(df["bench_void_cum"], window))
+    df["sector_rel_missing"] = df[list(SECTOR_REL_COLS)].isna().any(axis=1).astype(int)
     return df
 
 
@@ -296,6 +290,85 @@ def require_earnings_parser() -> None:
             f"environment: pip install -r requirements.txt")
 
 
+#: How long a surprise stays "current" with no new announcement, in sessions.
+#: Measured on the vendor tables in the Stage 2 snapshot (1,902 consecutive
+#: announcement pairs, 84 tickers): median gap 91 calendar days, 95th
+#: percentile 112, 99th 265 — the tail is missed quarters. 85 sessions is ~120
+#: calendar days: every ordinary reporting cycle plus a week of slack. Beyond
+#: it the value is NULL, never the stale number.
+EARNINGS_STALE_SESSIONS = 85
+
+
+class EarningsUnavailable(RuntimeError):
+    """The vendor returned no usable earnings history for one ticker.
+
+    Raised, never absorbed as 0.0. `compute_and_store` then SKIPS the ticker:
+    it keeps the signals it already has and is named in the run's `skipped`
+    list, which is loud and self-healing. The alternative this replaced wrote
+    `earnings_surprise = 0.0` over the ticker's WHOLE history — and because
+    the signals write is DELETE-range-then-reinsert, one transient vendor
+    failure silently replaced every real surprise value it had."""
+
+
+def earnings_surprise_from(earnings: pd.DataFrame | None, df: pd.DataFrame,
+                           ticker: str = "") -> pd.DataFrame:
+    """
+    Maps a vendor earnings table onto `df`'s sessions. Pure: no network.
+
+    NULL BEFORE THE FIRST RECORDED ANNOUNCEMENT, NEVER 0.0 (2026-09-24). The
+    vendor's history starts around 2020-21; before it, this used to write 0.0
+    — measured on 88-94% of rows in 2016-2020 — which says "the result matched
+    the estimate" about quarters nobody observed. Forward-filling BETWEEN
+    announcements is the design (the last surprise is the current one); filling
+    BEFORE the first is invention.
+    """
+    if earnings is None or len(earnings) == 0:
+        raise EarningsUnavailable(f"{ticker}: no earnings history returned")
+
+    earnings = earnings.reset_index()
+    earnings.columns = [str(c).lower().replace(" ", "_") for c in earnings.columns]
+
+    est_col = next((c for c in earnings.columns if "estimate" in c), None)
+    act_col = next((c for c in earnings.columns if "actual" in c or "reported" in c), None)
+    date_col = next((c for c in earnings.columns if "date" in c), None)
+    if not (est_col and act_col and date_col):
+        raise EarningsUnavailable(
+            f"{ticker}: earnings table lacks estimate/actual/date columns: "
+            f"{list(earnings.columns)}")
+
+    earnings["announced"] = pd.to_datetime(
+        earnings[date_col], errors="coerce", utc=True
+    ).dt.strftime("%Y-%m-%d")
+
+    earnings = earnings[["announced", est_col, act_col]].dropna()
+    earnings = earnings[earnings[est_col].abs() > 0.001]
+    if earnings.empty:
+        raise EarningsUnavailable(f"{ticker}: no announcement carries an estimate")
+
+    earnings["surprise"] = (
+        (earnings[act_col] - earnings[est_col]) / earnings[est_col].abs()
+    ).clip(-2.0, 2.0)
+
+    # Map each announcement onto the first session strictly after it (F13).
+    sessions = df["date"].tolist()
+    surprise_by_session: dict[str, float] = {}
+    for _, row in earnings.iterrows():
+        later = [s for s in sessions if s > row["announced"]]
+        if later:
+            surprise_by_session[later[0]] = float(row["surprise"])
+
+    # CARRIED FORWARD FOR ONE REPORTING CYCLE, NOT FOREVER (2026-09-24). The
+    # last surprise IS the current one - until the next announcement is due.
+    # Past that, the vendor has missed a quarter and the old value is stale,
+    # not current: measured on the Stage 2 snapshot, BAJAJHLDNG's last
+    # announcement with an estimate was 2018-10-24 and its surprise had been
+    # carried for 1,954 sessions; ADANIPOWER for 1,463. See
+    # EARNINGS_STALE_SESSIONS for the measured cycle.
+    df["earnings_surprise"] = (df["date"].map(surprise_by_session)
+                               .ffill(limit=EARNINGS_STALE_SESSIONS))
+    return df
+
+
 def compute_earnings_surprise(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
     """
     Earnings surprise, (actual - estimate) / |estimate|, clipped to [-2, 2] and
@@ -305,62 +378,31 @@ def compute_earnings_surprise(ticker: str, df: pd.DataFrame) -> pd.DataFrame:
     announcement date (F13). Indian results are commonly declared post-close,
     so stamping the announcement date itself let the model read information one
     session before it was tradable.
+
+    Any failure raises EarningsUnavailable — see there for why that is a skip
+    and not a 0.0.
     """
     try:
         earnings = yf.Ticker(ticker).earnings_dates
-        if earnings is None or len(earnings) == 0:
-            df["earnings_surprise"] = 0.0
-            return df
-
-        earnings = earnings.reset_index()
-        earnings.columns = [c.lower().replace(" ", "_") for c in earnings.columns]
-
-        est_col = next((c for c in earnings.columns if "estimate" in c), None)
-        act_col = next((c for c in earnings.columns if "actual" in c or "reported" in c), None)
-        date_col = next((c for c in earnings.columns if "date" in c), None)
-
-        if not (est_col and act_col and date_col):
-            df["earnings_surprise"] = 0.0
-            return df
-
-        earnings["announced"] = pd.to_datetime(
-            earnings[date_col], errors="coerce", utc=True
-        ).dt.strftime("%Y-%m-%d")
-
-        earnings = earnings[["announced", est_col, act_col]].dropna()
-        earnings = earnings[earnings[est_col].abs() > 0.001]
-        if earnings.empty:
-            df["earnings_surprise"] = 0.0
-            return df
-
-        earnings["surprise"] = (
-            (earnings[act_col] - earnings[est_col]) / earnings[est_col].abs()
-        ).clip(-2.0, 2.0)
-
-        # Map each announcement onto the first session strictly after it.
-        sessions = df["date"].tolist()
-        surprise_by_session: dict[str, float] = {}
-        for _, row in earnings.iterrows():
-            later = [s for s in sessions if s > row["announced"]]
-            if later:
-                surprise_by_session[later[0]] = float(row["surprise"])
-
-        df["earnings_surprise"] = df["date"].map(surprise_by_session).ffill().fillna(0.0)
-
     except Exception as exc:                                  # noqa: BLE001
-        print(f"[Signals] earnings surprise failed for {ticker}: {exc}")
-        df["earnings_surprise"] = 0.0
-
-    return df
+        raise EarningsUnavailable(f"{ticker}: earnings fetch failed: {exc}") from exc
+    return earnings_surprise_from(earnings, df, ticker)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | None:
+def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame,
+                          benchmark: Benchmark | None = None) -> pd.DataFrame | None:
     """
-    Computes indicators and the forward excess-return target for one ticker.
+    Computes indicators and both forward targets for one ticker.
 
     Prices use ``adj_close`` so the whole series shares one adjustment basis.
-    Returns None when there is not enough history.
+    Returns None when there is not enough history, or when the vendor's
+    earnings history is unavailable (EarningsUnavailable: skip, never 0.0).
+
+    `benchmark` comes from `pipeline.sector_benchmark.build_benchmarks`, which
+    needs the whole universe's prices and so is built once per run by
+    `compute_and_store`, not here. None means "no benchmark": the relative
+    features and the excess label are NULL, the absolute label is unaffected.
     """
     if ohlcv.empty or len(ohlcv) < 120:
         print(f"[Signals] {ticker}: insufficient history ({len(ohlcv)} rows)")
@@ -438,42 +480,24 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     df["dev_sma50"] = (df["close"] - sma_50) / sma_50 * 100
     df["hurst"] = _rolling_hurst(df["close"])
 
-    # ── Benchmark, relative momentum, and the target ─────────────────────────
-    index_ticker, is_sector = get_benchmark(ticker)
-    benchmark = get_benchmark_series(index_ticker)
-
-    # THE BENCHMARK IS NO LONGER REQUIRED FOR A LABEL, and this is the single
-    # largest practical consequence of the P1 target switch.
+    # ── Benchmark, relative momentum, and the targets ────────────────────────
     #
-    # It used to be. target_excess_return is the stock's return MINUS the
-    # index's, so a missing index NULLed every row's target — and because
-    # _upsert_signals DELETEs the recomputed range before reinserting, writing
-    # that frame destroyed whatever labels the ticker already had. Refusing
-    # outright was the correct response to that, and it is what kept 55 tickers
-    # frozen on stale signals after Yahoo stopped publishing eight of the ten
-    # NSE sector indices around 2026-07-20.
+    # THE BENCHMARK IS PANEL-INTERNAL SINCE MODEL_VERSION v4 (2026-09-24): the
+    # leave-one-out equal-weighted mean of the stock's sector peers in this
+    # universe, or of the whole universe for a thin or unlabelled sector. See
+    # pipeline/sector_benchmark.py. The Yahoo sector indices this replaces
+    # stopped publishing around 2026-07-20 and left 49 tickers refused.
     #
-    # target_return asks the index nothing. So a dead benchmark now costs the
-    # excess label and the benchmark columns, and nothing else: the primary
-    # target, every feature and every forecast survive. The vendor outage stops
-    # being a labelling problem and becomes exactly what it is, a gap in a
-    # secondary column.
-    #
-    # The refusal that replaced it lives at the write boundary and is stricter
-    # rather than looser: _upsert_signals now refuses a decrease in EITHER
-    # target's labelled count, so a run that would erase historical excess
-    # labels for a name whose index has since died is still blocked.
-    if benchmark.empty:
-        print(f"[Signals] {ticker}: benchmark {index_ticker} unavailable — "
-              f"computing the absolute-return target only; the excess-return "
-              f"label and the benchmark columns will be NULL for this run.")
-
+    # The primary label never depended on it (P1): target_return asks the
+    # benchmark nothing, so a missing benchmark costs the excess label and the
+    # relative features, and nothing else.
     df = compute_sector_momentum(df, benchmark)
-    df = compute_earnings_surprise(ticker, df)
-
-    if "benchmark_close" not in df.columns:
-        df = df.merge(benchmark, on="date", how="left")
-        df["benchmark_close"] = df["benchmark_close"].ffill()
+    try:
+        df = compute_earnings_surprise(ticker, df)
+    except EarningsUnavailable as exc:
+        print(f"[Signals] SKIPPED {exc} — keeping the stored signals rather "
+              f"than writing a neutral 0.0 over them.")
+        return None
 
     h = HORIZON_SESSIONS
     log_close = np.log(df["close"])
@@ -481,39 +505,29 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     # THE PRIMARY LABEL, and it depends on nothing but this ticker's own close.
     df["target_return"] = log_close.shift(-h) - log_close
 
-    # An index that downloads but does not ALIGN is the same failure wearing a
-    # different hat: a truncated history, or dates that fail to merge, leaves
-    # benchmark_close entirely null after the ffill, and the `benchmark.empty`
-    # check above cannot see it. Both cases now degrade to the same place —
-    # the excess label is NULL and the absolute one is not — rather than one
-    # skipping the ticker and the other silently writing nulls.
-    aligned = ("benchmark_close" in df.columns
-               and bool(df["benchmark_close"].notna().any()))
-
-    if aligned:
+    if benchmark is not None and df["benchmark_close"].notna().any():
         log_bench = np.log(df["benchmark_close"])
-        df["benchmark_return"] = log_bench.shift(-h) - log_bench
+        bench_return = log_bench.shift(-h) - log_bench
+        # A forward window that spans a date the peers could not form a mean
+        # is void, exactly as a backward feature window is.
+        df["benchmark_return"] = bench_return.where(
+            ~_window_void(df["bench_void_cum"], -h))
         df["target_excess_return"] = df["target_return"] - df["benchmark_return"]
-        df["benchmark_ticker"] = index_ticker
-        df["benchmark_sector_specific"] = 1 if is_sector else 0
     else:
-        print(f"[Signals] {ticker}: benchmark {index_ticker} returned "
-              f"{len(benchmark)} rows, none aligned to this ticker's sessions "
-              f"— the excess-return label is NULL for this run; the "
-              f"absolute-return label is unaffected.")
+        print(f"[Signals] {ticker}: no benchmark — the excess-return label and "
+              f"the relative features are NULL for this run; the absolute-"
+              f"return label is unaffected.")
         df["benchmark_close"] = np.nan
         df["benchmark_return"] = np.nan
         df["target_excess_return"] = np.nan
-        # The MAPPING is recorded even when the series is missing. Which index
-        # this ticker is benchmarked against is a fact about the configuration,
-        # not about whether Yahoo answered today, and blanking it would make a
-        # vendor outage look like an unmapped ticker.
-        df["benchmark_ticker"] = index_ticker
-        df["benchmark_sector_specific"] = 1 if is_sector else 0
+    df["benchmark_ticker"] = benchmark.name if benchmark is not None else None
+    df["benchmark_sector_specific"] = (
+        int(benchmark.sector_specific) if benchmark is not None else 0)
     df["ticker"] = ticker
 
     df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(subset=FEATURE_COLS)
+    # Only a REQUIRED feature drops a row; a NULLABLE one is stored as NULL.
+    df = df.dropna(subset=[c for c in FEATURE_COLS if c not in NULLABLE_FEATURES])
 
     # A row with no benchmark still has close, every feature and the primary
     # label. Dropping on the target columns here would undo the whole point.
@@ -523,7 +537,7 @@ def compute_signals_frame(ticker: str, ohlcv: pd.DataFrame) -> pd.DataFrame | No
     # read as an input - see the note in data/db.py.
     keep = (["date", "ticker", "close"] + FEATURE_COLS + TARGET_COLS
             + ["benchmark_close", "benchmark_ticker",
-               "benchmark_sector_specific"])
+               "benchmark_sector_specific", "sector_rel_missing"])
     return df[keep].reset_index(drop=True)
 
 
@@ -630,6 +644,27 @@ def _upsert_signals(conn, ticker: str, df: pd.DataFrame) -> int:
     return len(df)
 
 
+def build_run_benchmarks(to_process: list[str], engine=None) -> dict[str, Benchmark]:
+    """Every processed ticker's panel-internal benchmark, peers drawn from the
+    frozen universe (plus the processed tickers themselves)."""
+    from data.universe import get_universe
+    from pipeline.sector_benchmark import (build_benchmarks, load_universe_prices,
+                                           sector_labels)
+
+    engine = engine or get_engine()
+    peers = sorted(set(get_universe()) | set(to_process))
+    prices = load_universe_prices(peers, engine)
+    if prices.empty:
+        return {}
+    labels = sector_labels(peers, engine)
+    unlabelled = sorted(t for t in to_process if labels.get(t) is None)
+    if unlabelled:
+        print(f"[Signals] {len(unlabelled)} ticker(s) carry no industry label and "
+              f"get NO sector benchmark (market fallback for the excess label, "
+              f"NULL sector_rel): {', '.join(unlabelled)}")
+    return build_benchmarks(prices, labels, tickers=to_process)
+
+
 def compute_and_store(single_ticker: str | None = None,
                       tickers: list[str] | None = None) -> SignalsReport:
     """
@@ -648,13 +683,21 @@ def compute_and_store(single_ticker: str | None = None,
     # 0.0, one factor column at a time.
     require_earnings_parser()
 
+    from data.universe import get_universe
+
     if single_ticker:
         to_process = [single_ticker]
     elif tickers:
         to_process = list(tickers)
     else:
-        from data.universe import get_universe
         to_process = get_universe()
+
+    # THE BENCHMARKS NEED THE WHOLE UNIVERSE, so they are built once, here,
+    # before the loop — one price query and one membership query, however
+    # many tickers are processed. Peers are the FROZEN universe, never "who is
+    # in the index today", so a sector's composition does not churn under a
+    # label. See pipeline/sector_benchmark.py.
+    benchmarks = build_run_benchmarks(to_process, engine)
 
     total = 0
     processed: list[str] = []
@@ -666,7 +709,7 @@ def compute_and_store(single_ticker: str | None = None,
             text("SELECT * FROM ohlcv WHERE ticker = :t ORDER BY date ASC"),
             engine, params={"t": ticker},
         )
-        frame = compute_signals_frame(ticker, ohlcv)
+        frame = compute_signals_frame(ticker, ohlcv, benchmarks.get(ticker))
         if frame is None or frame.empty:
             skipped.append(ticker)          # reason already printed by the callee
             continue

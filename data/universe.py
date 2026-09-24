@@ -128,13 +128,22 @@ def fetch_nse_constituents(index_name: str = INDEX_NAME) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(resp.text))
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    if "symbol" not in df.columns:
-        raise ValueError(f"Unexpected NSE CSV schema for {index_name}: {list(df.columns)}")
+    # EVERY COLUMN WE READ IS REQUIRED, not just `symbol` (2026-09-24). The
+    # industry label decides each stock's sector benchmark, and it used to be
+    # read with `df.get("industry", <empty>)`: a rename upstream would have
+    # given every newly joining ticker an empty industry, which reads back as
+    # "Unknown" — silently, and under a sector-mean benchmark that is the
+    # difference between a sector and no sector. Loud on a rename, as the
+    # download is already loud on death.
+    missing = [c for c in ("symbol", "company_name", "industry") if c not in df.columns]
+    if missing:
+        raise ValueError(f"Unexpected NSE CSV schema for {index_name}: missing "
+                         f"{missing} in {list(df.columns)}")
 
     out = pd.DataFrame({
         "ticker":   df["symbol"].astype(str).str.strip() + ".NS",
-        "company":  df.get("company_name", pd.Series(dtype=str)).astype(str).str.strip(),
-        "industry": df.get("industry", pd.Series(dtype=str)).astype(str).str.strip(),
+        "company":  df["company_name"].astype(str).str.strip(),
+        "industry": df["industry"].astype(str).str.strip(),
     })
     return out[out["ticker"].str.len() > 3].reset_index(drop=True)
 

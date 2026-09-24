@@ -332,7 +332,7 @@ function Overview({
             <>
               Against {benchmark}
               {forecast.benchmark_sector_specific === false
-                ? " (no sector index available, so NIFTY 50 is used)"
+                ? " (its sector has too few names for a peer benchmark, so the rest of the universe is used)"
                 : ""}
               . 50% is a coin flip.
             </>

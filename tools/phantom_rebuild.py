@@ -15,6 +15,11 @@ series - and every one of those would be read as the phantom fix. So:
      `pipeline/fetch.py` now makes.
   3. The two inputs that come off the network are FROZEN to what the stored
      panel used: each ticker's benchmark series and its earnings surprise.
+     Since v4 the benchmark is PASSED to `compute_signals_frame`; this tool
+     passes the stored Yahoo-index levels. v4's NULL features
+     (signals.NULLABLE_FEATURES) mean a rebuild today no longer matches the
+     2026-09-07 panel column for column: to reproduce that panel exactly, run
+     this tool from the pre-v4 commit (bd1b028).
   4. Every float goes through the float32 round trip the `signals` table's
      REAL columns impose, as `load_panel` would have read it.
 
@@ -75,28 +80,30 @@ def read_ohlcv(tickers: list[str], through: str) -> dict[str, pd.DataFrame]:
     return out
 
 
-def freeze_network_inputs(stored: pd.DataFrame) -> None:
-    """Point signals' three network calls at what the stored panel used."""
+def freeze_network_inputs(stored: pd.DataFrame) -> dict:
+    """Freeze signals' network inputs to what the stored panel used, and
+    return each ticker's (pre-v4, Yahoo-index) benchmark.
+
+    Since MODEL_VERSION v4 the production benchmark is panel-internal
+    (pipeline/sector_benchmark.py) and is PASSED to `compute_signals_frame`
+    rather than fetched inside it; the stored 2026-09-07 panel was measured
+    against the Yahoo indices, so this rebuild passes those, frozen."""
+    from pipeline.sector_benchmark import index_benchmark
+
     bench_of = stored.groupby("ticker")["benchmark_ticker"].first().to_dict()
     series = {b: g.drop_duplicates("date").sort_values("date")[["date", "benchmark_close"]]
               .reset_index(drop=True)
               for b, g in stored.groupby("benchmark_ticker")}
     surprise = stored.set_index(["ticker", "date"])["earnings_surprise"]
 
-    def get_benchmark(ticker):
-        return bench_of[ticker], bench_of[ticker] != "^NSEI"
-
-    def get_benchmark_series(index_ticker, period="10y"):
-        return series[index_ticker].copy()
-
     def compute_earnings_surprise(ticker, df):
         s = surprise.xs(ticker, level="ticker")
         df["earnings_surprise"] = df["date"].map(s).ffill().fillna(0.0)
         return df
 
-    signals.get_benchmark = get_benchmark
-    signals.get_benchmark_series = get_benchmark_series
     signals.compute_earnings_surprise = compute_earnings_surprise
+    return {t: index_benchmark(t, b, series[b], sector_specific=b != "^NSEI")
+            for t, b in bench_of.items()}
 
 
 def as_panel(frames: list[pd.DataFrame], stored: pd.DataFrame) -> pd.DataFrame:
@@ -154,7 +161,7 @@ def main() -> None:
           flush=True)
 
     ohlcv = read_ohlcv(tickers, through)
-    freeze_network_inputs(stored)
+    benchmarks = freeze_network_inputs(stored)
 
     ctrl, clean, removed = [], [], {}
     for t in tickers:
@@ -163,7 +170,7 @@ def main() -> None:
         if gone:
             removed[t] = gone
         for bucket, frame in ((ctrl, raw), (clean, kept)):
-            f = signals.compute_signals_frame(t, frame.copy())
+            f = signals.compute_signals_frame(t, frame.copy(), benchmarks.get(t))
             if f is not None:
                 bucket.append(f)
     print(f"signals recomputed for {len(ctrl)} tickers ({time.time() - t0:.0f}s)", flush=True)

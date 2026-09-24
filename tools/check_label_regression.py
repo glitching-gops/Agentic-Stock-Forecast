@@ -81,6 +81,11 @@ def main() -> int:
     if args.limit:
         tickers = tickers[:args.limit]
 
+    # The benchmark is panel-internal since v4 and needs the whole universe's
+    # prices, so it is built ONCE, exactly as `compute_and_store` builds it.
+    from pipeline.signals import build_run_benchmarks
+    benchmarks = build_run_benchmarks(tickers, engine)
+
     print(f"Recomputing {len(tickers)} tickers in memory. Nothing is written.\n")
     print(f"  {'ticker':16s}{'stored':>8}{'recomp':>8}{'delta':>8}"
           f"{'excess d':>10}  note")
@@ -95,7 +100,7 @@ def main() -> int:
             continue
 
         try:
-            frame = compute_signals_frame(ticker, ohlcv)
+            frame = compute_signals_frame(ticker, ohlcv, benchmarks.get(ticker))
         except Exception as exc:                                 # noqa: BLE001
             missing.append((ticker, f"{type(exc).__name__}: {exc}"[:80]))
             continue

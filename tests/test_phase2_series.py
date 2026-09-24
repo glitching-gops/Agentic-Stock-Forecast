@@ -410,19 +410,18 @@ def _signals_frame(volume: np.ndarray, n: int = 400):
         "high": prices * 1.01, "low": prices * 0.99, "close": prices,
         "adj_close": prices, "volume": volume,
     })
-    bench = pd.DataFrame({"date": sessions,
-                          "benchmark_close": np.linspace(20000.0, 26000.0, n)})
+    from pipeline.sector_benchmark import index_benchmark
 
-    original = (signals.get_benchmark_series, signals.get_benchmark,
-                signals.compute_earnings_surprise)
-    signals.get_benchmark_series = lambda *a, **k: bench
-    signals.get_benchmark = lambda t: ("^NSEI", False)
+    bench = index_benchmark("TEST.NS", "^NSEI", pd.DataFrame({
+        "date": sessions, "benchmark_close": np.linspace(20000.0, 26000.0, n)}),
+        sector_specific=False)
+
+    original = signals.compute_earnings_surprise
     signals.compute_earnings_surprise = lambda t, df: df.assign(earnings_surprise=0.0)
     try:
-        return signals.compute_signals_frame("TEST.NS", ohlcv), sessions
+        return signals.compute_signals_frame("TEST.NS", ohlcv, bench), sessions
     finally:
-        (signals.get_benchmark_series, signals.get_benchmark,
-         signals.compute_earnings_surprise) = original
+        signals.compute_earnings_surprise = original
 
 
 def test_a_zero_volume_session_does_not_delete_the_row_ten_sessions_later():

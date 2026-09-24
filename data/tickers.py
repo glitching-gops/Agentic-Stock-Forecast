@@ -217,7 +217,16 @@ def get_benchmark(ticker: str, sector: str | None = None) -> tuple[str, bool]:
 
 
 def get_benchmark_name(index_ticker: str) -> str:
-    """Human-readable benchmark name for display."""
+    """Human-readable benchmark name for display.
+
+    Since MODEL_VERSION v4 the stored benchmark is panel-internal
+    ("EW-LOO:<industry>" or "EW-LOO:MARKET", see
+    pipeline/sector_benchmark.py); the index names below remain for rows and
+    tools that still refer to the Yahoo indices."""
+    if index_ticker and index_ticker.startswith("EW-LOO:"):
+        if index_ticker == "EW-LOO:MARKET":
+            return "the rest of the universe (equal-weighted)"
+        return f"{index_ticker[len('EW-LOO:'):]} peers (equal-weighted)"
     names = {
         "^NSEI":       "NIFTY 50",
         "^NSEBANK":    "NIFTY Bank",

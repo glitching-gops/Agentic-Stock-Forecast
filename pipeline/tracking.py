@@ -104,11 +104,11 @@ def git_sha() -> str | None:
 
 def config_hash() -> tuple[str, dict]:
     """Everything a human chose, and its digest."""
-    from data.tickers import BROAD_MARKET_INDEX, SECTOR_INDICES
     from pipeline.model import (
         EVAL_MIN_TRAIN, EVAL_N_FOLDS, EVAL_TUNE_TRIALS, FEATURES,
         MIN_ROWS_FOR_EVALUATION, MIN_ROWS_FOR_FORECAST, MODEL_VERSION, TARGET,
     )
+    from pipeline.sector_benchmark import MARKET_BENCHMARK, MIN_SECTOR_PEERS
     from pipeline.signals import HORIZON_SESSIONS
 
     config = {
@@ -121,9 +121,13 @@ def config_hash() -> tuple[str, dict]:
         "eval_tune_trials": EVAL_TUNE_TRIALS,
         "min_rows_forecast": MIN_ROWS_FOR_FORECAST,
         "min_rows_evaluation": MIN_ROWS_FOR_EVALUATION,
-        # Half the label. See the module docstring.
-        "benchmarks": dict(sorted(SECTOR_INDICES.items())),
-        "broad_market": BROAD_MARKET_INDEX,
+        # Half the excess label. See the module docstring. Since v4 it is no
+        # longer a list of Yahoo indices but a RULE — leave-one-out equal-
+        # weighted sector peers, a minimum peer count, and a market fallback —
+        # so the rule is what is hashed (pipeline/sector_benchmark.py).
+        "benchmark": {"method": "equal-weighted leave-one-out sector peers",
+                      "min_sector_peers": MIN_SECTOR_PEERS,
+                      "fallback": MARKET_BENCHMARK},
     }
     return _sha(config), config
 

@@ -48,7 +48,7 @@ from pipeline.evaluation import (
     format_report,
     walk_forward,
 )
-from pipeline.signals import FEATURE_COLS, HORIZON_SESSIONS
+from pipeline.signals import FEATURE_COLS, HORIZON_SESSIONS, NULLABLE_FEATURES
 from pipeline.tuning import tune, tune_and_cache
 
 # Bumped 2026-09-01 (v2 -> v3): THE TARGET ITSELF CHANGED. The model predicted
@@ -70,7 +70,19 @@ from pipeline.tuning import tune, tune_and_cache
 # sectors (36 of 100 tickers) onto different indices on 2026-08-19, so those
 # tickers' excess labels mean something different from every excess label
 # written under v1.
-MODEL_VERSION = "rebuild-absolute-return-v3"
+#
+# Bumped 2026-09-24 (v3 -> v4): THE SECTOR BENCHMARK IS PANEL-INTERNAL. The
+# three sector_rel_* features and the excess label used to be measured against
+# Yahoo's NSE sector indices, eight of ten of which stopped publishing around
+# 2026-07-20; they are now measured against the leave-one-out equal-weighted
+# mean of the stock's sector peers in this universe (pipeline/
+# sector_benchmark.py), and NULL for the 11 names in sectors too thin to form
+# one. Three features also stopped writing a neutral value where nothing was
+# measured (earnings_surprise before the vendor's coverage, hurst in its
+# warm-up) — see signals.NULLABLE_FEATURES. Features the per-ticker model was
+# evaluated on changed definition, so its v3 evaluations are discarded until
+# the weekly job re-measures them.
+MODEL_VERSION = "absolute-return-sector-loo-v4"
 
 FEATURES = FEATURE_COLS + [
     # Macro.
@@ -182,9 +194,14 @@ def load_features_for_ticker(ticker: str, engine=None) -> pd.DataFrame:
 
     for col in FEATURES:
         if col not in df.columns:
-            df[col] = 0.0
+            df[col] = np.nan if col in NULLABLE_FEATURES else 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce")
-        df[col] = df[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+        # A NULLABLE feature stays NaN: XGBoost reads it as MISSING. Filling it
+        # with 0.0 here would re-create, one layer up, the neutral value the
+        # signals step stopped writing (signals.NULLABLE_FEATURES).
+        if col not in NULLABLE_FEATURES:
+            df[col] = df[col].fillna(0.0)
 
     return df.sort_values("date").reset_index(drop=True)
 

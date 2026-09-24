@@ -52,7 +52,7 @@ from sqlalchemy import text
 
 from data import nse_calendar
 from data.db import get_engine
-from pipeline.signals import FEATURE_COLS
+from pipeline.signals import FEATURE_COLS, NULLABLE_FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +220,13 @@ def load_panel(
 
     for col in FEATURES:
         panel[col] = pd.to_numeric(panel[col], errors="coerce")
-        panel[col] = panel[col].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        panel[col] = panel[col].replace([np.inf, -np.inf], np.nan)
+        # NULLABLE features stay NaN (signals.NULLABLE_FEATURES): a 0.0 here is
+        # the neutral value the signals step stopped writing, re-created one
+        # layer up. `cross_sectional_zscore(keep_missing=...)` decides what a
+        # given model sees; the loader does not decide for it.
+        if col not in NULLABLE_FEATURES:
+            panel[col] = panel[col].fillna(0.0)
 
     for col in TARGETS:
         if col in panel.columns:
@@ -324,6 +330,7 @@ def cross_sectional_zscore(
     min_names: int = MIN_NAMES_PER_DATE,
     clip: float = ZSCORE_CLIP,
     suffix: str = "",
+    keep_missing: bool = False,
 ) -> pd.DataFrame:
     """
     Standardises `cols` within each date.
@@ -338,6 +345,13 @@ def cross_sectional_zscore(
     standardised: dividing by the standard deviation of six numbers manufactures
     outliers instead of removing them. A column that is constant across a date
     is likewise zeroed, since it carries no cross-sectional information that day.
+
+    `keep_missing` (2026-09-24): a value that was NaN on input stays NaN on
+    output instead of becoming 0.0, the cross-sectional mean. Use it for a
+    model that reads missing as missing (XGBoost); leave it off for one that
+    cannot (the ridge comparators). The mean and sd are over the values
+    present either way, so the standardised values of the other names do not
+    change — only what a missing one is reported as.
     """
     out = panel.copy()
     present = [c for c in cols if c in out.columns]
@@ -352,6 +366,8 @@ def cross_sectional_zscore(
     z = (out[present] - mean) / std.replace(0.0, np.nan)
     z = z.where(count >= min_names, 0.0)
     z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(-clip, clip)
+    if keep_missing:
+        z = z.where(out[present].notna())
 
     for col in present:
         out[col + suffix] = z[col]
