@@ -292,6 +292,23 @@ def run_pipeline_job():
             logger.info(f"[7/8] Pruned {removed} forecast_current row(s) for "
                        f"tickers no longer in the universe")
 
+        # THE POOLED MODEL, IN SHADOW (Stage 2, 2026-09-24). Forecasts every
+        # name from the latest shadow model into `shadow_forecasts`, which no
+        # public endpoint reads — see pipeline/pooled_shadow.py. AFTER the live
+        # forecasts are written, and NON-FATAL, for the baseline step's reason:
+        # it publishes nothing, so a defect in it must cost a recorded note,
+        # never the day's live forecasts. Recorded either way.
+        logger.info("[7/8] Shadow: pooled model forecasts...")
+        shadow_metrics: dict = {}
+        try:
+            from pipeline.pooled_shadow import run_daily_shadow
+
+            shadow_metrics = run_daily_shadow(universe)
+            logger.info(f"[7/8] Shadow: {shadow_metrics}")
+        except Exception as exc:                                # noqa: BLE001
+            logger.error(f"[7/8] Shadow pooled forecast failed: {exc}")
+            shadow_metrics = {"note": f"shadow step raised: {str(exc)[:300]}"}
+
         # Score the forecasts whose 30 sessions have now elapsed. This is the
         # only measurement in the system taken on PUBLISHED output rather than
         # on held-out folds, and `forecast_outcomes` had no writer at all until
@@ -309,6 +326,7 @@ def run_pipeline_job():
             "labelled_rows": labelled_after,
             "outcomes_resolved": outcomes.resolved,
             "forecast_rows_pruned": removed,
+            "pooled_shadow": shadow_metrics,
         })
         logger.info("Daily pipeline run completed successfully.")
     except Exception as e:
@@ -451,6 +469,24 @@ def run_weekly_evaluation_job():
         raise
     logger.info(f"[Scheduler] Weekly evaluation complete: "
                f"{len(results)}/{len(universe)} tickers evaluated")
+
+    # ── The pooled model, in SHADOW (Stage 2, 2026-09-24) ────────────────────
+    #
+    # Train, walk-forward, grade (Stage 0c: demeaned within-fold IC, date-level
+    # bootstrap, REML/HKSJ, Romano-Wolf, the tau2 ~ 0 detector), calibrate and
+    # fit the pooled model; write it to the shadow tables, which no public
+    # endpoint reads (pipeline/pooled_shadow.py). AFTER the per-ticker
+    # evaluation has persisted and NON-FATAL, so a defect here cannot cost the
+    # live model's week. Recorded either way: a silent skip reads as "fine".
+    shadow_metrics: dict = {}
+    try:
+        from pipeline.pooled_shadow import run_weekly_shadow
+
+        shadow_metrics = run_weekly_shadow(universe)
+        logger.info(f"[Scheduler] Shadow pooled model: {shadow_metrics}")
+    except Exception as exc:                                        # noqa: BLE001
+        logger.error(f"[Scheduler] Shadow pooled model failed: {exc}")
+        shadow_metrics = {"note": f"shadow step raised: {str(exc)[:300]}"}
 
     # ── Fundamentals sync ────────────────────────────────────────────────────
     #
@@ -598,6 +634,7 @@ def run_weekly_evaluation_job():
         "baselines_news_regime": enriched_metrics,
         "fundamentals": fundamentals_metrics,
         "news_scoring": scoring_metrics,
+        "pooled_shadow": shadow_metrics,
     })
 
 

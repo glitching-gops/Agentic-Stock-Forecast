@@ -102,3 +102,62 @@ def trigger_weekly_evaluation(background_tasks: BackgroundTasks):
         "message": ("Weekly evaluation triggered in the background. This is "
                     "expensive — prefer the GitHub Actions workflow when possible."),
     }
+
+
+# ── The pooled model in SHADOW (Stage 2, 2026-09-24) ──────────────────────────
+#
+# Read-only inspection of what pipeline/pooled_shadow.py writes. Admin-gated
+# and linked from nowhere: the shadow model is NOT published, and nothing here
+# may be read by a public page until the cutover session (docs/
+# dashboard-switch-preregistration.md). The booster itself is never returned.
+
+_SHADOW_MODEL_COLS = ("model_id, pooled_version, trained_at, train_first_date, "
+                      "train_last_date, n_train_rows, params_json, coverage_json, "
+                      "coverage_status, walk_forward_json, config_hash, data_hash, "
+                      "env_hash, env_json, git_sha, runtime_seconds")
+
+
+def _shadow_read(sql: str, params: dict | None = None):
+    import pandas as pd
+    from sqlalchemy import text
+
+    from api.serialization import records
+    from data.db import get_engine, is_missing_relation
+
+    try:
+        return records(pd.read_sql(text(sql), get_engine(), params=params or {}))
+    except Exception as exc:                                    # noqa: BLE001
+        if is_missing_relation(exc):
+            return None
+        raise
+
+
+@router.get("/shadow/summary", dependencies=[Depends(verify_api_key)])
+def shadow_summary():
+    """The latest shadow model, its panel statement and its grade counts."""
+    models = _shadow_read(f"SELECT {_SHADOW_MODEL_COLS} FROM shadow_models "
+                          f"ORDER BY trained_at DESC LIMIT 1")
+    if not models:
+        return {"model": None, "note": "no shadow model has been written yet"}
+    model = models[0]
+    statement = _shadow_read("SELECT * FROM shadow_panel_statements WHERE model_id = :m",
+                             {"m": model["model_id"]})
+    latest = _shadow_read("SELECT forecast_date, COUNT(*) AS n FROM shadow_forecasts "
+                          "WHERE model_id = :m GROUP BY forecast_date "
+                          "ORDER BY forecast_date DESC LIMIT 5",
+                          {"m": model["model_id"]})
+    return {"model": model, "panel_statement": (statement or [None])[0],
+            "recent_forecast_dates": latest or []}
+
+
+@router.get("/shadow/forecasts", dependencies=[Depends(verify_api_key)])
+def shadow_forecasts(date: str | None = None):
+    """Every shadow forecast for one date (default: the latest)."""
+    if date is None:
+        latest = _shadow_read("SELECT MAX(forecast_date) AS d FROM shadow_forecasts")
+        date = latest[0]["d"] if latest else None
+    if date is None:
+        return {"date": None, "forecasts": []}
+    rows = _shadow_read("SELECT * FROM shadow_forecasts WHERE forecast_date = :d "
+                        "ORDER BY ticker", {"d": date})
+    return {"date": date, "forecasts": rows or []}

@@ -115,6 +115,44 @@ def check_coverage(
     }
 
 
+def expanding_fold_coverage(y_true: np.ndarray, y_pred: np.ndarray,
+                            folds: np.ndarray, coverage: float = 0.80) -> dict:
+    """
+    Coverage measured the only honest way on a walk-forward: for each fold k,
+    calibrate on every fold BEFORE k and check on k. Plus the pooled figure over
+    every checked row.
+
+    Checking on the calibration pool itself reports the quantile's own
+    definition back and always looks like a pass. And the per-fold split is
+    what exposes drift: this panel's target dispersion falls across folds, so a
+    band calibrated on the wilder early period over-covers the calmer late one
+    — which the pooled number averages away (Hygiene, 2026-09-21: 0.8166 at
+    the first checkable fold, 0.87-0.91 after).
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    folds = np.asarray(folds)
+    ok = np.isfinite(y_true) & np.isfinite(y_pred)
+    per_fold, inside_all = [], []
+    for k in sorted({int(f) for f in np.unique(folds[ok])}):
+        earlier, here = ok & (folds < k), ok & (folds == k)
+        if earlier.sum() < 20 or here.sum() < 20:
+            continue
+        cal = fit_conformal(y_true[earlier], y_pred[earlier], coverage=coverage)
+        if cal is None:
+            continue
+        inside = np.abs(y_true[here] - y_pred[here]) <= cal.quantile
+        inside_all.append(inside)
+        per_fold.append({"fold": k, "n": int(here.sum()),
+                         "coverage": float(inside.mean()),
+                         "quantile": cal.quantile,
+                         "n_calibration": int(earlier.sum())})
+    pooled = np.concatenate(inside_all) if inside_all else np.zeros(0, dtype=bool)
+    return {"nominal": coverage, "per_fold": per_fold,
+            "overall": float(pooled.mean()) if pooled.size else float("nan"),
+            "n_checked": int(pooled.size)}
+
+
 def brier_score(y_true: np.ndarray, probabilities: np.ndarray) -> float:
     """Brier score for the P(excess return > 0) forecasts. Lower is better."""
     valid = np.isfinite(y_true) & np.isfinite(probabilities)

@@ -1,0 +1,46 @@
+name: Platform digest
+
+# Does the GitHub Actions runner — where the pooled shadow model TRAINS —
+# produce the reference platform's pooled-model numbers bit for bit?
+#
+# Windows and Linux diverge from identical code and versions whenever XGBoost
+# subsamples (CLAUDE.md §7). The Stage 2 reference numbers were measured on
+# WSL Ubuntu; this job fits the same production code on a fixed synthetic panel
+# with subsampling below 1.0 and compares its digest to the one recorded from
+# WSL (tools/platform_digest.json). No database, no secrets, ~2 minutes.
+#
+# RED means the runner is a different platform: per
+# docs/dashboard-switch-preregistration.md §3 the runner then becomes the
+# reference, and the backtest must be re-established there before any cutover.
+# It does not stop the shadow path.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/**"
+      - "requirements*.txt"
+      - "tools/platform_digest.py"
+      - "tools/platform_digest.json"
+      - ".github/workflows/platform-digest.yml"
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.0"
+          cache: "pip"
+
+      - name: Install dependencies (locked)
+        run: |
+          pip install -r requirements.txt
+          python tools/check_locked_env.py requirements.txt
+
+      - name: Compare the pooled-model digest to the reference platform's
+        run: python tools/platform_digest.py --check

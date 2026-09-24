@@ -1,0 +1,23 @@
+{
+ "digest": "ab65d091a9457dfb34e4d2cb5714ba8944298cea0720d906617a881383136a77",
+ "fixed_params_prediction_sum": -31.42766072115046,
+ "searched_gammas": [
+  0.917023,
+  0.917023
+ ],
+ "environment": {
+  "platform": "linux",
+  "machine": "x86_64",
+  "python": "3.12.0",
+  "xgb_threads": 2,
+  "xgb_threads_pinned_default": 2,
+  "xgb_threads_overridden": false,
+  "omp_num_threads": "unset",
+  "cpu_count": 20,
+  "xgboost": "3.2.0",
+  "optuna": "4.8.0",
+  "sklearn": "1.8.0",
+  "numpy": "2.4.4",
+  "pandas": "3.0.2"
+ }
+}

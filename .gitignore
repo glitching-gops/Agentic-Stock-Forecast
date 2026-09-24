@@ -175,3 +175,10 @@ graphify-out/
 panel_cache_control.parquet
 panel_cache_clean.parquet
 stage1_rerun/
+
+# Stage 2 (2026-09-24) — the frozen snapshot, the panels built from it and the
+# run artifacts. Regenerable only by re-reading the database, which is exactly
+# what a snapshot exists to avoid, so the manifest's content hash — quoted in
+# docs/dashboard-switch-preregistration.md — is the durable record, not a copy
+# in git.
+stage2/
